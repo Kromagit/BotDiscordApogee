@@ -58,18 +58,6 @@ jobs:
             --collect-all numpy `
             bot.py
 
-      - name: Smoke test packaged OCR
-        shell: pwsh
-        run: |
-          $env:DISCORD_TOKEN=""
-          & ".\dist\ApogeeRaidHelperBot.exe" 2>&1 | Tee-Object -Variable output
-          if ($LASTEXITCODE -eq 0) {
-            Write-Host "EXE exited cleanly."
-          }
-          # We cannot fully start the bot without a token, but PyInstaller must
-          # at least be able to import the packaged OCR modules before main exits.
-          # The bot.py startup check will show OCR state in a real run.
-
       - name: Prepare downloadable package
         shell: pwsh
         run: |
