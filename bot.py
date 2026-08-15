@@ -18,6 +18,24 @@ from discord import app_commands
 from discord.ext import commands
 from dotenv import load_dotenv
 
+# OCR local pour lire le nom du personnage sur le screenshot DKPARSE.
+# Dépendances :
+#   pip install rapidocr_onnxruntime pillow numpy
+try:
+    from rapidocr_onnxruntime import RapidOCR
+except Exception:
+    RapidOCR = None
+
+try:
+    from PIL import Image
+except Exception:
+    Image = None
+
+try:
+    import numpy as np
+except Exception:
+    np = None
+
 
 # =============================================================================
 # APogee Discord Bot - Raid-Helper + DKPARSE
@@ -650,14 +668,199 @@ async def run_rh_list(interaction: discord.Interaction, message: discord.Message
         export_text = "RH|" + "|".join(sorted(export_items, key=str.lower))
         chunks = split_discord_text("\n".join(lines))
         for index, chunk in enumerate(chunks):
-            await interaction.followup.send(
-                chunk,
-                view=ExportView(export_text) if index == len(chunks) - 1 else None,
-            )
+            if index == len(chunks) - 1:
+                await interaction.followup.send(
+                    chunk,
+                    view=ExportView(export_text),
+                )
+            else:
+                await interaction.followup.send(chunk)
     except Exception as exc:
         if RH_DEBUG:
             print(repr(exc))
         await interaction.followup.send(f"❌ RH List : {exc}")
+
+
+# =============================================================================
+# OCR screenshot DKPARSE
+# =============================================================================
+
+OCR_ENGINE = None
+
+OCR_IGNORE_WORDS = {
+    "icecrown", "boss", "rank", "points", "point", "best", "dps", "dur",
+    "kills", "kill", "date", "show", "other", "bosses", "hide", "snapshot",
+    "snapshots", "found", "for", "this", "character", "server", "damage",
+    "warrior", "rogue", "paladin", "deathknight", "hunter", "mage", "priest",
+    "druid", "warlock", "shaman", "frost", "fire", "shadow", "balance",
+    "feral", "combat", "fury", "unholy", "demonology", "marksmanship",
+}
+
+
+def get_ocr_engine():
+    global OCR_ENGINE
+    if OCR_ENGINE is None and RapidOCR is not None:
+        OCR_ENGINE = RapidOCR()
+    return OCR_ENGINE
+
+
+def is_image_attachment(att: discord.Attachment) -> bool:
+    ctype = (att.content_type or "").lower()
+    name = (att.filename or "").lower()
+    return (
+        ctype.startswith("image/")
+        or name.endswith((".png", ".jpg", ".jpeg", ".webp", ".bmp"))
+    )
+
+
+async def download_attachment_bytes(att: discord.Attachment) -> bytes:
+    try:
+        return await att.read(use_cached=True)
+    except TypeError:
+        return await att.read()
+
+
+def _clean_ocr_token(raw: str) -> str:
+    return re.sub(r"[^A-Za-z]", "", raw or "")
+
+
+def _box_geometry(box: Any) -> Tuple[float, float, float, float]:
+    try:
+        xs = [float(p[0]) for p in box]
+        ys = [float(p[1]) for p in box]
+        return min(xs), min(ys), max(xs), max(ys)
+    except Exception:
+        return 0.0, 0.0, 0.0, 0.0
+
+
+def choose_character_from_ocr(
+    ocr_result: Any,
+    image_width: int,
+    image_height: int,
+) -> Tuple[Optional[str], List[Dict[str, Any]]]:
+    candidates: List[Dict[str, Any]] = []
+
+    if isinstance(ocr_result, tuple) and ocr_result:
+        ocr_result = ocr_result[0]
+
+    if not isinstance(ocr_result, list):
+        return None, candidates
+
+    for item in ocr_result:
+        if not isinstance(item, (list, tuple)) or len(item) < 2:
+            continue
+
+        box = item[0]
+        raw_text = str(item[1] or "").strip()
+        try:
+            confidence = float(item[2]) if len(item) >= 3 else 0.5
+        except Exception:
+            confidence = 0.5
+
+        token = _clean_ocr_token(raw_text)
+        if not WOW_NAME_RE.fullmatch(token):
+            continue
+        if token.lower() in OCR_IGNORE_WORDS:
+            continue
+
+        x1, y1, x2, y2 = _box_geometry(box)
+        cx = (x1 + x2) / 2.0
+        cy = (y1 + y2) / 2.0
+
+        # Le nom UwU est normalement dans la partie haute du screenshot.
+        if image_height > 0 and cy > image_height * 0.42:
+            continue
+
+        y_score = 1.0 - min(max(cy / max(image_height, 1), 0.0), 1.0)
+        x_target = image_width * 0.25
+        x_distance = abs(cx - x_target) / max(image_width, 1)
+        x_score = max(0.0, 1.0 - x_distance)
+        score = confidence * 3.0 + y_score * 2.2 + x_score * 1.2
+
+        candidates.append({
+            "name": token,
+            "raw": raw_text,
+            "confidence": confidence,
+            "x": round(cx, 1),
+            "y": round(cy, 1),
+            "score": round(score, 4),
+        })
+
+    candidates.sort(key=lambda c: c["score"], reverse=True)
+
+    if not candidates:
+        return None, candidates
+
+    best = candidates[0]
+    if best["confidence"] < 0.35:
+        return None, candidates
+
+    return best["name"], candidates
+
+
+async def extract_character_from_screenshot(
+    message: discord.Message,
+) -> Tuple[Optional[str], str]:
+    image_attachments = [a for a in message.attachments if is_image_attachment(a)]
+
+    if not image_attachments:
+        return None, "Aucun screenshot image joint au message."
+
+    if RapidOCR is None or Image is None or np is None:
+        missing = []
+        if RapidOCR is None:
+            missing.append("rapidocr_onnxruntime")
+        if Image is None:
+            missing.append("Pillow")
+        if np is None:
+            missing.append("numpy")
+        return (
+            None,
+            "OCR local indisponible (" + ", ".join(missing) + "). "
+            "Installer : pip install rapidocr_onnxruntime pillow numpy",
+        )
+
+    engine = get_ocr_engine()
+    if engine is None:
+        return None, "Impossible d'initialiser RapidOCR."
+
+    all_candidates: List[Dict[str, Any]] = []
+
+    for att in image_attachments[:4]:
+        try:
+            raw = await download_attachment_bytes(att)
+            image = Image.open(io.BytesIO(raw)).convert("RGB")
+            width, height = image.size
+            arr = np.array(image)
+
+            result, _elapsed = engine(arr)
+            name, candidates = choose_character_from_ocr(result, width, height)
+
+            for c in candidates[:10]:
+                c["attachment"] = att.filename
+            all_candidates.extend(candidates[:10])
+
+            dkp_debug(
+                "OCR SCREENSHOT",
+                {
+                    "attachment": att.filename,
+                    "size": [width, height],
+                    "selected": name,
+                    "candidates": candidates[:10],
+                },
+            )
+
+            if name:
+                return name, f"Nom lu sur le screen : {name}"
+
+        except Exception as exc:
+            dkp_debug(
+                "OCR SCREENSHOT ECHEC",
+                {"attachment": att.filename, "error": repr(exc)},
+            )
+
+    dkp_debug("OCR CANDIDATS GLOBAUX", all_candidates[:20])
+    return None, "Le nom du personnage n'a pas pu être lu de façon fiable sur le screenshot."
 
 
 # =============================================================================
@@ -895,12 +1098,27 @@ def parse_hits_from_text(
 async def fetch_uwu_report(report: UwuReport) -> Tuple[str, str]:
     timeout = aiohttp.ClientTimeout(total=25)
     headers = {
-        "User-Agent": "ApogeeDKParseBot/1.0 (+Discord guild tooling)",
+        "User-Agent": "ApogeeDKParseBot/1.1 (+Discord guild tooling)",
         "Accept": "text/html,application/xhtml+xml",
     }
+
+    dkp_debug("UWU LECTURE DEBUT", report.url)
+
     async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
         async with session.get(report.url, allow_redirects=True) as resp:
             body = await resp.text(errors="replace")
+
+            dkp_debug(
+                "UWU LECTURE REPONSE",
+                {
+                    "requested_url": report.url,
+                    "final_url": str(resp.url),
+                    "status": resp.status,
+                    "content_type": resp.headers.get("Content-Type"),
+                    "body_chars": len(body),
+                },
+            )
+
             if resp.status != 200:
                 raise RuntimeError(f"UwU HTTP {resp.status}")
             return str(resp.url), body
@@ -913,42 +1131,111 @@ async def scan_whitelisted_reports(
         guild, LOGS_RAID_CHANNEL_ID, "LOGS_RAID_CHANNEL_ID"
     )
 
-    # Small safety margin: user said 7 or 8 days is not important. We use the
-    # configured 8-day rule plus one day when scanning Discord, then reject a
-    # report whose actual date is outside the allowed window.
-    after = reference_time - timedelta(days=DKPARSE_MAX_DAYS + 1)
-    before = reference_time + timedelta(days=1)
-
+    HISTORY_LIMIT = 300
     reports: List[UwuReport] = []
     seen: set[str] = set()
+    scanned_messages = 0
+    messages_with_urls = 0
 
-    async for msg in channel.history(
-        limit=None, after=after, before=before, oldest_first=True
-    ):
-        combined = msg.content or ""
-        for embed in msg.embeds:
-            if embed.url:
-                combined += "\n" + embed.url
-            if embed.description:
-                combined += "\n" + embed.description
+    dkp_debug(
+        "SCAN #logs-raid",
+        {
+            "channel_id": channel.id,
+            "channel_name": channel.name,
+            "reference_time": reference_time.isoformat(),
+            "history_limit": HISTORY_LIMIT,
+            "mode": "latest messages, no Discord after/before filter",
+        },
+    )
 
-        for url in extract_uwu_urls(combined):
-            if url in seen:
-                continue
-            seen.add(url)
-            reports.append(
-                UwuReport(
+    try:
+        async for msg in channel.history(limit=HISTORY_LIMIT, oldest_first=False):
+            scanned_messages += 1
+
+            combined_parts = [msg.content or ""]
+
+            for embed in msg.embeds:
+                if embed.url:
+                    combined_parts.append(embed.url)
+                if embed.title:
+                    combined_parts.append(embed.title)
+                if embed.description:
+                    combined_parts.append(embed.description)
+                for field in embed.fields:
+                    if field.name:
+                        combined_parts.append(field.name)
+                    if field.value:
+                        combined_parts.append(field.value)
+
+            for attachment in msg.attachments:
+                combined_parts.append(attachment.url or "")
+                combined_parts.append(attachment.filename or "")
+
+            combined = "\n".join(x for x in combined_parts if x)
+            urls = extract_uwu_urls(combined)
+
+            if DKPARSE_DEBUG:
+                dkp_debug(
+                    f"MSG {msg.id}",
+                    {
+                        "created_at": msg.created_at.isoformat(),
+                        "author": f"{msg.author} ({msg.author.id})",
+                        "content": (msg.content or "")[:500],
+                        "urls_found": urls,
+                    },
+                )
+
+            if urls:
+                messages_with_urls += 1
+
+            for url in urls:
+                if url in seen:
+                    continue
+
+                seen.add(url)
+                rdate = report_date_from_url(url)
+                report = UwuReport(
                     url=url,
                     message_id=msg.id,
                     posted_at=msg.created_at,
-                    report_date=report_date_from_url(url),
+                    report_date=rdate,
                     label=(msg.content or "")[:120],
                 )
-            )
+                reports.append(report)
 
-    dkp_debug("Rapports whitelistés", [r.url for r in reports])
+                dkp_debug(
+                    "RAPPORT DÉTECTÉ",
+                    {
+                        "url": url,
+                        "report_date": rdate.isoformat() if rdate else None,
+                        "discord_posted_at": msg.created_at.isoformat(),
+                        "eligible_for_request": report_within_delay(report, reference_time),
+                    },
+                )
+
+    except discord.Forbidden as exc:
+        raise RuntimeError(
+            "Le bot n'a pas la permission de lire l'historique de #logs-raid."
+        ) from exc
+    except discord.HTTPException as exc:
+        raise RuntimeError(
+            f"Discord n'a pas pu lire l'historique de #logs-raid : {exc}"
+        ) from exc
+
+    dkp_debug(
+        "RÉSUMÉ SCAN #logs-raid",
+        {
+            "messages_scannés": scanned_messages,
+            "messages_avec_url": messages_with_urls,
+            "rapports_uniques": len(reports),
+            "rapports_éligibles": sum(
+                1 for r in reports if report_within_delay(r, reference_time)
+            ),
+            "urls": [r.url for r in reports],
+        },
+    )
+
     return reports
-
 
 def report_within_delay(report: UwuReport, post_time: datetime) -> bool:
     # Best source is date encoded in UwU report URL.
@@ -1042,15 +1329,26 @@ async def analyze_dkparse_message(
             None,
         )
 
-    main_map, _ = await build_main_map(guild)
-    character = explicit_character_from_post(message.content) or main_map.get(message.author.id)
+    # Source du personnage DKPARSE = le nom visible sur le screenshot.
+    # Aucun fallback sur le nom Discord ni sur #Main.
+    character, ocr_detail = await extract_character_from_screenshot(message)
+
     if not character:
         return (
             "⚠️ **DKPARSE À VÉRIFIER**\n"
-            "Impossible de déterminer le personnage. Le joueur n'a pas de main "
-            "reconnu dans #Main et le message ne contient pas `perso: Nom`.",
+            f"{ocr_detail}\n"
+            "Aucun personnage n'est supposé à partir du nom Discord.",
             None,
         )
+
+    dkp_debug(
+        "PERSONNAGE DKPARSE",
+        {
+            "discord_author": f"{message.author} ({message.author.id})",
+            "character_from_screen": character,
+            "detail": ocr_detail,
+        },
+    )
 
     requested_bosses = requested_bosses_from_post(message.content)
     requested_spec = requested_spec_from_post(message.content)
@@ -1060,9 +1358,10 @@ async def analyze_dkparse_message(
 
     if not reports:
         return (
-            f"❌ **DKPARSE REFUSÉE — {character}**\n"
-            f"Aucun rapport UwU whitelisté dans #logs-raid sur les "
-            f"{DKPARSE_MAX_DAYS} jours précédant ce post.",
+            f"⚠️ **DKPARSE À VÉRIFIER — {character}**\n"
+            f"Personnage lu sur le screen : **{character}**\n"
+            f"Aucun rapport UwU exploitable trouvé dans #logs-raid pour cette demande.\n"
+            f"Fenêtre DKPARSE : {DKPARSE_MAX_DAYS} jours avant le post du joueur.",
             None,
         )
 
@@ -1101,7 +1400,12 @@ async def analyze_dkparse_message(
                         )
                     )
             except Exception as exc:
-                errors.append(f"{report.url}: {exc}")
+                error_text = f"{report.url}: {type(exc).__name__}: {exc}"
+                errors.append(error_text)
+                dkp_debug(
+                    "UWU LECTURE ECHEC",
+                    {"url": report.url, "error": error_text},
+                )
 
     await asyncio.gather(*(inspect_one(r) for r in reports))
     hits = dedupe_hits(all_hits)
@@ -1133,6 +1437,7 @@ async def analyze_dkparse_message(
 
     lines = [
         f"**DKPARSE — {character}**",
+        f"Personnage lu sur le screen : **{character}**",
         f"Post : {message.created_at.strftime('%d/%m/%Y')} — "
         f"fenêtre : {DKPARSE_MAX_DAYS} jours",
         f"Logs guilde examinés : {len(reports)}",
@@ -1162,9 +1467,10 @@ async def analyze_dkparse_message(
     if not valid_hits:
         lines += [
             "",
-            "⚠️ **Aucun bonus auto-validé.**",
-            "Le bot n'a pas trouvé dans les rapports whitelistés une preuve "
-            "suffisamment complète `personnage + boss + parse + spec`.",
+            "⚠️ **DKPARSE À VÉRIFIER**",
+            f"Personnage lu sur le screen : **{character}**",
+            "Aucune parse exploitable correspondant à ce personnage n'a été "
+            "trouvée dans les rapports guilde éligibles.",
         ]
         if errors:
             lines.append(
@@ -1212,10 +1518,13 @@ async def run_dkparse_check(
     await interaction.response.defer(ephemeral=False, thinking=True)
     try:
         report, export = await analyze_dkparse_message(interaction.guild, message)
-        await interaction.followup.send(
-            report,
-            view=DKParseExportView(export) if export else None,
-        )
+        if export:
+            await interaction.followup.send(
+                report,
+                view=DKParseExportView(export),
+            )
+        else:
+            await interaction.followup.send(report)
     except Exception as exc:
         if DKPARSE_DEBUG:
             import traceback
@@ -1308,15 +1617,21 @@ async def dkparse_logs(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True, thinking=True)
     try:
         now = datetime.now(timezone.utc)
-        reports = await scan_whitelisted_reports(interaction.guild, now)
-        reports = [r for r in reports if report_within_delay(r, now)]
+        all_reports = await scan_whitelisted_reports(interaction.guild, now)
+        reports = [r for r in all_reports if report_within_delay(r, now)]
         if not reports:
             await interaction.followup.send(
-                "Aucun rapport UwU récent trouvé dans #logs-raid.", ephemeral=True
+                f"Aucun rapport UwU éligible trouvé dans #logs-raid. "
+                f"({len(all_reports)} rapport(s) détecté(s) dans le scan.)",
+                ephemeral=True,
             )
             return
 
-        lines = [f"**{len(reports)} rapport(s) UwU whitelisté(s)**", ""]
+        lines = [
+            f"**{len(reports)} rapport(s) UwU éligible(s)** "
+            f"({len(all_reports)} détecté(s) au total)",
+            "",
+        ]
         for r in reports[:40]:
             date_txt = (
                 r.report_date.strftime("%d/%m/%Y")
@@ -1407,6 +1722,7 @@ async def on_ready():
     print(f"#logs-raid channel ID: {LOGS_RAID_CHANNEL_ID or 'NON CONFIGURE'}")
     print(f"#dkparse channel ID: {DKPARSE_CHANNEL_ID or 'NON CONFIGURE'}")
     print(f"DKPARSE window: {DKPARSE_MAX_DAYS} jours")
+    print("DKPARSE OCR: " + ("RapidOCR OK" if (RapidOCR is not None and Image is not None and np is not None) else "INDISPONIBLE"))
 
 
 @bot.event
