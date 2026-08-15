@@ -37,7 +37,7 @@ WOW_NAME_RE = re.compile(r"^[A-Za-z]{2,12}$")
 # V2 : mode diagnostic Raid-Helper.
 # Laisser à True pendant les tests. Une fois le format exact des statuts connu,
 # on pourra le remettre à False.
-RH_DEBUG = True
+RH_DEBUG = False
 
 STATUS_ORDER = ["signed", "bench", "late", "tentative", "absence", "unknown"]
 STATUS_LABELS = {
@@ -110,9 +110,11 @@ def get_first(d: Dict[str, Any], keys: Iterable[str], default=None):
 
 
 def normalize_status(raw: Any) -> str:
+    """Legacy fallback for unusual/custom Raid-Helper payloads."""
     s = str(raw or "").strip().lower()
 
     aliases = {
+        "primary": "signed",
         "signed": "signed",
         "signup": "signed",
         "accepted": "signed",
@@ -137,6 +139,7 @@ def normalize_status(raw: Any) -> str:
         "declined": "absence",
         "no": "absence",
     }
+
     if s in aliases:
         return aliases[s]
 
@@ -150,7 +153,40 @@ def normalize_status(raw: Any) -> str:
         return "absence"
     if "sign" in s or "accept" in s or "confirm" in s:
         return "signed"
+
     return "unknown"
+
+
+def signup_category(entry: Dict[str, Any]) -> str:
+    """
+    Raid-Helper WotLK template observed on Apogee:
+    - normal classes => signed
+    - className/cClassName = Late => late
+    - Bench => bench
+    - Tentative => tentative
+    - Absence => absence
+
+    status itself stays 'primary' for all of these.
+    """
+    class_name = str(
+        get_first(entry, ["className", "cClassName"], "")
+    ).strip().lower()
+
+    if class_name == "late":
+        return "late"
+    if class_name == "bench":
+        return "bench"
+    if class_name == "tentative":
+        return "tentative"
+    if class_name == "absence":
+        return "absence"
+
+    # Anything else with a valid Discord signup is a normal signup.
+    if class_name:
+        return "signed"
+
+    # Fallback in case Raid-Helper changes its payload.
+    return normalize_status(extract_raw_status(entry))
 
 
 def find_signup_lists(obj: Any) -> List[List[Dict[str, Any]]]:
@@ -274,7 +310,7 @@ def extract_signup(entry: Dict[str, Any]) -> Optional[Signup]:
         name = f"Discord {uid}"
 
     raw_status = extract_raw_status(entry)
-    normalized = normalize_status(raw_status)
+    normalized = signup_category(entry)
 
     signup = Signup(
         user_id=int(uid),
@@ -373,7 +409,7 @@ def parse_event_payload(payload: Any) -> Tuple[List[Signup], str]:
 async def fetch_raid_helper_event(event_id: int) -> Any:
     url = RAID_HELPER_API.format(event_id=event_id)
     timeout = aiohttp.ClientTimeout(total=15)
-    headers = {"User-Agent": "ApogeeRaidHelperBot/2.0-debug"}
+    headers = {"User-Agent": "ApogeeRaidHelperBot/3.0"}
 
     if RH_DEBUG:
         print(f"\n[RH DEBUG] GET {url}")
@@ -828,10 +864,9 @@ async def on_message_edit(
 
 @bot.event
 async def on_ready():
-    print("Apogee Raid-Helper Bot V2 DEBUG")
+    print("Apogee Raid-Helper Bot V3")
     print(f"Connecté en tant que {bot.user} ({bot.user.id})")
     print(f"#Main channel ID: {MAIN_CHANNEL_ID}")
-    print(f"RH_DEBUG: {RH_DEBUG}")
 
 
 @bot.event
