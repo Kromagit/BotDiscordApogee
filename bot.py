@@ -650,10 +650,13 @@ async def run_rh_list(interaction: discord.Interaction, message: discord.Message
         export_text = "RH|" + "|".join(sorted(export_items, key=str.lower))
         chunks = split_discord_text("\n".join(lines))
         for index, chunk in enumerate(chunks):
-            await interaction.followup.send(
-                chunk,
-                view=ExportView(export_text) if index == len(chunks) - 1 else None,
-            )
+            if index == len(chunks) - 1:
+                await interaction.followup.send(
+                    chunk,
+                    view=ExportView(export_text),
+                )
+            else:
+                await interaction.followup.send(chunk)
     except Exception as exc:
         if RH_DEBUG:
             print(repr(exc))
@@ -1212,10 +1215,13 @@ async def run_dkparse_check(
     await interaction.response.defer(ephemeral=False, thinking=True)
     try:
         report, export = await analyze_dkparse_message(interaction.guild, message)
-        await interaction.followup.send(
-            report,
-            view=DKParseExportView(export) if export else None,
-        )
+        if export:
+            await interaction.followup.send(
+                report,
+                view=DKParseExportView(export),
+            )
+        else:
+            await interaction.followup.send(report)
     except Exception as exc:
         if DKPARSE_DEBUG:
             import traceback
