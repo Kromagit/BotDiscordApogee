@@ -1470,34 +1470,21 @@ def build_kromaddon_dkparse_export(
     character: str, post_time: datetime, hits: List[ParseHit]
 ) -> str:
     """
-    Export DKPARSE non cumulatif.
+    Export DKPARSE cumulatif.
 
-    Un joueur ne touche qu'un seul bonus DKPARSE pour son post : le meilleur
-    palier atteint parmi tous les boss validés. Les autres boss restent dans
-    l'export pour conserver le détail de la vérification, mais leur DKP vaut 0
-    afin d'éviter tout double crédit côté Kromaddon si celui-ci additionne les
-    lignes BOSS.
+    Chaque boss explicitement demandé dans le post et validé reçoit
+    son propre bonus DKPARSE. TOTAL est la somme de tous ces bonus.
     """
-    best_hit = max(hits, key=lambda h: dkp_for_parse(h.parse)) if hits else None
-    total = dkp_for_parse(best_hit.parse) if best_hit else 0
-
     lines = [
         "KROMADDON_DKPARSE_V1",
         f"PLAYER={character}",
         f"POST_DATE={post_time.date().isoformat()}",
     ]
 
-    reward_assigned = False
+    total = 0
     for h in hits:
-        amount = 0
-        if (
-            best_hit is not None
-            and not reward_assigned
-            and h is best_hit
-        ):
-            amount = total
-            reward_assigned = True
-
+        amount = dkp_for_parse(h.parse)
+        total += amount
         lines.append(
             "BOSS="
             + h.boss
@@ -1725,33 +1712,24 @@ async def analyze_dkparse_message(
     ]
 
     if valid_hits:
-        # DKPARSE = bonus unique par post/joueur, NON cumulatif entre les boss.
-        # On garde toutes les améliorations dans le rapport, puis on paie
-        # uniquement le meilleur palier atteint.
-        best_hit = max(valid_hits, key=lambda h: dkp_for_parse(h.parse))
-        total = dkp_for_parse(best_hit.parse)
+        # DKPARSE cumulatif : chaque boss demandé et validé rapporte son bonus.
+        total = 0
 
         for hit in valid_hits:
             amount = dkp_for_parse(hit.parse)
+            total += amount
             date_txt = (
                 hit.report_date.strftime("%d/%m/%Y")
                 if hit.report_date else "date UwU inconnue"
             )
-            marker = "🏆" if hit is best_hit else "✅"
-            suffix = (
-                f"→ **+{amount} DKP VALIDÉ**"
-                if hit is best_hit
-                else f"→ palier **+{amount} DKP** (non cumulé)"
-            )
             lines.append(
-                f"{marker} **{hit.boss}** — {hit.parse:.2f}% — "
-                f"{hit.spec} — {date_txt} {suffix}"
+                f"✅ **{hit.boss}** — {hit.parse:.2f}% — "
+                f"{hit.spec} — {date_txt} → **+{amount} DKP VALIDÉ**"
             )
 
         lines += [
             "",
-            f"**BONUS DKPARSE VALIDÉ : +{total} DKP**",
-            "_Un seul bonus est attribué : le meilleur palier du post._",
+            f"**BONUS DKPARSE TOTAL : +{total} DKP**",
         ]
 
     if uncertain_hits:
