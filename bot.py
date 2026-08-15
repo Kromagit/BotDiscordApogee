@@ -916,14 +916,14 @@ async def scan_whitelisted_reports(
         guild, LOGS_RAID_CHANNEL_ID, "LOGS_RAID_CHANNEL_ID"
     )
 
-    # IMPORTANT:
-    # On ne limite plus history() à la fenêtre exacte des 8 jours.
-    # Discord.py peut être trompeur ici avec les bornes after/before + timezone,
-    # surtout pour un message posté autour de minuit. On parcourt une fenêtre
-    # plus large puis on applique la vraie règle des 8 jours sur report_date.
-    scan_days = max(DKPARSE_MAX_DAYS + 7, 21)
-    after = reference_time - timedelta(days=scan_days)
-    before = reference_time + timedelta(days=2)
+    # FIX V2:
+    # Ne pas utiliser after/before dans channel.history().
+    # Sur l'environnement Discord Apogee, ces bornes renvoyaient 0 message
+    # alors que le salon et les messages étaient bien visibles.
+    #
+    # Le salon #logs-raid contient peu de messages : on lit simplement les
+    # derniers messages puis on filtre nous-mêmes selon la date UwU.
+    HISTORY_LIMIT = 300
 
     reports: List[UwuReport] = []
     seen: set[str] = set()
@@ -936,83 +936,95 @@ async def scan_whitelisted_reports(
             "channel_id": channel.id,
             "channel_name": channel.name,
             "reference_time": reference_time.isoformat(),
-            "after": after.isoformat(),
-            "before": before.isoformat(),
-            "scan_days": scan_days,
+            "history_limit": HISTORY_LIMIT,
+            "mode": "latest messages, no Discord after/before filter",
         },
     )
 
-    async for msg in channel.history(
-        limit=None,
-        after=after,
-        before=before,
-        oldest_first=True,
-    ):
-        scanned_messages += 1
+    try:
+        async for msg in channel.history(
+            limit=HISTORY_LIMIT,
+            oldest_first=False,
+        ):
+            scanned_messages += 1
 
-        combined_parts = [msg.content or ""]
+            combined_parts = [msg.content or ""]
 
-        # Discord may store links in embeds rather than plain content.
-        for embed in msg.embeds:
-            if embed.url:
-                combined_parts.append(embed.url)
-            if embed.title:
-                combined_parts.append(embed.title)
-            if embed.description:
-                combined_parts.append(embed.description)
-            for field in embed.fields:
-                if field.name:
-                    combined_parts.append(field.name)
-                if field.value:
-                    combined_parts.append(field.value)
+            # Liens éventuellement transformés en embeds par Discord.
+            for embed in msg.embeds:
+                if embed.url:
+                    combined_parts.append(embed.url)
+                if embed.title:
+                    combined_parts.append(embed.title)
+                if embed.description:
+                    combined_parts.append(embed.description)
+                for field in embed.fields:
+                    if field.name:
+                        combined_parts.append(field.name)
+                    if field.value:
+                        combined_parts.append(field.value)
 
-        # Also inspect attachment URLs just in case somebody posted a txt/link file.
-        for attachment in msg.attachments:
-            combined_parts.append(attachment.url or "")
-            combined_parts.append(attachment.filename or "")
+            # Pièces jointes, au cas où.
+            for attachment in msg.attachments:
+                combined_parts.append(attachment.url or "")
+                combined_parts.append(attachment.filename or "")
 
-        combined = "\n".join(x for x in combined_parts if x)
-        urls = extract_uwu_urls(combined)
+            combined = "\n".join(x for x in combined_parts if x)
+            urls = extract_uwu_urls(combined)
 
-        dkp_debug(
-            f"MSG {msg.id}",
-            {
-                "created_at": msg.created_at.isoformat(),
-                "author": f"{msg.author} ({msg.author.id})",
-                "content": (msg.content or "")[:500],
-                "urls_found": urls,
-            },
-        )
+            if DKPARSE_DEBUG:
+                dkp_debug(
+                    f"MSG {msg.id}",
+                    {
+                        "created_at": msg.created_at.isoformat(),
+                        "author": f"{msg.author} ({msg.author.id})",
+                        "content": (msg.content or "")[:500],
+                        "urls_found": urls,
+                    },
+                )
 
-        if urls:
-            messages_with_urls += 1
+            if urls:
+                messages_with_urls += 1
 
-        for url in urls:
-            if url in seen:
-                dkp_debug("URL DUPLIQUÉE IGNORÉE", url)
-                continue
+            for url in urls:
+                if url in seen:
+                    dkp_debug("URL DUPLIQUÉE IGNORÉE", url)
+                    continue
 
-            seen.add(url)
-            rdate = report_date_from_url(url)
+                seen.add(url)
+                rdate = report_date_from_url(url)
+                report = UwuReport(
+                    url=url,
+                    message_id=msg.id,
+                    posted_at=msg.created_at,
+                    report_date=rdate,
+                    label=(msg.content or "")[:120],
+                )
+                reports.append(report)
 
-            report = UwuReport(
-                url=url,
-                message_id=msg.id,
-                posted_at=msg.created_at,
-                report_date=rdate,
-                label=(msg.content or "")[:120],
-            )
-            reports.append(report)
+                dkp_debug(
+                    "RAPPORT DÉTECTÉ",
+                    {
+                        "url": url,
+                        "report_date": rdate.isoformat() if rdate else None,
+                        "discord_posted_at": msg.created_at.isoformat(),
+                        "eligible_for_request": report_within_delay(
+                            report, reference_time
+                        ),
+                    },
+                )
 
-            dkp_debug(
-                "RAPPORT AJOUTÉ",
-                {
-                    "url": url,
-                    "report_date": rdate.isoformat() if rdate else None,
-                    "discord_posted_at": msg.created_at.isoformat(),
-                    "within_delay": report_within_delay(report, reference_time),
-                },
-            )
+    except discord.Forbidden as exc:
+        raise RuntimeError(
+            "Le bot n'a pas la permission de lire l'historique de #logs-raid. "
+            "Active au minimum Voir le salon + Lire l'historique des messages "
+            "pour le rôle du bot."
+        ) from exc
+
+    except discord.HTTPException as exc:
+        raise RuntimeError(
+            f"Discord n'a pas pu lire l'historique de #logs-raid : {exc}"
+        ) from exc
 
     dkp_debug(
         "RÉSUMÉ SCAN #logs-raid",
@@ -1020,11 +1032,14 @@ async def scan_whitelisted_reports(
             "messages_scannés": scanned_messages,
             "messages_avec_url": messages_with_urls,
             "rapports_uniques": len(reports),
+            "rapports_éligibles": sum(
+                1 for r in reports if report_within_delay(r, reference_time)
+            ),
             "urls": [r.url for r in reports],
         },
     )
-    return reports
 
+    return reports
 
 def report_within_delay(report: UwuReport, post_time: datetime) -> bool:
     # Best source is date encoded in UwU report URL.
