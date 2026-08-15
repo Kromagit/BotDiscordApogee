@@ -185,6 +185,7 @@ DKPARSE_BRACKETS = (
 BOSS_ALIASES = {
     "lord marrowgar": "Lord Marrowgar",
     "marrowgar": "Lord Marrowgar",
+    "marrow": "Lord Marrowgar",
     "lady deathwhisper": "Lady Deathwhisper",
     "deathwhisper": "Lady Deathwhisper",
     "gunship battle": "Gunship Battle",
@@ -205,6 +206,7 @@ BOSS_ALIASES = {
     "valithria dreamwalker": "Valithria Dreamwalker",
     "valithria": "Valithria Dreamwalker",
     "sindragosa": "Sindragosa",
+    "sindra": "Sindragosa",
     "the lich king": "The Lich King",
     "lich king": "The Lich King",
     "lk": "The Lich King",
@@ -863,6 +865,198 @@ async def extract_character_from_screenshot(
     return None, "Le nom du personnage n'a pas pu être lu de façon fiable sur le screenshot."
 
 
+
+def _ocr_result_items(ocr_result: Any) -> List[Dict[str, Any]]:
+    """Normalize RapidOCR output into positioned text items."""
+    if isinstance(ocr_result, tuple) and ocr_result:
+        ocr_result = ocr_result[0]
+    if not isinstance(ocr_result, list):
+        return []
+
+    out: List[Dict[str, Any]] = []
+    for item in ocr_result:
+        if not isinstance(item, (list, tuple)) or len(item) < 2:
+            continue
+        box = item[0]
+        raw = str(item[1] or "").strip()
+        try:
+            confidence = float(item[2]) if len(item) >= 3 else 0.5
+        except Exception:
+            confidence = 0.5
+        x1, y1, x2, y2 = _box_geometry(box)
+        out.append({
+            "raw": raw,
+            "lower": raw.lower(),
+            "confidence": confidence,
+            "x1": x1,
+            "y1": y1,
+            "x2": x2,
+            "y2": y2,
+            "cx": (x1 + x2) / 2.0,
+            "cy": (y1 + y2) / 2.0,
+            "h": max(1.0, y2 - y1),
+        })
+    return out
+
+
+def _ocr_percent_value(raw: str) -> Optional[float]:
+    """Read one OCR cell as a 0..100 decimal percentage-like value."""
+    text = (raw or "").strip().replace("%", "").replace(",", ".")
+    # Points in the UwU table are decimals such as 90.98 / 94.50 / 81.15.
+    m = re.fullmatch(r"\s*(\d{1,3}(?:\.\d{1,3})?)\s*", text)
+    if not m:
+        return None
+    try:
+        value = float(m.group(1))
+    except ValueError:
+        return None
+    return value if 0.0 <= value <= 100.0 else None
+
+
+def parse_requested_points_from_ocr(
+    ocr_result: Any,
+    requested_bosses: List[str],
+    image_width: int,
+    image_height: int,
+) -> Dict[str, float]:
+    """
+    Read the orange/red `Points` column from the UwU character screenshot.
+
+    This is the DKPARSE value the user sees on the screenshot. Fight pages are
+    used only to prove participation/date/spec; they must not invent/replace
+    this value (the old parser could incorrectly pick unrelated 100 values).
+    """
+    if not requested_bosses:
+        return {}
+
+    items = _ocr_result_items(ocr_result)
+    if not items:
+        return {}
+
+    # Locate the table header. RapidOCR usually returns `Points` as one cell.
+    point_headers = [
+        it for it in items
+        if "point" in it["lower"]
+        and (image_height <= 0 or it["cy"] <= image_height * 0.45)
+    ]
+    points_x: Optional[float] = None
+    if point_headers:
+        # Prefer the highest-confidence header near the middle of the table.
+        header = max(point_headers, key=lambda it: (it["confidence"], -abs(it["cx"] - image_width * 0.5)))
+        points_x = header["cx"]
+
+    # Fallback: infer Points between Rank and Best Dps headers.
+    if points_x is None:
+        rank_headers = [it for it in items if it["lower"].strip() == "rank"]
+        best_headers = [it for it in items if "best" in it["lower"]]
+        if rank_headers and best_headers:
+            rx = max(rank_headers, key=lambda it: it["confidence"])["cx"]
+            bx = max(best_headers, key=lambda it: it["confidence"])["cx"]
+            points_x = (rx + bx) / 2.0
+
+    if points_x is None:
+        dkp_debug("OCR POINTS HEADER INTROUVABLE", {"requested_bosses": requested_bosses})
+        return {}
+
+    found: Dict[str, float] = {}
+    for boss in requested_bosses:
+        boss_cells = [
+            it for it in items
+            if normalize_boss(it["raw"]) == boss
+        ]
+        if not boss_cells:
+            continue
+        boss_cell = max(boss_cells, key=lambda it: it["confidence"])
+        row_tol = max(10.0, boss_cell["h"] * 0.9, image_height * 0.012)
+
+        candidates: List[Tuple[float, float, Dict[str, Any]]] = []
+        for it in items:
+            if abs(it["cy"] - boss_cell["cy"]) > row_tol:
+                continue
+            value = _ocr_percent_value(it["raw"])
+            if value is None:
+                continue
+            # Distance to the Points-column header is the primary criterion.
+            xdist = abs(it["cx"] - points_x)
+            candidates.append((xdist, -it["confidence"], it))
+
+        if not candidates:
+            continue
+        candidates.sort(key=lambda t: (t[0], t[1]))
+        best_item = candidates[0][2]
+        value = _ocr_percent_value(best_item["raw"])
+        if value is not None:
+            found[boss] = value
+
+    dkp_debug(
+        "OCR POINTS DKPARSE",
+        {
+            "requested_bosses": requested_bosses,
+            "points_x": round(points_x, 1),
+            "values": found,
+        },
+    )
+    return found
+
+
+async def extract_dkparse_screenshot_data(
+    message: discord.Message,
+    requested_bosses: List[str],
+) -> Tuple[Optional[str], str, Dict[str, float]]:
+    """Read character name + requested boss Points values in a single OCR pass."""
+    image_attachments = [a for a in message.attachments if is_image_attachment(a)]
+    if not image_attachments:
+        return None, "Aucun screenshot image joint au message.", {}
+
+    if RapidOCR is None or Image is None or np is None:
+        missing = []
+        if RapidOCR is None:
+            missing.append("rapidocr_onnxruntime")
+        if Image is None:
+            missing.append("Pillow")
+        if np is None:
+            missing.append("numpy")
+        return (
+            None,
+            "OCR local indisponible (" + ", ".join(missing) + "). "
+            "Installer : pip install rapidocr_onnxruntime pillow numpy",
+            {},
+        )
+
+    engine = get_ocr_engine()
+    if engine is None:
+        return None, "Impossible d'initialiser RapidOCR.", {}
+
+    all_candidates: List[Dict[str, Any]] = []
+    for att in image_attachments[:4]:
+        try:
+            raw = await download_attachment_bytes(att)
+            image = Image.open(io.BytesIO(raw)).convert("RGB")
+            width, height = image.size
+            result, _elapsed = engine(np.array(image))
+            name, candidates = choose_character_from_ocr(result, width, height)
+            points = parse_requested_points_from_ocr(result, requested_bosses, width, height)
+            for c in candidates[:10]:
+                c["attachment"] = att.filename
+            all_candidates.extend(candidates[:10])
+            dkp_debug(
+                "OCR DKPARSE COMPLET",
+                {
+                    "attachment": att.filename,
+                    "size": [width, height],
+                    "selected": name,
+                    "points": points,
+                    "candidates": candidates[:10],
+                },
+            )
+            if name:
+                return name, f"Nom lu sur le screen : {name}", points
+        except Exception as exc:
+            dkp_debug("OCR DKPARSE ECHEC", {"attachment": att.filename, "error": repr(exc)})
+
+    dkp_debug("OCR CANDIDATS GLOBAUX", all_candidates[:20])
+    return None, "Le nom du personnage n'a pas pu être lu de façon fiable sur le screenshot.", {}
+
 # =============================================================================
 # DKPARSE
 # =============================================================================
@@ -1296,48 +1490,112 @@ def parse_hits_from_fight_page(
     return hits
 
 
-async def fetch_uwu_url(url: str) -> Tuple[str, str]:
-    timeout = aiohttp.ClientTimeout(total=25)
+
+def parse_presence_from_fight_page(
+    raw_html: str,
+    character: str,
+    fight_url: str,
+    report_date: Optional[datetime],
+    screenshot_parse: float,
+) -> Optional[ParseHit]:
+    """Prove character participation/spec on one requested boss; parse comes from screenshot."""
+    boss = boss_from_uwu_url(fight_url)
+    if not boss or boss in DKPARSE_EXCLUDED_BOSSES:
+        return None
+
+    rows = re.findall(r"(?is)<tr\b[^>]*>.*?</tr>", raw_html)
+    exact_rows = [
+        row for row in rows
+        if re.search(rf"(?i)(?<![A-Za-z]){re.escape(character)}(?![A-Za-z])", row)
+    ]
+    relevant_rows = exact_rows or [row for row in rows if _row_matches_character(row, character)]
+
+    fragments: List[str] = relevant_rows[:10]
+    if not fragments:
+        # Conservative fallback around an exact textual occurrence only.
+        for m in re.finditer(re.escape(character), raw_html, re.IGNORECASE):
+            fragments.append(raw_html[max(0, m.start()-1400):min(len(raw_html), m.end()+2200)])
+            if len(fragments) >= 5:
+                break
+
+    if not fragments:
+        return None
+
+    # Prefer a recognized DKPARSE spec if one appears in the player's row/fragment.
+    spec = ""
+    for fragment in fragments:
+        spec = normalize_spec(html_to_text(fragment) + " " + fragment)
+        if spec:
+            break
+
+    return ParseHit(
+        character=character,
+        boss=boss,
+        parse=screenshot_parse,
+        spec=spec,
+        report_url=fight_url,
+        report_date=report_date,
+        evidence="Screenshot Points + présence UwU",
+    )
+
+
+def _fight_url_priority(url: str) -> Tuple[int, int]:
+    """Prefer a concrete attempt URL, then mode URL, then generic boss URL."""
+    q = parse_qs(urlsplit(html_lib.unescape(url)).query)
+    has_attempt = 0 if "attempt" in q else 1
+    has_mode = 0 if "mode" in q else 1
+    return has_attempt, has_mode
+
+async def _fetch_uwu_with_retry(url: str, user_agent: str) -> Tuple[str, str]:
+    timeout = aiohttp.ClientTimeout(total=30)
     headers = {
-        "User-Agent": "ApogeeDKParseBot/1.2 (+Discord guild tooling)",
+        "User-Agent": user_agent,
         "Accept": "text/html,application/xhtml+xml",
     }
-
-    async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
-        async with session.get(url, allow_redirects=True) as resp:
-            body = await resp.text(errors="replace")
-            if resp.status != 200:
+    last_status = None
+    for attempt in range(4):
+        async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
+            async with session.get(url, allow_redirects=True) as resp:
+                body = await resp.text(errors="replace")
+                last_status = resp.status
+                if resp.status == 200:
+                    return str(resp.url), body
+                if resp.status == 429:
+                    retry_raw = resp.headers.get("Retry-After", "")
+                    try:
+                        delay = float(retry_raw)
+                    except (TypeError, ValueError):
+                        delay = 1.25 * (2 ** attempt)
+                    delay = max(0.75, min(delay, 8.0))
+                    dkp_debug("UWU 429 RETRY", {"url": url, "attempt": attempt + 1, "delay": delay})
+                    await asyncio.sleep(delay)
+                    continue
                 raise RuntimeError(f"UwU HTTP {resp.status}")
-            return str(resp.url), body
+    raise RuntimeError(f"UwU HTTP {last_status or 429} après retries")
+
+
+async def fetch_uwu_url(url: str) -> Tuple[str, str]:
+    return await _fetch_uwu_with_retry(url, "ApogeeDKParseBot/1.3 (+Discord guild tooling)")
 
 
 async def fetch_uwu_report(report: UwuReport) -> Tuple[str, str]:
-    timeout = aiohttp.ClientTimeout(total=25)
-    headers = {
-        "User-Agent": "ApogeeDKParseBot/1.1 (+Discord guild tooling)",
-        "Accept": "text/html,application/xhtml+xml",
-    }
-
     dkp_debug("UWU LECTURE DEBUT", report.url)
-
-    async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
-        async with session.get(report.url, allow_redirects=True) as resp:
-            body = await resp.text(errors="replace")
-
-            dkp_debug(
-                "UWU LECTURE REPONSE",
-                {
-                    "requested_url": report.url,
-                    "final_url": str(resp.url),
-                    "status": resp.status,
-                    "content_type": resp.headers.get("Content-Type"),
-                    "body_chars": len(body),
-                },
-            )
-
-            if resp.status != 200:
-                raise RuntimeError(f"UwU HTTP {resp.status}")
-            return str(resp.url), body
+    try:
+        final_url, body = await _fetch_uwu_with_retry(
+            report.url, "ApogeeDKParseBot/1.3 (+Discord guild tooling)"
+        )
+        dkp_debug(
+            "UWU LECTURE REPONSE",
+            {
+                "requested_url": report.url,
+                "final_url": final_url,
+                "status": 200,
+                "body_chars": len(body),
+            },
+        )
+        return final_url, body
+    except Exception:
+        raise
 
 
 async def scan_whitelisted_reports(
@@ -1483,12 +1741,18 @@ def explicit_character_from_post(content: str) -> Optional[str]:
 
 
 def requested_bosses_from_post(content: str) -> List[str]:
+    """Return only bosses explicitly named in the post, in textual order."""
     text = (content or "").lower()
-    found = []
-    for alias, boss in sorted(BOSS_ALIASES.items(), key=lambda kv: -len(kv[0])):
-        if alias in text and boss not in found and boss not in DKPARSE_EXCLUDED_BOSSES:
-            found.append(boss)
-    return found
+    first_pos: Dict[str, int] = {}
+    for alias, boss in BOSS_ALIASES.items():
+        if boss in DKPARSE_EXCLUDED_BOSSES:
+            continue
+        pos = text.find(alias)
+        if pos < 0:
+            continue
+        if boss not in first_pos or pos < first_pos[boss]:
+            first_pos[boss] = pos
+    return [boss for boss, _pos in sorted(first_pos.items(), key=lambda kv: kv[1])]
 
 
 def requested_spec_from_post(content: str) -> str:
@@ -1545,15 +1809,32 @@ async def analyze_dkparse_message(
 ) -> Tuple[str, Optional[str]]:
     if DKPARSE_CHANNEL_ID and message.channel.id != DKPARSE_CHANNEL_ID:
         return (
-            "⚠️ Ce message n'est pas dans le salon DKPARSE configuré "
-            "(`DKPARSE_CHANNEL_ID`).",
+            "⚠️ Ce message n'est pas dans le salon DKPARSE configuré (`DKPARSE_CHANNEL_ID`).",
             None,
         )
 
-    # Source du personnage DKPARSE = le nom visible sur le screenshot.
-    # Aucun fallback sur le nom Discord ni sur #Main.
-    character, ocr_detail = await extract_character_from_screenshot(message)
+    requested_bosses = requested_bosses_from_post(message.content)
+    requested_spec = requested_spec_from_post(message.content)
+    dkp_debug(
+        "DEMANDE DKPARSE",
+        {
+            "content": message.content,
+            "requested_bosses": requested_bosses,
+            "requested_spec": requested_spec,
+        },
+    )
 
+    if not requested_bosses:
+        return (
+            "⚠️ **DKPARSE À VÉRIFIER**\n"
+            "Aucun boss DKPARSE reconnu dans le texte du post.\n"
+            "Utilise par exemple : `BPC 90%+ = 500 dkp`, `Marrow +94%`, `Sindra +80%`.",
+            None,
+        )
+
+    character, ocr_detail, screenshot_points = await extract_dkparse_screenshot_data(
+        message, requested_bosses
+    )
     if not character:
         return (
             "⚠️ **DKPARSE À VÉRIFIER**\n"
@@ -1562,173 +1843,120 @@ async def analyze_dkparse_message(
             None,
         )
 
+    missing_points = [boss for boss in requested_bosses if boss not in screenshot_points]
     dkp_debug(
-        "PERSONNAGE DKPARSE",
+        "PERSONNAGE + POINTS DKPARSE",
         {
             "discord_author": f"{message.author} ({message.author.id})",
             "character_from_screen": character,
-            "detail": ocr_detail,
+            "requested_bosses": requested_bosses,
+            "screenshot_points": screenshot_points,
+            "missing_points": missing_points,
         },
     )
 
-    requested_bosses = requested_bosses_from_post(message.content)
-    requested_spec = requested_spec_from_post(message.content)
-
     reports = await scan_whitelisted_reports(guild, message.created_at)
     reports = [r for r in reports if report_within_delay(r, message.created_at)]
+    reports.sort(key=lambda r: (r.report_date or r.posted_at), reverse=True)
 
     if not reports:
         return (
             f"⚠️ **DKPARSE À VÉRIFIER — {character}**\n"
             f"Personnage lu sur le screen : **{character}**\n"
-            f"Aucun rapport UwU exploitable trouvé dans #logs-raid pour cette demande.\n"
+            "Aucun rapport UwU exploitable trouvé dans #logs-raid pour cette demande.\n"
             f"Fenêtre DKPARSE : {DKPARSE_MAX_DAYS} jours avant le post du joueur.",
             None,
         )
 
     all_hits: List[ParseHit] = []
     errors: List[str] = []
+    found_bosses: set[str] = set()
 
-    # Avoid hammering UwU. A normal 8-day Apogee window is small.
-    semaphore = asyncio.Semaphore(3)
+    # Sequential on purpose: only requested bosses are queried, which avoids the
+    # hundreds of requests that previously triggered UwU HTTP 429.
+    for report in reports:
+        needed = [
+            boss for boss in requested_bosses
+            if boss not in found_bosses and boss in screenshot_points
+        ]
+        if not needed:
+            break
+        try:
+            final_url, raw_html = await fetch_uwu_report(report)
+            report2 = UwuReport(
+                url=canonical_uwu_url(final_url),
+                message_id=report.message_id,
+                posted_at=report.posted_at,
+                report_date=report.report_date or report_date_from_url(final_url),
+                label=report.label,
+            )
 
-    async def inspect_one(report: UwuReport):
-        async with semaphore:
-            try:
-                final_url, raw_html = await fetch_uwu_report(report)
-                report2 = UwuReport(
-                    url=canonical_uwu_url(final_url),
-                    message_id=report.message_id,
-                    posted_at=report.posted_at,
-                    report_date=report.report_date or report_date_from_url(final_url),
-                    label=report.label,
-                )
+            fight_urls = extract_uwu_fight_urls(raw_html, report2.url)
+            # Keep only bosses explicitly requested by the DKPARSE post.
+            by_boss: Dict[str, List[str]] = defaultdict(list)
+            for url in fight_urls:
+                boss = boss_from_uwu_url(url)
+                if boss in needed:
+                    by_boss[boss].append(url)
 
-                char_in_landing = character.lower() in raw_html.lower()
-                dkp_debug(
-                    "UWU LANDING",
-                    {
-                        "report": report2.url,
-                        "character": character,
-                        "character_present": char_in_landing,
-                    },
-                )
+            dkp_debug(
+                "UWU FIGHT LINKS FILTRÉS",
+                {
+                    "report": report2.url,
+                    "needed": needed,
+                    "counts": {boss: len(urls) for boss, urls in by_boss.items()},
+                },
+            )
 
-                if char_in_landing:
-                    structured = parse_hits_from_json(
-                        json_candidates_from_html(raw_html),
-                        character,
-                        report2.url,
-                        report2.report_date,
-                    )
-                    if structured:
-                        all_hits.extend(structured)
-                    else:
-                        all_hits.extend(
-                            parse_hits_from_text(
-                                raw_html, character, report2.url, report2.report_date
-                            )
-                        )
-
-                # UwU commonly keeps roster/player data on selected fight pages.
-                # Follow same-report ?boss=... links instead of returning when
-                # the character is absent from the landing page.
-                fight_urls = extract_uwu_fight_urls(raw_html, report2.url)
-                dkp_debug(
-                    "UWU FIGHT LINKS",
-                    {
-                        "report": report2.url,
-                        "count": len(fight_urls),
-                        "urls": fight_urls[:50],
-                    },
-                )
-
-                report_hits_before = len(all_hits)
-
-                for fight_url in fight_urls[:60]:
+            for boss in needed:
+                urls = sorted(dict.fromkeys(by_boss.get(boss, [])), key=_fight_url_priority)
+                # Usually the first attempt URL is enough. Try a few variants only
+                # if necessary, then stop immediately once participation is proven.
+                for fight_url in urls[:6]:
                     try:
                         page_url, fight_html = await fetch_uwu_url(fight_url)
                     except Exception as sub_exc:
                         dkp_debug(
                             "UWU FIGHT LECTURE ECHEC",
-                            {
-                                "url": fight_url,
-                                "error": f"{type(sub_exc).__name__}: {sub_exc}",
-                            },
+                            {"url": fight_url, "error": f"{type(sub_exc).__name__}: {sub_exc}"},
                         )
                         continue
 
-                    present = character.lower() in fight_html.lower()
-                    dkp_debug(
-                        "UWU FIGHT PAGE",
-                        {
-                            "url": page_url,
-                            "boss": boss_from_uwu_url(page_url),
-                            "character_present": present,
-                            "body_chars": len(fight_html),
-                        },
-                    )
-
-                    if not present:
-                        continue
-
-                    structured = parse_hits_from_json(
-                        json_candidates_from_html(fight_html),
+                    hit = parse_presence_from_fight_page(
+                        fight_html,
                         character,
                         page_url,
                         report2.report_date,
+                        screenshot_points[boss],
                     )
-                    if structured:
-                        all_hits.extend(structured)
-
-                    all_hits.extend(
-                        parse_hits_from_fight_page(
-                            fight_html,
-                            character,
-                            page_url,
-                            report2.report_date,
-                        )
+                    dkp_debug(
+                        "UWU FIGHT PAGE DEMANDÉE",
+                        {
+                            "url": page_url,
+                            "boss": boss,
+                            "character": character,
+                            "validated": bool(hit),
+                            "screenshot_parse": screenshot_points[boss],
+                        },
                     )
+                    if hit:
+                        all_hits.append(hit)
+                        found_bosses.add(boss)
+                        break
+                    await asyncio.sleep(0.10)
 
-                dkp_debug(
-                    "UWU RAPPORT RESULTAT",
-                    {
-                        "report": report2.url,
-                        "character": character,
-                        "new_hits": len(all_hits) - report_hits_before,
-                        "hits": [
-                            {
-                                "boss": h.boss,
-                                "parse": h.parse,
-                                "spec": h.spec,
-                                "evidence": h.evidence,
-                                "url": h.report_url,
-                            }
-                            for h in all_hits[report_hits_before:]
-                        ],
-                    },
-                )
+            await asyncio.sleep(0.15)
 
-            except Exception as exc:
-                error_text = f"{report.url}: {type(exc).__name__}: {exc}"
-                errors.append(error_text)
-                dkp_debug(
-                    "UWU LECTURE ECHEC",
-                    {"url": report.url, "error": error_text},
-                )
+        except Exception as exc:
+            error_text = f"{report.url}: {type(exc).__name__}: {exc}"
+            errors.append(error_text)
+            dkp_debug("UWU LECTURE ECHEC", {"url": report.url, "error": error_text})
 
-    await asyncio.gather(*(inspect_one(r) for r in reports))
     hits = dedupe_hits(all_hits)
-
-    if requested_bosses:
-        hits = [h for h in hits if h.boss in requested_bosses]
-
-    # Only parses that actually earn DKP are relevant.
+    # Hard safety filter: output/export can NEVER contain a non-requested boss.
+    hits = [h for h in hits if h.boss in requested_bosses]
     hits = [h for h in hits if dkp_for_parse(h.parse) > 0]
 
-    # Spec validation:
-    # - explicit spec in post -> every proven different spec is rejected
-    # - no explicit spec -> a hit with unknown spec is not auto-paid
     valid_hits: List[ParseHit] = []
     uncertain_hits: List[ParseHit] = []
     for hit in hits:
@@ -1748,25 +1976,26 @@ async def analyze_dkparse_message(
     lines = [
         f"**DKPARSE — {character}**",
         f"Personnage lu sur le screen : **{character}**",
-        f"Post : {message.created_at.strftime('%d/%m/%Y')} — "
-        f"fenêtre : {DKPARSE_MAX_DAYS} jours",
+        f"Post : {message.created_at.strftime('%d/%m/%Y')} — fenêtre : {DKPARSE_MAX_DAYS} jours",
         f"Logs guilde examinés : {len(reports)}",
         "",
     ]
 
+    for boss in missing_points:
+        lines.append(f"⚠️ **{boss}** — valeur `Points` illisible sur le screenshot")
+
     if valid_hits:
-        # DKPARSE CUMULATIF : chaque boss demandé et validé rapporte son bonus.
         total = 0
+        # Preserve requested-boss order from the post.
+        order = {boss: i for i, boss in enumerate(requested_bosses)}
+        valid_hits.sort(key=lambda h: order.get(h.boss, 999))
         for hit in valid_hits:
             amount = dkp_for_parse(hit.parse)
             total += amount
-            date_txt = (
-                hit.report_date.strftime("%d/%m/%Y")
-                if hit.report_date else "date UwU inconnue"
-            )
+            date_txt = hit.report_date.strftime("%d/%m/%Y") if hit.report_date else "date UwU inconnue"
             lines.append(
-                f"✅ **{hit.boss}** — {hit.parse:.2f}% — "
-                f"{hit.spec} — {date_txt} → **+{amount} DKP VALIDÉ**"
+                f"✅ **{hit.boss}** — {hit.parse:.2f}% — {hit.spec} — "
+                f"{date_txt} → **+{amount} DKP VALIDÉ**"
             )
         lines += ["", f"**BONUS DKPARSE TOTAL : +{total} DKP**"]
 
@@ -1775,19 +2004,24 @@ async def analyze_dkparse_message(
         for hit in uncertain_hits:
             lines.append(f"• {hit.boss} — {hit.parse:.2f}%")
 
+    missing_presence = [
+        boss for boss in requested_bosses
+        if boss in screenshot_points and boss not in {h.boss for h in hits}
+    ]
+    if missing_presence:
+        lines += ["", "**⚠️ Boss demandés non validés dans les logs guilde :**"]
+        lines.extend(f"• {boss}" for boss in missing_presence)
+
     if not valid_hits:
         lines += [
             "",
             "⚠️ **DKPARSE À VÉRIFIER**",
             f"Personnage lu sur le screen : **{character}**",
-            "Aucune parse exploitable correspondant à ce personnage n'a été "
-            "trouvée dans les pages de combat des rapports guilde éligibles.",
+            "Aucun boss demandé n'a pu être validé avec à la fois la valeur Points du screenshot "
+            "et la présence du personnage dans un rapport guilde éligible.",
         ]
         if errors:
-            lines.append(
-                f"{len(errors)} rapport(s) UwU n'ont pas pu être lus. "
-                "Active `DKPARSE_DEBUG=true` pour le détail."
-            )
+            lines.append(f"{len(errors)} rapport(s) UwU ont rencontré une erreur après retry.")
         return "\n".join(lines), None
 
     export = build_kromaddon_dkparse_export(character, message.created_at, valid_hits)
