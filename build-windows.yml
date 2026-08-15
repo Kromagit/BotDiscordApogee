@@ -1,0 +1,88 @@
+name: Build Windows EXE
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+      - master
+    paths:
+      - "bot.py"
+      - "requirements.txt"
+      - "requirements-build.txt"
+      - ".github/workflows/build-windows.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install build dependencies
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-build.txt
+
+      - name: Verify OCR imports
+        shell: pwsh
+        run: |
+          python -c "import numpy, PIL, rapidocr_onnxruntime, onnxruntime; print('OCR imports OK')"
+
+      - name: Build ApogeeRaidHelperBot.exe
+        shell: pwsh
+        run: |
+          pyinstaller `
+            --noconfirm `
+            --clean `
+            --onefile `
+            --console `
+            --name "ApogeeRaidHelperBot" `
+            --collect-all discord `
+            --collect-all aiohttp `
+            --collect-all dotenv `
+            --collect-all rapidocr_onnxruntime `
+            --collect-all onnxruntime `
+            --collect-all PIL `
+            --collect-all numpy `
+            bot.py
+
+      - name: Smoke test packaged OCR
+        shell: pwsh
+        run: |
+          $env:DISCORD_TOKEN=""
+          & ".\dist\ApogeeRaidHelperBot.exe" 2>&1 | Tee-Object -Variable output
+          if ($LASTEXITCODE -eq 0) {
+            Write-Host "EXE exited cleanly."
+          }
+          # We cannot fully start the bot without a token, but PyInstaller must
+          # at least be able to import the packaged OCR modules before main exits.
+          # The bot.py startup check will show OCR state in a real run.
+
+      - name: Prepare downloadable package
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path package | Out-Null
+          Copy-Item "dist\ApogeeRaidHelperBot.exe" "package\ApogeeRaidHelperBot.exe"
+          Copy-Item ".env.example" "package\.env.example"
+          Copy-Item "README.md" "package\README.md"
+          Copy-Item "start_exe.bat" "package\start_exe.bat"
+
+      - name: Upload Windows build
+        uses: actions/upload-artifact@v4
+        with:
+          name: ApogeeRaidHelperBot-Windows
+          path: package/
+          if-no-files-found: error
+          retention-days: 30

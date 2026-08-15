@@ -1,3 +1,6 @@
 discord.py>=2.5,<3
 aiohttp>=3.9,<4
 python-dotenv>=1.0,<2
+rapidocr_onnxruntime
+Pillow
+numpy
