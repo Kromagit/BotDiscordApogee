@@ -1,0 +1,44 @@
+APOGEE RAID-HELPER BOT V2 DEBUG
+
+REMPLACEMENT DANS GITHUB
+1. Ouvre Kromagit/BotDiscordApogee.
+2. Ouvre bot.py.
+3. Clique Edit this file (crayon).
+4. Ctrl+A dans l'éditeur GitHub.
+5. Remplace TOUT par le contenu du bot.py V2 fourni.
+6. Commit changes sur la branche main.
+
+RECOMPILATION
+Le workflow doit démarrer automatiquement parce qu'il surveille bot.py.
+Sinon :
+Actions -> Build Windows EXE -> Run workflow -> Run workflow.
+
+Quand le run est vert :
+1. ouvre le run ;
+2. télécharge l'artifact ApogeeRaidHelperBot-Windows ;
+3. extrais-le ;
+4. remplace seulement ton ancien ApogeeRaidHelperBot.exe ;
+5. garde ton .env actuel ;
+6. lance start_exe.bat.
+
+TEST
+Au démarrage, la console doit contenir :
+Apogee Raid-Helper Bot V2 DEBUG
+RH_DEBUG: True
+
+Puis :
+clic droit sur le même event Raid-Helper -> Apps -> RH List.
+
+La console affichera des blocs [RH DEBUG], notamment :
+- JSON RAID-HELPER BRUT
+- RAW SIGNUP
+- raw_status
+- normalized
+- RESULTAT FINAL PARSE
+
+Envoie une capture ou copie la partie concernant un inscrit normal, un bench,
+un retard, une tentative et un absent si ces statuts existent dans l'event.
+
+IMPORTANT
+Ne montre jamais DISCORD_TOKEN ni le contenu de .env.
+Le debug n'affiche pas le token Discord.
