@@ -1058,29 +1058,35 @@ def parse_hits_from_text(
 
         spec = normalize_spec(window)
 
-        # Strong labels first.
-        patterns = [
-            r"(?:parse|performance|points?|rank)\s*[:=]?\s*(\d{2,3}(?:[.,]\d+)?)\s*%?",
-            r"(\d{2,3}(?:[.,]\d+)?)\s*%\s*(?:parse|performance|points?|rank)?",
-        ]
+        # BUGFIX : le second motif rendait l'etiquette (parse/performance/
+        # points/rank) FACULTATIVE - n'importe quel "NN%" traine pres du nom
+        # du joueur (crit%, haste%, uptime%, barre de progression HTML, etc.)
+        # etait donc accepte comme parse. L'etiquette est maintenant
+        # TOUJOURS obligatoire pour ce chemin de secours (texte, pas JSON) :
+        # on prefere ne rien afficher plutot que d'afficher une valeur
+        # fausse, conformement a l'intention documentee de cette fonction.
+        pattern = r"(?:parse|performance|points?|rank)\s*[:=]?\s*(\d{2,3}(?:[.,]\d+)?)\s*%"
         values: List[float] = []
-        for pattern in patterns:
-            for m in re.finditer(pattern, window, re.IGNORECASE):
-                try:
-                    value = float(m.group(1).replace(",", "."))
-                except ValueError:
-                    continue
-                if 0 <= value <= 100:
-                    values.append(value)
+        for m in re.finditer(pattern, window, re.IGNORECASE):
+            try:
+                value = float(m.group(1).replace(",", "."))
+            except ValueError:
+                continue
+            if 70 <= value <= 100:
+                values.append(value)
 
-        # DKPARSE only starts at 70, which also removes many unrelated values.
-        values = [v for v in values if v >= 70]
         if not values:
             continue
 
-        # Use the largest candidate only inside this tightly bounded evidence
-        # window. If UwU exposes structured JSON, that path is preferred.
-        value = max(values)
+        # Une seule etiquette "parse" ne devrait apparaitre qu'une fois par
+        # ligne de joueur legitime ; si plusieurs valeurs concurrentes
+        # apparaissent dans la meme fenetre, c'est le signe que la fenetre
+        # couvre plusieurs joueurs/lignes - on rejette plutot que de deviner
+        # (evite d'afficher trop de boss sur la base d'une correspondance
+        # ambigue).
+        if len(values) > 1:
+            continue
+        value = values[0]
         hits.append(
             ParseHit(
                 character=character,
@@ -1154,15 +1160,21 @@ def _candidate_parse_values(text: str) -> List[float]:
     """
     Extract plausible performance/parse values.
 
-    Strong labelled values are preferred. As a fallback for an UwU player row,
-    decimal/percent values in the DKPARSE range are accepted.
+    Uniquement des valeurs explicitement etiquetees ("parse: 87%", "87%
+    parse", etc.) ou immediatement suivies d'un "%" collant sont retenues.
+    BUGFIX : l'ancien repli (n'importe quel nombre a 2-3 chiffres avec
+    decimale, sans "%" obligatoire) captait des durees de combat, des
+    niveaux d'objet ou d'autres statistiques (crit/haste/uptime) comme si
+    c'etaient des parses - source probable des "100% sur plein de boss" et
+    du nombre de boss affiches en trop. Le "%" est desormais TOUJOURS
+    obligatoire, colle au nombre (pas de tolerance d'espace/caracteres).
     """
     strong: List[float] = []
     fallback: List[float] = []
 
     labelled_patterns = [
-        r"(?:parse|performance|points?|rank)\s*[:=]?\s*(\d{2,3}(?:[.,]\d+)?)\s*%?",
-        r"(\d{2,3}(?:[.,]\d+)?)\s*%\s*(?:parse|performance|points?|rank)?",
+        r"(?:parse|performance|points?|rank)\s*[:=]?\s*(\d{2,3}(?:[.,]\d+)?)\s*%",
+        r"(\d{2,3}(?:[.,]\d+)?)\s*%\s*(?:parse|performance|points?|rank)",
     ]
 
     for pattern in labelled_patterns:
@@ -1174,17 +1186,16 @@ def _candidate_parse_values(text: str) -> List[float]:
             if 70 <= value <= 100:
                 strong.append(value)
 
-    for m in re.finditer(r"(?<!\d)(\d{2,3}(?:[.,]\d{1,3})?)(?!\d)", text):
+    # Repli : un nombre directement suivi de "%", sans etiquette explicite -
+    # toujours exige le "%" colle (pas juste "a proximite"), contrairement a
+    # l'ancienne version.
+    for m in re.finditer(r"(?<!\d)(\d{2,3}(?:[.,]\d{1,3})?)%(?!\w)", text):
         raw = m.group(1)
         try:
             value = float(raw.replace(",", "."))
         except ValueError:
             continue
-        if not 70 <= value <= 100:
-            continue
-
-        around = text[max(0, m.start() - 2): m.end() + 2]
-        if "." in raw or "," in raw or "%" in around:
+        if 70 <= value <= 100:
             fallback.append(value)
 
     return strong or fallback
@@ -1227,8 +1238,14 @@ def parse_hits_from_fight_page(
 
     for fragment in fragments:
         visible = html_to_text(fragment)
-        spec = normalize_spec(visible + " " + fragment)
-        values = _candidate_parse_values(visible + " " + fragment)
+        # BUGFIX : ne JAMAIS passer le HTML brut (balises/attributs/CSS) au
+        # detecteur de valeurs numeriques. Un simple `width:100%` dans une
+        # barre de progression (tres courant sur les sites de logs) etait
+        # jusqu'ici capte comme si c'etait le parse du joueur - c'est la
+        # cause la plus probable des "100% sur plein de boss" observes.
+        # On ne scanne desormais que le texte VISIBLE (nettoye des balises).
+        spec = normalize_spec(visible)
+        values = _candidate_parse_values(visible)
         if not values:
             continue
 
@@ -1413,10 +1430,14 @@ def report_within_delay(report: UwuReport, post_time: datetime) -> bool:
         delta = (post_day - report_day).days
         return -1 <= delta <= DKPARSE_MAX_DAYS
 
-    # If URL format changes, the Discord #logs-raid timestamp is acceptable as
-    # fallback, but the result will remain conservative elsewhere.
+    # BUGFIX (repli renforcé) : si la date n'a pas pu être extraite de l'URL
+    # UwU, se fier à la date de POST Discord est risqué - un vieux rapport
+    # repartagé/repingué tardivement dans #logs-raid resterait "éligible"
+    # indéfiniment, ce qui peut expliquer des bonus validés hors de la
+    # fenêtre attendue. On applique désormais exactement la même fenêtre
+    # stricte que le cas normal (pas de marge supplémentaire de +1 jour).
     delta = post_time - report.posted_at
-    return timedelta(days=-1) <= delta <= timedelta(days=DKPARSE_MAX_DAYS + 1)
+    return timedelta(days=-1) <= delta <= timedelta(days=DKPARSE_MAX_DAYS)
 
 
 def explicit_character_from_post(content: str) -> Optional[str]:
@@ -1464,6 +1485,77 @@ def dedupe_hits(hits: List[ParseHit]) -> List[ParseHit]:
         elif hit.parse == old.parse and hit.spec and not old.spec:
             best[hit.boss] = hit
     return sorted(best.values(), key=lambda h: h.boss.lower())
+
+
+# =============================================================================
+# Suivi du meilleur parse deja recompense par personnage+boss.
+#
+# Nouveau : seuls les boss dont le parse s'AMELIORE par rapport au meilleur
+# deja valide precedemment sont retenus (affiches et payes). Stocke dans un
+# petit fichier JSON local, a cote de l'exe/.env (persiste entre les
+# executions du bot).
+# =============================================================================
+
+BEST_PARSE_FILE = APP_DIR / "dkparse_best.json"
+
+
+def load_best_parses() -> Dict[str, Dict[str, float]]:
+    if not BEST_PARSE_FILE.exists():
+        return {}
+    try:
+        with open(BEST_PARSE_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def save_best_parses(data: Dict[str, Dict[str, float]]) -> None:
+    try:
+        with open(BEST_PARSE_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2, sort_keys=True)
+    except Exception:
+        pass
+
+
+def filter_improved_hits(
+    character: str, hits: List[ParseHit]
+) -> Tuple[List[ParseHit], List[Tuple[ParseHit, float]]]:
+    """
+    Ne garde que les hits dont le parse est STRICTEMENT meilleur que le
+    meilleur parse deja valide pour ce personnage sur ce boss.
+
+    Retourne (hits ameliores, [(hit rejete, ancien record), ...]) pour
+    pouvoir expliquer clairement dans le rapport pourquoi un boss n'est pas
+    payé.
+    """
+    best_all = load_best_parses()
+    char_best = best_all.get(character, {})
+
+    improved: List[ParseHit] = []
+    not_improved: List[Tuple[ParseHit, float]] = []
+
+    for hit in hits:
+        old = char_best.get(hit.boss)
+        if old is None or hit.parse > old:
+            improved.append(hit)
+        else:
+            not_improved.append((hit, old))
+
+    return improved, not_improved
+
+
+def record_best_parses(character: str, hits: List[ParseHit]) -> None:
+    best_all = load_best_parses()
+    char_best = best_all.setdefault(character, {})
+    changed = False
+    for hit in hits:
+        old = char_best.get(hit.boss)
+        if old is None or hit.parse > old:
+            char_best[hit.boss] = hit.parse
+            changed = True
+    if changed:
+        save_best_parses(best_all)
 
 
 def build_kromaddon_dkparse_export(
@@ -1702,6 +1794,11 @@ async def analyze_dkparse_message(
             else:
                 uncertain_hits.append(hit)
 
+    # Nouveau : seuls les boss dont le parse s'améliore par rapport au
+    # meilleur déjà validé pour ce personnage sont retenus. Les autres sont
+    # listés séparément (transparence), mais ne rapportent rien.
+    valid_hits, not_improved_hits = filter_improved_hits(character, valid_hits)
+
     lines = [
         f"**DKPARSE — {character}**",
         f"Personnage lu sur le screen : **{character}**",
@@ -1737,7 +1834,21 @@ async def analyze_dkparse_message(
         for hit in uncertain_hits:
             lines.append(f"• {hit.boss} — {hit.parse:.2f}%")
 
-    if not valid_hits:
+    if not_improved_hits:
+        lines += ["", "**➖ PAS D'AMÉLIORATION (déjà battu, aucun bonus)**"]
+        for hit, old in not_improved_hits:
+            lines.append(
+                f"• {hit.boss} — {hit.parse:.2f}% (record actuel : {old:.2f}%)"
+            )
+
+    if not valid_hits and not_improved_hits:
+        lines += [
+            "",
+            "ℹ️ Des parses ont été trouvées mais aucune n'améliore le record "
+            "déjà validé pour ce personnage - aucun bonus DKPARSE.",
+        ]
+        return "\n".join(lines), None
+    elif not valid_hits:
         lines += [
             "",
             "⚠️ **DKPARSE À VÉRIFIER**",
@@ -1753,6 +1864,10 @@ async def analyze_dkparse_message(
         return "\n".join(lines), None
 
     export = build_kromaddon_dkparse_export(character, message.created_at, valid_hits)
+    # Le record n'est mis à jour qu'ici, une fois le DKPARSE effectivement
+    # validé (export généré) - pas avant, pour ne jamais "consommer"
+    # l'amélioration d'un parse sur un simple appel de vérification.
+    record_best_parses(character, valid_hits)
     return "\n".join(lines), export
 
 
