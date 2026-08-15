@@ -9,7 +9,7 @@ from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 from pathlib import Path
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import urlsplit, urlunsplit, urljoin, parse_qs
 import sys
 
 import aiohttp
@@ -1095,6 +1095,174 @@ def parse_hits_from_text(
     return hits
 
 
+def boss_from_uwu_url(url: str) -> str:
+    """Return the canonical boss name from an UwU ?boss=... query."""
+    try:
+        query = parse_qs(urlsplit(html_lib.unescape(url)).query)
+        raw = (query.get("boss") or [""])[0]
+    except Exception:
+        raw = ""
+    return normalize_boss(raw)
+
+
+def extract_uwu_fight_urls(raw_html: str, report_url: str) -> List[str]:
+    """
+    UwU's report landing page does not necessarily contain the raid roster.
+    Individual fight pages are linked through ?boss=... URLs.
+
+    Collect same-report fight URLs from href/data attributes and JS strings.
+    """
+    base = canonical_uwu_url(report_url)
+    base_parts = urlsplit(base)
+    candidates: List[str] = []
+
+    # HTML attributes.
+    attr_pattern = r"""(?is)(?:href|data-url|data-href|value)\s*=\s*["']([^"']+)["']"""
+    for m in re.finditer(attr_pattern, raw_html):
+        candidates.append(html_lib.unescape(m.group(1).strip()))
+
+    # JS/JSON strings containing report queries.
+    js_pattern = r"""(?is)["']([^"']*(?:\?|&amp;|&)boss=[^"']+)["']"""
+    for m in re.finditer(js_pattern, raw_html):
+        candidates.append(html_lib.unescape(m.group(1).strip()))
+
+    out: List[str] = []
+    seen = set()
+
+    for raw in candidates:
+        if not raw or "boss=" not in raw.lower():
+            continue
+
+        absolute = urljoin(base, raw)
+        parts = urlsplit(absolute)
+
+        if parts.netloc.lower() not in {"uwu-logs.xyz", "www.uwu-logs.xyz"}:
+            continue
+
+        if parts.path.rstrip("/") != base_parts.path.rstrip("/"):
+            continue
+
+        url = urlunsplit(("https", "uwu-logs.xyz", parts.path, parts.query, ""))
+        if url not in seen:
+            seen.add(url)
+            out.append(url)
+
+    return out
+
+
+def _candidate_parse_values(text: str) -> List[float]:
+    """
+    Extract plausible performance/parse values.
+
+    Strong labelled values are preferred. As a fallback for an UwU player row,
+    decimal/percent values in the DKPARSE range are accepted.
+    """
+    strong: List[float] = []
+    fallback: List[float] = []
+
+    labelled_patterns = [
+        r"(?:parse|performance|points?|rank)\s*[:=]?\s*(\d{2,3}(?:[.,]\d+)?)\s*%?",
+        r"(\d{2,3}(?:[.,]\d+)?)\s*%\s*(?:parse|performance|points?|rank)?",
+    ]
+
+    for pattern in labelled_patterns:
+        for m in re.finditer(pattern, text, re.IGNORECASE):
+            try:
+                value = float(m.group(1).replace(",", "."))
+            except ValueError:
+                continue
+            if 70 <= value <= 100:
+                strong.append(value)
+
+    for m in re.finditer(r"(?<!\d)(\d{2,3}(?:[.,]\d{1,3})?)(?!\d)", text):
+        raw = m.group(1)
+        try:
+            value = float(raw.replace(",", "."))
+        except ValueError:
+            continue
+        if not 70 <= value <= 100:
+            continue
+
+        around = text[max(0, m.start() - 2): m.end() + 2]
+        if "." in raw or "," in raw or "%" in around:
+            fallback.append(value)
+
+    return strong or fallback
+
+
+def parse_hits_from_fight_page(
+    raw_html: str,
+    character: str,
+    fight_url: str,
+    report_date: Optional[datetime],
+) -> List[ParseHit]:
+    """
+    Parse a selected UwU fight page.
+
+    Boss is read directly from ?boss=... in the fight URL, so the parser no
+    longer requires boss + character + parse to appear together on the landing
+    page.
+    """
+    char_l = character.lower()
+    if char_l not in raw_html.lower():
+        return []
+
+    boss = boss_from_uwu_url(fight_url)
+    if not boss or boss in DKPARSE_EXCLUDED_BOSSES:
+        return []
+
+    hits: List[ParseHit] = []
+
+    rows = re.findall(r"(?is)<tr\b[^>]*>.*?</tr>", raw_html)
+    relevant_rows = [row for row in rows if char_l in row.lower()]
+
+    fragments: List[str] = relevant_rows[:10]
+    if not fragments:
+        for m in re.finditer(re.escape(character), raw_html, re.IGNORECASE):
+            fragments.append(
+                raw_html[max(0, m.start() - 1800): min(len(raw_html), m.end() + 2600)]
+            )
+            if len(fragments) >= 10:
+                break
+
+    for fragment in fragments:
+        visible = html_to_text(fragment)
+        spec = normalize_spec(visible + " " + fragment)
+        values = _candidate_parse_values(visible + " " + fragment)
+        if not values:
+            continue
+
+        value = max(values)
+        hits.append(
+            ParseHit(
+                character=character,
+                boss=boss,
+                parse=value,
+                spec=spec,
+                report_url=fight_url,
+                report_date=report_date,
+                evidence="UwU fight page",
+            )
+        )
+
+    return hits
+
+
+async def fetch_uwu_url(url: str) -> Tuple[str, str]:
+    timeout = aiohttp.ClientTimeout(total=25)
+    headers = {
+        "User-Agent": "ApogeeDKParseBot/1.2 (+Discord guild tooling)",
+        "Accept": "text/html,application/xhtml+xml",
+    }
+
+    async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
+        async with session.get(url, allow_redirects=True) as resp:
+            body = await resp.text(errors="replace")
+            if resp.status != 200:
+                raise RuntimeError(f"UwU HTTP {resp.status}")
+            return str(resp.url), body
+
+
 async def fetch_uwu_report(report: UwuReport) -> Tuple[str, str]:
     timeout = aiohttp.ClientTimeout(total=25)
     headers = {
@@ -1382,23 +1550,112 @@ async def analyze_dkparse_message(
                     report_date=report.report_date or report_date_from_url(final_url),
                     label=report.label,
                 )
-                if character.lower() not in raw_html.lower():
-                    return
 
-                structured = parse_hits_from_json(
-                    json_candidates_from_html(raw_html),
-                    character,
-                    report2.url,
-                    report2.report_date,
+                char_in_landing = character.lower() in raw_html.lower()
+                dkp_debug(
+                    "UWU LANDING",
+                    {
+                        "report": report2.url,
+                        "character": character,
+                        "character_present": char_in_landing,
+                    },
                 )
-                if structured:
-                    all_hits.extend(structured)
-                else:
+
+                if char_in_landing:
+                    structured = parse_hits_from_json(
+                        json_candidates_from_html(raw_html),
+                        character,
+                        report2.url,
+                        report2.report_date,
+                    )
+                    if structured:
+                        all_hits.extend(structured)
+                    else:
+                        all_hits.extend(
+                            parse_hits_from_text(
+                                raw_html, character, report2.url, report2.report_date
+                            )
+                        )
+
+                # UwU commonly keeps roster/player data on selected fight pages.
+                # Follow same-report ?boss=... links instead of returning when
+                # the character is absent from the landing page.
+                fight_urls = extract_uwu_fight_urls(raw_html, report2.url)
+                dkp_debug(
+                    "UWU FIGHT LINKS",
+                    {
+                        "report": report2.url,
+                        "count": len(fight_urls),
+                        "urls": fight_urls[:50],
+                    },
+                )
+
+                report_hits_before = len(all_hits)
+
+                for fight_url in fight_urls[:60]:
+                    try:
+                        page_url, fight_html = await fetch_uwu_url(fight_url)
+                    except Exception as sub_exc:
+                        dkp_debug(
+                            "UWU FIGHT LECTURE ECHEC",
+                            {
+                                "url": fight_url,
+                                "error": f"{type(sub_exc).__name__}: {sub_exc}",
+                            },
+                        )
+                        continue
+
+                    present = character.lower() in fight_html.lower()
+                    dkp_debug(
+                        "UWU FIGHT PAGE",
+                        {
+                            "url": page_url,
+                            "boss": boss_from_uwu_url(page_url),
+                            "character_present": present,
+                            "body_chars": len(fight_html),
+                        },
+                    )
+
+                    if not present:
+                        continue
+
+                    structured = parse_hits_from_json(
+                        json_candidates_from_html(fight_html),
+                        character,
+                        page_url,
+                        report2.report_date,
+                    )
+                    if structured:
+                        all_hits.extend(structured)
+
                     all_hits.extend(
-                        parse_hits_from_text(
-                            raw_html, character, report2.url, report2.report_date
+                        parse_hits_from_fight_page(
+                            fight_html,
+                            character,
+                            page_url,
+                            report2.report_date,
                         )
                     )
+
+                dkp_debug(
+                    "UWU RAPPORT RESULTAT",
+                    {
+                        "report": report2.url,
+                        "character": character,
+                        "new_hits": len(all_hits) - report_hits_before,
+                        "hits": [
+                            {
+                                "boss": h.boss,
+                                "parse": h.parse,
+                                "spec": h.spec,
+                                "evidence": h.evidence,
+                                "url": h.report_url,
+                            }
+                            for h in all_hits[report_hits_before:]
+                        ],
+                    },
+                )
+
             except Exception as exc:
                 error_text = f"{report.url}: {type(exc).__name__}: {exc}"
                 errors.append(error_text)
@@ -1470,7 +1727,7 @@ async def analyze_dkparse_message(
             "⚠️ **DKPARSE À VÉRIFIER**",
             f"Personnage lu sur le screen : **{character}**",
             "Aucune parse exploitable correspondant à ce personnage n'a été "
-            "trouvée dans les rapports guilde éligibles.",
+            "trouvée dans les pages de combat des rapports guilde éligibles.",
         ]
         if errors:
             lines.append(
