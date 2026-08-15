@@ -916,40 +916,113 @@ async def scan_whitelisted_reports(
         guild, LOGS_RAID_CHANNEL_ID, "LOGS_RAID_CHANNEL_ID"
     )
 
-    # Small safety margin: user said 7 or 8 days is not important. We use the
-    # configured 8-day rule plus one day when scanning Discord, then reject a
-    # report whose actual date is outside the allowed window.
-    after = reference_time - timedelta(days=DKPARSE_MAX_DAYS + 1)
-    before = reference_time + timedelta(days=1)
+    # IMPORTANT:
+    # On ne limite plus history() à la fenêtre exacte des 8 jours.
+    # Discord.py peut être trompeur ici avec les bornes after/before + timezone,
+    # surtout pour un message posté autour de minuit. On parcourt une fenêtre
+    # plus large puis on applique la vraie règle des 8 jours sur report_date.
+    scan_days = max(DKPARSE_MAX_DAYS + 7, 21)
+    after = reference_time - timedelta(days=scan_days)
+    before = reference_time + timedelta(days=2)
 
     reports: List[UwuReport] = []
     seen: set[str] = set()
+    scanned_messages = 0
+    messages_with_urls = 0
+
+    dkp_debug(
+        "SCAN #logs-raid",
+        {
+            "channel_id": channel.id,
+            "channel_name": channel.name,
+            "reference_time": reference_time.isoformat(),
+            "after": after.isoformat(),
+            "before": before.isoformat(),
+            "scan_days": scan_days,
+        },
+    )
 
     async for msg in channel.history(
-        limit=None, after=after, before=before, oldest_first=True
+        limit=None,
+        after=after,
+        before=before,
+        oldest_first=True,
     ):
-        combined = msg.content or ""
+        scanned_messages += 1
+
+        combined_parts = [msg.content or ""]
+
+        # Discord may store links in embeds rather than plain content.
         for embed in msg.embeds:
             if embed.url:
-                combined += "\n" + embed.url
+                combined_parts.append(embed.url)
+            if embed.title:
+                combined_parts.append(embed.title)
             if embed.description:
-                combined += "\n" + embed.description
+                combined_parts.append(embed.description)
+            for field in embed.fields:
+                if field.name:
+                    combined_parts.append(field.name)
+                if field.value:
+                    combined_parts.append(field.value)
 
-        for url in extract_uwu_urls(combined):
+        # Also inspect attachment URLs just in case somebody posted a txt/link file.
+        for attachment in msg.attachments:
+            combined_parts.append(attachment.url or "")
+            combined_parts.append(attachment.filename or "")
+
+        combined = "\n".join(x for x in combined_parts if x)
+        urls = extract_uwu_urls(combined)
+
+        dkp_debug(
+            f"MSG {msg.id}",
+            {
+                "created_at": msg.created_at.isoformat(),
+                "author": f"{msg.author} ({msg.author.id})",
+                "content": (msg.content or "")[:500],
+                "urls_found": urls,
+            },
+        )
+
+        if urls:
+            messages_with_urls += 1
+
+        for url in urls:
             if url in seen:
+                dkp_debug("URL DUPLIQUÉE IGNORÉE", url)
                 continue
+
             seen.add(url)
-            reports.append(
-                UwuReport(
-                    url=url,
-                    message_id=msg.id,
-                    posted_at=msg.created_at,
-                    report_date=report_date_from_url(url),
-                    label=(msg.content or "")[:120],
-                )
+            rdate = report_date_from_url(url)
+
+            report = UwuReport(
+                url=url,
+                message_id=msg.id,
+                posted_at=msg.created_at,
+                report_date=rdate,
+                label=(msg.content or "")[:120],
+            )
+            reports.append(report)
+
+            dkp_debug(
+                "RAPPORT AJOUTÉ",
+                {
+                    "url": url,
+                    "report_date": rdate.isoformat() if rdate else None,
+                    "discord_posted_at": msg.created_at.isoformat(),
+                    "within_delay": report_within_delay(report, reference_time),
+                },
             )
 
-    dkp_debug("Rapports whitelistés", [r.url for r in reports])
+    dkp_debug(
+        "RÉSUMÉ SCAN #logs-raid",
+        {
+            "messages_scannés": scanned_messages,
+            "messages_avec_url": messages_with_urls,
+            "rapports_uniques": len(reports),
+            "urls": [r.url for r in reports],
+        },
+    )
     return reports
 
 
@@ -1064,8 +1137,10 @@ async def analyze_dkparse_message(
     if not reports:
         return (
             f"❌ **DKPARSE REFUSÉE — {character}**\n"
-            f"Aucun rapport UwU whitelisté dans #logs-raid sur les "
-            f"{DKPARSE_MAX_DAYS} jours précédant ce post.",
+            f"Aucun rapport UwU exploitable trouvé dans #logs-raid pour cette demande.\n"
+            f"Fenêtre DKPARSE : {DKPARSE_MAX_DAYS} jours avant le post du joueur.\n"
+            f"Active `DKPARSE_DEBUG=true` dans `.env` puis relance le bot pour voir "
+            f"chaque message/URL détecté dans la console.",
             None,
         )
 
@@ -1314,15 +1389,21 @@ async def dkparse_logs(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True, thinking=True)
     try:
         now = datetime.now(timezone.utc)
-        reports = await scan_whitelisted_reports(interaction.guild, now)
-        reports = [r for r in reports if report_within_delay(r, now)]
+        all_reports = await scan_whitelisted_reports(interaction.guild, now)
+        reports = [r for r in all_reports if report_within_delay(r, now)]
         if not reports:
             await interaction.followup.send(
-                "Aucun rapport UwU récent trouvé dans #logs-raid.", ephemeral=True
+                f"Aucun rapport UwU éligible trouvé dans #logs-raid. "
+                f"({len(all_reports)} rapport(s) détecté(s) dans la fenêtre de scan.)",
+                ephemeral=True,
             )
             return
 
-        lines = [f"**{len(reports)} rapport(s) UwU whitelisté(s)**", ""]
+        lines = [
+            f"**{len(reports)} rapport(s) UwU éligible(s)** "
+            f"({len(all_reports)} détecté(s) au total)",
+            "",
+        ]
         for r in reports[:40]:
             date_txt = (
                 r.report_date.strftime("%d/%m/%Y")
