@@ -650,13 +650,10 @@ async def run_rh_list(interaction: discord.Interaction, message: discord.Message
         export_text = "RH|" + "|".join(sorted(export_items, key=str.lower))
         chunks = split_discord_text("\n".join(lines))
         for index, chunk in enumerate(chunks):
-            if index == len(chunks) - 1:
-                await interaction.followup.send(
-                    chunk,
-                    view=ExportView(export_text),
-                )
-            else:
-                await interaction.followup.send(chunk)
+            await interaction.followup.send(
+                chunk,
+                view=ExportView(export_text) if index == len(chunks) - 1 else None,
+            )
     except Exception as exc:
         if RH_DEBUG:
             print(repr(exc))
@@ -916,130 +913,42 @@ async def scan_whitelisted_reports(
         guild, LOGS_RAID_CHANNEL_ID, "LOGS_RAID_CHANNEL_ID"
     )
 
-    # FIX V2:
-    # Ne pas utiliser after/before dans channel.history().
-    # Sur l'environnement Discord Apogee, ces bornes renvoyaient 0 message
-    # alors que le salon et les messages étaient bien visibles.
-    #
-    # Le salon #logs-raid contient peu de messages : on lit simplement les
-    # derniers messages puis on filtre nous-mêmes selon la date UwU.
-    HISTORY_LIMIT = 300
+    # Small safety margin: user said 7 or 8 days is not important. We use the
+    # configured 8-day rule plus one day when scanning Discord, then reject a
+    # report whose actual date is outside the allowed window.
+    after = reference_time - timedelta(days=DKPARSE_MAX_DAYS + 1)
+    before = reference_time + timedelta(days=1)
 
     reports: List[UwuReport] = []
     seen: set[str] = set()
-    scanned_messages = 0
-    messages_with_urls = 0
 
-    dkp_debug(
-        "SCAN #logs-raid",
-        {
-            "channel_id": channel.id,
-            "channel_name": channel.name,
-            "reference_time": reference_time.isoformat(),
-            "history_limit": HISTORY_LIMIT,
-            "mode": "latest messages, no Discord after/before filter",
-        },
-    )
+    async for msg in channel.history(
+        limit=None, after=after, before=before, oldest_first=True
+    ):
+        combined = msg.content or ""
+        for embed in msg.embeds:
+            if embed.url:
+                combined += "\n" + embed.url
+            if embed.description:
+                combined += "\n" + embed.description
 
-    try:
-        async for msg in channel.history(
-            limit=HISTORY_LIMIT,
-            oldest_first=False,
-        ):
-            scanned_messages += 1
-
-            combined_parts = [msg.content or ""]
-
-            # Liens éventuellement transformés en embeds par Discord.
-            for embed in msg.embeds:
-                if embed.url:
-                    combined_parts.append(embed.url)
-                if embed.title:
-                    combined_parts.append(embed.title)
-                if embed.description:
-                    combined_parts.append(embed.description)
-                for field in embed.fields:
-                    if field.name:
-                        combined_parts.append(field.name)
-                    if field.value:
-                        combined_parts.append(field.value)
-
-            # Pièces jointes, au cas où.
-            for attachment in msg.attachments:
-                combined_parts.append(attachment.url or "")
-                combined_parts.append(attachment.filename or "")
-
-            combined = "\n".join(x for x in combined_parts if x)
-            urls = extract_uwu_urls(combined)
-
-            if DKPARSE_DEBUG:
-                dkp_debug(
-                    f"MSG {msg.id}",
-                    {
-                        "created_at": msg.created_at.isoformat(),
-                        "author": f"{msg.author} ({msg.author.id})",
-                        "content": (msg.content or "")[:500],
-                        "urls_found": urls,
-                    },
-                )
-
-            if urls:
-                messages_with_urls += 1
-
-            for url in urls:
-                if url in seen:
-                    dkp_debug("URL DUPLIQUÉE IGNORÉE", url)
-                    continue
-
-                seen.add(url)
-                rdate = report_date_from_url(url)
-                report = UwuReport(
+        for url in extract_uwu_urls(combined):
+            if url in seen:
+                continue
+            seen.add(url)
+            reports.append(
+                UwuReport(
                     url=url,
                     message_id=msg.id,
                     posted_at=msg.created_at,
-                    report_date=rdate,
+                    report_date=report_date_from_url(url),
                     label=(msg.content or "")[:120],
                 )
-                reports.append(report)
+            )
 
-                dkp_debug(
-                    "RAPPORT DÉTECTÉ",
-                    {
-                        "url": url,
-                        "report_date": rdate.isoformat() if rdate else None,
-                        "discord_posted_at": msg.created_at.isoformat(),
-                        "eligible_for_request": report_within_delay(
-                            report, reference_time
-                        ),
-                    },
-                )
-
-    except discord.Forbidden as exc:
-        raise RuntimeError(
-            "Le bot n'a pas la permission de lire l'historique de #logs-raid. "
-            "Active au minimum Voir le salon + Lire l'historique des messages "
-            "pour le rôle du bot."
-        ) from exc
-
-    except discord.HTTPException as exc:
-        raise RuntimeError(
-            f"Discord n'a pas pu lire l'historique de #logs-raid : {exc}"
-        ) from exc
-
-    dkp_debug(
-        "RÉSUMÉ SCAN #logs-raid",
-        {
-            "messages_scannés": scanned_messages,
-            "messages_avec_url": messages_with_urls,
-            "rapports_uniques": len(reports),
-            "rapports_éligibles": sum(
-                1 for r in reports if report_within_delay(r, reference_time)
-            ),
-            "urls": [r.url for r in reports],
-        },
-    )
-
+    dkp_debug("Rapports whitelistés", [r.url for r in reports])
     return reports
+
 
 def report_within_delay(report: UwuReport, post_time: datetime) -> bool:
     # Best source is date encoded in UwU report URL.
@@ -1152,10 +1061,8 @@ async def analyze_dkparse_message(
     if not reports:
         return (
             f"❌ **DKPARSE REFUSÉE — {character}**\n"
-            f"Aucun rapport UwU exploitable trouvé dans #logs-raid pour cette demande.\n"
-            f"Fenêtre DKPARSE : {DKPARSE_MAX_DAYS} jours avant le post du joueur.\n"
-            f"Active `DKPARSE_DEBUG=true` dans `.env` puis relance le bot pour voir "
-            f"chaque message/URL détecté dans la console.",
+            f"Aucun rapport UwU whitelisté dans #logs-raid sur les "
+            f"{DKPARSE_MAX_DAYS} jours précédant ce post.",
             None,
         )
 
@@ -1305,13 +1212,10 @@ async def run_dkparse_check(
     await interaction.response.defer(ephemeral=False, thinking=True)
     try:
         report, export = await analyze_dkparse_message(interaction.guild, message)
-        if export:
-            await interaction.followup.send(
-                report,
-                view=DKParseExportView(export),
-            )
-        else:
-            await interaction.followup.send(report)
+        await interaction.followup.send(
+            report,
+            view=DKParseExportView(export) if export else None,
+        )
     except Exception as exc:
         if DKPARSE_DEBUG:
             import traceback
@@ -1404,21 +1308,15 @@ async def dkparse_logs(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True, thinking=True)
     try:
         now = datetime.now(timezone.utc)
-        all_reports = await scan_whitelisted_reports(interaction.guild, now)
-        reports = [r for r in all_reports if report_within_delay(r, now)]
+        reports = await scan_whitelisted_reports(interaction.guild, now)
+        reports = [r for r in reports if report_within_delay(r, now)]
         if not reports:
             await interaction.followup.send(
-                f"Aucun rapport UwU éligible trouvé dans #logs-raid. "
-                f"({len(all_reports)} rapport(s) détecté(s) dans la fenêtre de scan.)",
-                ephemeral=True,
+                "Aucun rapport UwU récent trouvé dans #logs-raid.", ephemeral=True
             )
             return
 
-        lines = [
-            f"**{len(reports)} rapport(s) UwU éligible(s)** "
-            f"({len(all_reports)} détecté(s) au total)",
-            "",
-        ]
+        lines = [f"**{len(reports)} rapport(s) UwU whitelisté(s)**", ""]
         for r in reports[:40]:
             date_txt = (
                 r.report_date.strftime("%d/%m/%Y")
