@@ -60,7 +60,9 @@ except Exception:
 #
 # APOGEEBOT :
 # - surveille les nouveaux liens UwU dans #logs-raid ;
-# - analyse les pages de combat du rapport ;
+# - interroge l'API POST /character d'uwu-logs pour chaque participant du rapport
+#   (même approche que DKPARSE : pas de scraping HTML des fight pages, qui ne
+#   contiennent jamais les valeurs Points/Dps% calculées côté client par UwU) ;
 # - reproduit les catégories Top 0.2 / 2 / 5 / 10 / 15 / 20 / 25 / 33 % ;
 # - garde en mémoire les URLs déjà traitées pour éviter les doublons après redémarrage.
 # =============================================================================
@@ -3159,7 +3161,14 @@ def parse_pewpew_hits_from_fight_page(
     raw_html: str,
     fight_url: str,
 ) -> List[PewPewHit]:
-    """Use explicit Performance Points only. Top%% = 100 - Points."""
+    """Use explicit Performance Points only. Top%% = 100 - Points.
+
+    DEPRECATED / DEAD CODE (conservé pour référence uniquement) :
+    la page HTML brute renvoyée par le serveur uwu-logs ne contient jamais
+    les valeurs points-rank / points-dps (elles sont calculées côté client
+    en JavaScript après chargement). build_pewpew_report n'appelle plus
+    cette fonction — voir _apogeebot_character_hits / POST /character.
+    """
     boss=_generic_boss_from_uwu_url(fight_url)
     if not boss or boss == 'All':
         return []
@@ -3507,6 +3516,13 @@ async def _post_uwu_character_json(player: str, spec_idx: int) -> Any:
     raise RuntimeError("UwU /character impossible")
 
 
+# Payload sample dump: only the first successful /character response of the
+# process is logged in full, so Kroma can eyeball the real shape once and
+# confirm/adjust the parsing assumptions below without spamming the console
+# on every subsequent call.
+_APOGEEBOT_PAYLOAD_SAMPLE_LOGGED = False
+
+
 def _apogeebot_hits_from_character_payload(
     payload: Any,
     player: str,
@@ -3516,12 +3532,45 @@ def _apogeebot_hits_from_character_payload(
     Read character Points and keep only personal-best rows whose report ID is
     the report currently posted in #logs-raid. Old Apogee/UwU messages used
     100 - Points as the displayed Top X% value.
+
+    IMPORTANT (non vérifié en direct, réseau indisponible dans cet environnement) :
+    d'après les notes de session confirmées contre le repo GitHub d'uwu-logs
+    (c_player_classes.py / top_character.py), le champ `points` renvoyé par
+    /character est une valeur brute où points/100 = pourcentage affiché
+    (ex. 9850 -> 98.50%), et NON déjà une valeur 0..100. La normalisation
+    ci-dessous applique donc /100 quand la valeur brute dépasse 100, et laisse
+    la valeur telle quelle sinon (au cas où un déploiement renverrait déjà un
+    pourcentage 0..100 pour un champ différemment nommé). Si le premier dump
+    de payload réel (voir dkp_debug ci-dessous) montre un format différent,
+    ajuster `_normalize_points_field` en conséquence.
     """
+    global _APOGEEBOT_PAYLOAD_SAMPLE_LOGGED
+    if not _APOGEEBOT_PAYLOAD_SAMPLE_LOGGED:
+        dkp_debug(
+            "APOGEEBOT /character PAYLOAD ECHANTILLON (premier appel du process)",
+            {"player": player, "current_report_id": current_report_id, "payload": payload},
+        )
+        _APOGEEBOT_PAYLOAD_SAMPLE_LOGGED = True
+
+    def _normalize_points_field(raw: float) -> Optional[float]:
+        """Convert a raw /character `points`-like field to a 0..100 percentage."""
+        if raw is None:
+            return None
+        if raw > 100.0:
+            # Raw score format confirmed against uwu-logs source: /100 = %.
+            value = raw / 100.0
+        else:
+            value = raw
+        return value if 0.0 <= value <= 100.0 else None
+
     found: Dict[Tuple[str, str], PewPewHit] = {}
     current_low = current_report_id.lower()
 
-    def add_candidate(boss: str, points: Optional[float], report_id: str) -> None:
-        if not boss or points is None or not (0.0 <= points <= 100.0):
+    def add_candidate(boss: str, raw_points: Optional[float], report_id: str) -> None:
+        if not boss or raw_points is None:
+            return
+        points = _normalize_points_field(raw_points)
+        if points is None:
             return
         if not report_id or report_id.lower() != current_low:
             return
@@ -3562,14 +3611,14 @@ def _apogeebot_hits_from_character_payload(
         if not report_id:
             report_id = _extract_report_id_from_text(blob)
 
-        points = None
+        raw_points = None
         for key in ("points", "performancePoints", "performance_points", "playerPoints", "player_points", "score", "performance"):
             if key in d:
                 n = _numeric(d[key])
-                if n is not None and 0 <= n <= 100:
-                    points = n
+                if n is not None and n >= 0:
+                    raw_points = n
                     break
-        add_candidate(boss, points, report_id)
+        add_candidate(boss, raw_points, report_id)
 
     # List-shaped rows: [Boss, Points, ..., ReportId, ...].
     def walk_lists(obj: Any) -> Iterable[List[Any]]:
@@ -3594,12 +3643,11 @@ def _apogeebot_hits_from_character_payload(
                 if not report_id:
                     report_id = _extract_report_id_from_text(v)
             elif isinstance(v, (int, float)):
-                n = float(v)
-                if 0 <= n <= 100:
-                    numeric.append(n)
-        # Points is normally the high 0..100 value; ranks >100 are excluded.
-        points = max(numeric) if numeric else None
-        add_candidate(boss, points, report_id)
+                numeric.append(float(v))
+        # The Points-like field is normally the largest positive numeric
+        # value in the row; other numerics (rank, attempt index) are smaller.
+        raw_points = max(numeric) if numeric else None
+        add_candidate(boss, raw_points, report_id)
 
     return list(found.values())
 
@@ -3658,6 +3706,8 @@ def _js_relevant_snippets(js_text: str) -> List[str]:
 
 
 async def _apogeebot_debug_external_js(page_url: str, raw_html: str) -> None:
+    """DEAD CODE (conservé pour référence) : n'est plus appelé depuis que
+    build_pewpew_report n'analyse plus les fight pages HTML."""
     report_id = _extract_report_id_from_text(page_url) or canonical_uwu_url(page_url)
     if report_id in APOGEEBOT_JS_DEBUGGED:
         return
@@ -3722,45 +3772,75 @@ def _pewpew_candidate_fight_urls(urls: List[str]) -> List[str]:
 
 
 async def build_pewpew_report(report_url: str) -> Tuple[str, Dict[str, int]]:
-    """Build ApogeeBot from current report fight pages; /character is not used."""
-    report_url=canonical_uwu_url(report_url)
-    final_url,raw_html=await _fetch_uwu_with_retry(report_url,'ApogeeBot/4.0 (+Discord guild tooling)')
-    report_url=canonical_uwu_url(final_url)
-    fight_urls=extract_uwu_fight_urls(raw_html,report_url)
-    by_boss=defaultdict(list)
-    for url in fight_urls:
-        boss=_generic_boss_from_uwu_url(url)
-        if boss:
-            by_boss[boss].append(url)
-    stats={'fight_links':len(fight_urls),'bosses':len(by_boss),'pages_ok':0,'pages_failed':0,'pages_with_hits':0,'hits':0}
-    if not by_boss:
-        return '',stats
-    hits=[]
-    for boss,urls in by_boss.items():
-        before=len(hits)
-        for fight_url in _pewpew_candidate_fight_urls(urls):
-            try:
-                page_url,fight_html=await _fetch_uwu_with_retry(fight_url,'ApogeeBot/4.0 (+Discord guild tooling)')
-                stats['pages_ok']+=1
-                page_hits=parse_pewpew_hits_from_fight_page(fight_html,page_url)
-                if page_hits:
-                    stats['pages_with_hits']+=1
-                    hits.extend(page_hits)
-                    print(f'[APOGEEBOT] {boss}: {len(page_hits)} résultat(s) Top 33 sur {page_url}')
-                    break
-                summary=_pewpew_page_debug_summary(fight_html)
-                print(f'[APOGEEBOT] {boss}: page lue mais 0 résultat reconnu. Structure={summary}')
-                dkp_debug('APOGEEBOT PAGE SANS HIT',{'boss':boss,'url':page_url,'summary':summary})
-                await _apogeebot_debug_external_js(page_url, fight_html)
-            except Exception as exc:
-                stats['pages_failed']+=1
-                print(f'[APOGEEBOT] ECHEC {boss}: {type(exc).__name__}: {exc}')
-                dkp_debug('APOGEEBOT FIGHT ECHEC',{'boss':boss,'url':fight_url,'error':f'{type(exc).__name__}: {exc}'})
-            await asyncio.sleep(0.18)
-        if len(hits)==before:
-            print(f'[APOGEEBOT] {boss}: aucun Top 33 exploitable trouvé')
-    stats['hits']=len(hits)
-    return format_pewpew_report(hits),stats
+    """Build ApogeeBot via l'API UwU /character (même approche que DKPARSE).
+
+    On ne scrape plus le HTML des fight pages pour les Points : cette donnée
+    est calculée côté client par UwU et n'existe jamais dans le HTML brut
+    renvoyé par le serveur (d'où les cellules points-rank / points-dps
+    systématiquement vides observées en debug le 16/08/2026).
+    """
+    report_url = canonical_uwu_url(report_url)
+    final_url, raw_html = await _fetch_uwu_with_retry(
+        report_url, 'ApogeeBot/5.0 (+Discord guild tooling)'
+    )
+    report_url = canonical_uwu_url(final_url)
+    current_report_id = _apogee_report_id(report_url)
+
+    participants = extract_apogeebot_participants(raw_html)
+
+    stats = {
+        'participants': len(participants),
+        'queries': 0,
+        'players_ok': 0,
+        'players_failed': 0,
+        'players_with_hits': 0,
+        'hits': 0,
+    }
+
+    if not participants or not current_report_id:
+        return '', stats
+
+    # Récupère la casse d'affichage d'origine pour chaque joueur.
+    display_names: Dict[str, str] = {}
+    for row in re.findall(r"(?is)<tr\b[^>]*>.*?</tr>", raw_html):
+        cells = _html_cells(row)
+        if not cells:
+            continue
+        name = _extract_player_name_from_html_row(row, cells)
+        if name:
+            display_names.setdefault(name.lower(), name)
+
+    hits: List[PewPewHit] = []
+
+    for player_low, tree_idx in participants.items():
+        player = display_names.get(player_low, player_low.capitalize())
+        try:
+            player_hits, queries = await _apogeebot_character_hits(
+                player, tree_idx, current_report_id
+            )
+            stats['queries'] += queries
+            stats['players_ok'] += 1
+            if player_hits:
+                stats['players_with_hits'] += 1
+                hits.extend(player_hits)
+                print(
+                    f"[APOGEEBOT] {player}: {len(player_hits)} résultat(s) Top 33 "
+                    f"(report {current_report_id})"
+                )
+        except Exception as exc:
+            stats['players_failed'] += 1
+            print(f"[APOGEEBOT] ECHEC {player}: {type(exc).__name__}: {exc}")
+            dkp_debug(
+                "APOGEEBOT CHARACTER ECHEC",
+                {"player": player, "error": f"{type(exc).__name__}: {exc}"},
+            )
+        await asyncio.sleep(0.15)
+
+    stats['hits'] = len(hits)
+    if not hits:
+        print(f"[APOGEEBOT] Aucun Top 33 exploitable pour le rapport {current_report_id}")
+
+    return format_pewpew_report(hits), stats
 
 
 def _message_uwu_urls(message: discord.Message) -> List[str]:
@@ -3836,10 +3916,10 @@ async def handle_uwu_pewpew_message(
                 report, stats = await build_pewpew_report(canonical)
                 print(f"[APOGEEBOT] Résultat {canonical}: {stats}")
 
-                if stats["fight_links"] <= 0 or stats["bosses"] <= 0:
+                if stats["participants"] <= 0:
                     final_status = "⚠️"
                     await message.reply(
-                        "⚠️ **ApogeeBot : rapport détecté, mais aucun combat "
+                        "⚠️ **ApogeeBot : rapport détecté, mais aucun participant "
                         "n'a pu être extrait de la page UwU.**\n"
                         "Le rapport n'est pas marqué comme traité : tu peux le "
                         "reposter après correction du bot/site.",
@@ -3848,12 +3928,12 @@ async def handle_uwu_pewpew_message(
                     )
                     continue
 
-                if stats["pages_ok"] <= 0:
+                if stats["players_ok"] <= 0:
                     final_status = "⚠️"
                     await message.reply(
-                        "⚠️ **ApogeeBot : rapport détecté, mais aucune page de "
-                        "combat UwU n'a pu être lue.**\n"
-                        f"Pages en échec : {stats['pages_failed']}. "
+                        "⚠️ **ApogeeBot : rapport détecté, mais l'API UwU "
+                        "/character n'a pu être interrogée pour aucun joueur.**\n"
+                        f"Joueurs en échec : {stats['players_failed']}. "
                         "Le rapport n'est pas marqué comme traité.",
                         mention_author=False,
                         allowed_mentions=discord.AllowedMentions.none(),
@@ -3881,8 +3961,9 @@ async def handle_uwu_pewpew_message(
                         "⚠️ **ApogeeBot : rapport lu, mais aucun classement Top 33 "
                         "n'a pu être extrait avec certitude.**\n"
                         "Le rapport **n'est pas marqué comme traité**. "
-                        "La console `[APOGEEBOT]` affiche maintenant les premières "
-                        "lignes joueurs et le contexte exact autour de `Points`.",
+                        "La console `[APOGEEBOT]` affiche le détail par joueur, et "
+                        "le premier payload `/character` de la session est dumpé "
+                        "en entier si DKPARSE_DEBUG=true.",
                         mention_author=False,
                         allowed_mentions=discord.AllowedMentions.none(),
                     )
@@ -4179,7 +4260,7 @@ async def on_ready():
     print(f"#dkparse channel ID: {DKPARSE_CHANNEL_ID or 'NON CONFIGURE'}")
     print(f"DKPARSE window: {DKPARSE_MAX_DAYS} jours")
     print("DKPARSE OCR: " + ("RapidOCR OK" if (RapidOCR is not None and Image is not None and np is not None) else "INDISPONIBLE"))
-    print(f"ApogeeBot: {'ACTIVE' if UWU_PEWPEW_ENABLED else 'DESACTIVE'}")
+    print(f"ApogeeBot: {'ACTIVE' if UWU_PEWPEW_ENABLED else 'DESACTIVE'} (via API /character)")
 
 
 @bot.event
