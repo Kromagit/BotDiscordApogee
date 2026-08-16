@@ -2975,7 +2975,7 @@ PEWPEW_TIERS: Tuple[Tuple[float, str], ...] = (
     (25.0, "⚪ Top 25% ⚪"),
     (33.0, "⚫ Top 33% ⚫"),
 )
-PEWPEW_STATE_FILE = APP_DIR / "apogeebot_seen_v6.json"
+PEWPEW_STATE_FILE = APP_DIR / "apogeebot_seen_v7.json"
 PEWPEW_LOCK = asyncio.Lock()
 PEWPEW_IN_FLIGHT: set = set()
 
@@ -3201,25 +3201,73 @@ def parse_pewpew_hits_from_fight_page(
 
 
 def _pewpew_page_debug_summary(raw_html: str) -> Dict[str, Any]:
-    rows=re.findall(r'(?is)<tr\b[^>]*>.*?</tr>',raw_html)
-    headers=[]; sample_rows=[]; header_seen=False
+    rows = re.findall(r"(?is)<tr\\b[^>]*>.*?</tr>", raw_html)
+
+    headers: List[List[str]] = []
+    sample_rows: List[Dict[str, Any]] = []
+    header_seen = False
+
     for row in rows:
-        cells=_html_cells(row)
-        if not cells: continue
-        low_join=' '.join(cells).lower()
-        is_header=(('name' in low_join or 'player' in low_join) and ('rank' in low_join or 'dps%%' in low_join or 'dps %%' in low_join))
+        cells = _html_cells(row)
+        if not cells:
+            continue
+
+        low_join = " ".join(cells).lower()
+        is_header = (
+            ("name" in low_join or "player" in low_join)
+            and ("rank" in low_join or "dps%" in low_join or "dps %" in low_join)
+        )
         if is_header:
-            headers.append(cells[:12]); header_seen=True; continue
-        if header_seen and len(sample_rows)<4:
-            raw_cells=_html_raw_cells(row)
-            sample_rows.append({'cells':cells[:10],'player_guess':_extract_player_name_from_html_row(row,cells),'explicit_points':_extract_explicit_points_from_html(row),'raw_first_cells':[re.sub(r'\s+',' ',x)[:700] for x in raw_cells[:4]]})
-    points_contexts=[]
-    for m in re.finditer(r'(?i)points?',raw_html):
-        a=max(0,m.start()-180); b=min(len(raw_html),m.end()+260)
-        snippet=re.sub(r'\s+',' ',html_lib.unescape(raw_html[a:b]))
-        if snippet not in points_contexts: points_contexts.append(snippet[:700])
-        if len(points_contexts)>=5: break
-    return {'rows':len(rows),'candidate_headers':headers[:5],'sample_player_rows':sample_rows,'points_contexts':points_contexts,'html_chars':len(raw_html)}
+            headers.append(cells[:12])
+            header_seen = True
+            continue
+
+        if header_seen and len(sample_rows) < 4:
+            raw_cells = _html_raw_cells(row)
+            sample_rows.append(
+                {
+                    "cells": cells[:10],
+                    "player_guess": _extract_player_name_from_html_row(row, cells),
+                    "explicit_points": _extract_explicit_points_from_html(row),
+                    "raw_first_cells": [
+                        re.sub(r"\\s+", " ", x)[:700]
+                        for x in raw_cells[:4]
+                    ],
+                }
+            )
+
+    script_srcs: List[str] = []
+    for m in re.finditer(
+        r"(?is)<script\\b[^>]*\\bsrc\\s*=\\s*[\"']([^\"']+)[\"'][^>]*>",
+        raw_html,
+    ):
+        src = html_lib.unescape(m.group(1)).strip()
+        if src and src not in script_srcs:
+            script_srcs.append(src)
+
+    js_keyword_contexts: List[str] = []
+    keyword_re = re.compile(
+        r"(?i)(add-player-rank|points-rank|points-dps|fetch\\s*\\(|XMLHttpRequest|"
+        r"performancePoints|performance_points|rankPercent|rank_percent|"
+        r"/rank|/ranking|/points|dpsPercent|dps_percent)"
+    )
+    for m in keyword_re.finditer(raw_html):
+        a = max(0, m.start() - 260)
+        b = min(len(raw_html), m.end() + 520)
+        snippet = re.sub(r"\\s+", " ", html_lib.unescape(raw_html[a:b]))
+        if snippet not in js_keyword_contexts:
+            js_keyword_contexts.append(snippet[:1100])
+        if len(js_keyword_contexts) >= 12:
+            break
+
+    return {
+        "rows": len(rows),
+        "candidate_headers": headers[:5],
+        "sample_player_rows": sample_rows,
+        "script_srcs": script_srcs[:20],
+        "js_keyword_contexts": js_keyword_contexts,
+        "html_chars": len(raw_html),
+    }
 
 
 def _pewpew_tier(value: float) -> Optional[float]:
@@ -3581,6 +3629,84 @@ async def _apogeebot_character_hits(
     return all_hits, queries
 
 
+APOGEEBOT_JS_DEBUGGED: set = set()
+
+
+def _resolve_uwu_asset_url(page_url: str, asset: str) -> str:
+    asset = html_lib.unescape((asset or "").strip())
+    if not asset:
+        return ""
+    return urljoin(page_url, asset)
+
+
+def _js_relevant_snippets(js_text: str) -> List[str]:
+    out: List[str] = []
+    pattern = re.compile(
+        r"(?i)(add-player-rank|points-rank|points-dps|fetch\\s*\\(|XMLHttpRequest|"
+        r"performancePoints|performance_points|rankPercent|rank_percent|"
+        r"/rank|/ranking|/points|dpsPercent|dps_percent)"
+    )
+    for m in pattern.finditer(js_text or ""):
+        a = max(0, m.start() - 360)
+        b = min(len(js_text), m.end() + 900)
+        snippet = re.sub(r"\\s+", " ", js_text[a:b])
+        if snippet not in out:
+            out.append(snippet[:1500])
+        if len(out) >= 12:
+            break
+    return out
+
+
+async def _apogeebot_debug_external_js(page_url: str, raw_html: str) -> None:
+    report_id = _extract_report_id_from_text(page_url) or canonical_uwu_url(page_url)
+    if report_id in APOGEEBOT_JS_DEBUGGED:
+        return
+    APOGEEBOT_JS_DEBUGGED.add(report_id)
+
+    srcs: List[str] = []
+    for m in re.finditer(
+        r"(?is)<script\\b[^>]*\\bsrc\\s*=\\s*[\"']([^\"']+)[\"'][^>]*>",
+        raw_html,
+    ):
+        resolved = _resolve_uwu_asset_url(page_url, m.group(1))
+        if resolved and resolved not in srcs:
+            srcs.append(resolved)
+
+    print(f"[APOGEEBOT JS] {len(srcs)} script(s) externe(s) détecté(s)")
+    dkp_debug(
+        "APOGEEBOT JS SOURCES",
+        {"page": page_url, "scripts": srcs[:30]},
+    )
+
+    for js_url in srcs[:12]:
+        try:
+            final_url, js_text = await _fetch_uwu_with_retry(
+                js_url,
+                "ApogeeBot/6.1 (+ranking JS debug)",
+            )
+            snippets = _js_relevant_snippets(js_text)
+            if not snippets:
+                continue
+
+            print(
+                f"[APOGEEBOT JS] MATCH {final_url}: "
+                f"{len(snippets)} extrait(s)"
+            )
+            dkp_debug(
+                "APOGEEBOT JS MATCH",
+                {
+                    "url": final_url,
+                    "chars": len(js_text),
+                    "snippets": snippets,
+                },
+            )
+        except Exception as exc:
+            print(
+                f"[APOGEEBOT JS] ECHEC {js_url}: "
+                f"{type(exc).__name__}: {exc}"
+            )
+
+
 def _pewpew_candidate_fight_urls(urls: List[str]) -> List[str]:
     unique=list(dict.fromkeys(urls))
     concrete=[]; generic=[]
@@ -3625,6 +3751,7 @@ async def build_pewpew_report(report_url: str) -> Tuple[str, Dict[str, int]]:
                 summary=_pewpew_page_debug_summary(fight_html)
                 print(f'[APOGEEBOT] {boss}: page lue mais 0 résultat reconnu. Structure={summary}')
                 dkp_debug('APOGEEBOT PAGE SANS HIT',{'boss':boss,'url':page_url,'summary':summary})
+                await _apogeebot_debug_external_js(page_url, fight_html)
             except Exception as exc:
                 stats['pages_failed']+=1
                 print(f'[APOGEEBOT] ECHEC {boss}: {type(exc).__name__}: {exc}')
