@@ -4,6 +4,7 @@ import io
 import json
 import html as html_lib
 import asyncio
+import subprocess
 from dataclasses import dataclass
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
@@ -38,36 +39,30 @@ except Exception:
 
 
 # =============================================================================
-# APogee Discord Bot - Raid-Helper + DKPARSE
+# Apogee Discord Bot - Raid-Helper + DKPARSE + UwU PewPew
 # =============================================================================
-# DKPARSE V1:
-# - #logs-raid is the whitelist: only UwU reports posted there are eligible.
-# - A DKPARSE post may be validated against reports posted around the preceding
-#   8 calendar days (configurable).
-# - Multiple UwU uploads of the same raid are harmless: results are deduplicated
-#   by character + boss + report date + parse value.
-# - The Discord post timestamp is the reference date, NOT the day the bot runs.
-# - No RL / 33% guild computation: presence in #logs-raid is the guild-raid proof.
-# - The UwU parser is deliberately defensive. If UwU changes its HTML/JS format
-#   or a parse cannot be proven, the bot returns "A VERIFIER" instead of paying.
+# DKPARSE V2 (SCREEN-ONLY):
+# - Le texte du post DKPARSE est TOUJOURS ignoré dès qu'un screenshot est présent.
+# - Le screenshot est la source de vérité : personnage, boss, Points, date, spec si visible.
+# - Le bot retient uniquement la date de Best Log la plus récente visible sur le screen.
+# - Seuls les boss de cette date qui atteignent un palier DKPARSE rapportent des DKP.
+# - #logs-raid sert uniquement à confirmer qu'au moins un lien de raid existe à cette date.
+# - DKPARSE ne charge AUCUNE page UwU et ne vérifie plus la présence du joueur dans le raid.
+# - Le délai est calculé entre la date Best Log du screen et la date du post Discord.
+# - Les bonus sont cumulatifs.
 #
-# Required .env additions for DKPARSE:
-#   LOGS_RAID_CHANNEL_ID=123...
-#   DKPARSE_CHANNEL_ID=123...
+# /dkparse-cloture :
+# - relit tous les screenshots du salon DKPARSE ;
+# - déduplique personnage + boss + date ;
+# - produit DKPARSE|Nom:Total|... ;
+# - tente de copier ce texte dans le presse-papier de la machine qui exécute le bot ;
+# - propose ensuite une confirmation avant de vider entièrement le salon DKPARSE.
 #
-# Optional:
-#   DKPARSE_MAX_DAYS=8
-#   UWU_SERVER=Icecrown
-#   DKPARSE_DEBUG=false
-#
-# Context menus:
-#   RH List      -> existing Raid-Helper feature
-#   DKPARSE      -> right click a player's DKPARSE message
-#
-# Slash commands:
-#   /main-audit
-#   /dkparse-check message_id:<id>
-#   /dkparse-logs
+# UWU PEWPEW :
+# - surveille les nouveaux liens UwU dans #logs-raid ;
+# - analyse les pages de combat du rapport ;
+# - reproduit les catégories Top 0.2 / 2 / 5 / 10 / 15 / 20 / 25 / 33 % ;
+# - garde en mémoire les URLs déjà traitées pour éviter les doublons après redémarrage.
 # =============================================================================
 
 
@@ -93,6 +88,10 @@ UWU_SERVER = os.getenv("UWU_SERVER", "Icecrown").strip() or "Icecrown"
 DKPARSE_DEBUG = os.getenv("DKPARSE_DEBUG", "false").strip().lower() in {
     "1", "true", "yes", "on"
 }
+UWU_PEWPEW_ENABLED = os.getenv("UWU_PEWPEW_ENABLED", "true").strip().lower() in {
+    "1", "true", "yes", "on"
+}
+UWU_PEWPEW_MAX_FIGHTS_PER_BOSS = int(os.getenv("UWU_PEWPEW_MAX_FIGHTS_PER_BOSS", "2") or 2)
 
 RAID_HELPER_API = "https://raid-helper.dev/api/v4/events/{event_id}"
 WOW_NAME_RE = re.compile(r"^[A-Za-z]{2,12}$")
@@ -250,6 +249,38 @@ class ParseHit:
     report_url: str
     report_date: Optional[datetime]
     evidence: str = ""
+
+
+@dataclass(frozen=True)
+class ScreenParseRow:
+    boss: str
+    parse: float
+    spec: str
+    best_date: Optional[datetime]
+    date_raw: str = ""
+    attachment: str = ""
+
+
+@dataclass
+class DKParseScreenResult:
+    message_id: int
+    character: Optional[str]
+    spec: str
+    raid_date: Optional[datetime]
+    rows: List[ScreenParseRow]
+    valid_hits: List[ParseHit]
+    issues: List[str]
+    total: int
+    ocr_detail: str = ""
+
+
+@dataclass(frozen=True)
+class PewPewHit:
+    player: str
+    boss: str
+    top_percent: float
+    points: float
+    server_best: bool = False
 
 
 def rh_debug(title: str, value: Any = None) -> None:
@@ -1056,6 +1087,231 @@ async def extract_dkparse_screenshot_data(
 
     dkp_debug("OCR CANDIDATS GLOBAUX", all_candidates[:20])
     return None, "Le nom du personnage n'a pas pu être lu de façon fiable sur le screenshot.", {}
+
+
+
+def _ocr_date_value(raw: str) -> Optional[datetime]:
+    """Parse a Best Log date cell such as 09-08-26 / 12/08/2026."""
+    text = (raw or "").strip()
+    text = text.replace(".", "-").replace("/", "-")
+    m = re.search(r"(?<!\d)(\d{1,2})-(\d{1,2})-(\d{2,4})(?!\d)", text)
+    if not m:
+        return None
+    day, month, year = map(int, m.groups())
+    if year < 100:
+        year += 2000
+    try:
+        return datetime(year, month, day, tzinfo=timezone.utc)
+    except ValueError:
+        return None
+
+
+def _points_column_x(items: List[Dict[str, Any]], image_width: int, image_height: int) -> Optional[float]:
+    headers = [
+        it for it in items
+        if "point" in it["lower"]
+        and (image_height <= 0 or it["cy"] <= image_height * 0.50)
+    ]
+    if headers:
+        return max(
+            headers,
+            key=lambda it: (it["confidence"], -abs(it["cx"] - image_width * 0.55)),
+        )["cx"]
+
+    rank_headers = [it for it in items if it["lower"].strip() == "rank"]
+    best_headers = [it for it in items if "best" in it["lower"]]
+    if rank_headers and best_headers:
+        rx = max(rank_headers, key=lambda it: it["confidence"])["cx"]
+        bx = max(best_headers, key=lambda it: it["confidence"])["cx"]
+        return (rx + bx) / 2.0
+    return None
+
+
+def parse_all_dkparse_rows_from_ocr(
+    ocr_result: Any,
+    image_width: int,
+    image_height: int,
+    attachment: str = "",
+) -> Tuple[str, List[ScreenParseRow]]:
+    """
+    Parse ALL ICC DKPARSE rows visible in the screenshot.
+
+    The Discord message text is deliberately not consulted here.
+    """
+    items = _ocr_result_items(ocr_result)
+    if not items:
+        return "", []
+
+    joined = " ".join(it["raw"] for it in items)
+    spec = normalize_spec(joined)
+    points_x = _points_column_x(items, image_width, image_height)
+    if points_x is None:
+        dkp_debug("OCR SCREEN-ONLY POINTS HEADER INTROUVABLE")
+        return spec, []
+
+    # One best OCR cell per canonical boss.
+    boss_cells: Dict[str, Dict[str, Any]] = {}
+    for it in items:
+        boss = normalize_boss(it["raw"])
+        if not boss or boss in DKPARSE_EXCLUDED_BOSSES:
+            continue
+        old = boss_cells.get(boss)
+        if old is None or it["confidence"] > old["confidence"]:
+            boss_cells[boss] = it
+
+    rows: List[ScreenParseRow] = []
+    for boss, boss_cell in boss_cells.items():
+        row_tol = max(9.0, boss_cell["h"] * 0.95, image_height * 0.013)
+        row_items = [it for it in items if abs(it["cy"] - boss_cell["cy"]) <= row_tol]
+        row_items.sort(key=lambda it: it["cx"])
+
+        # Points: closest numeric cell to the Points header X coordinate.
+        point_candidates: List[Tuple[float, float, Dict[str, Any]]] = []
+        for it in row_items:
+            value = _ocr_percent_value(it["raw"])
+            if value is None:
+                continue
+            point_candidates.append((abs(it["cx"] - points_x), -it["confidence"], it))
+        if not point_candidates:
+            continue
+        point_candidates.sort(key=lambda t: (t[0], t[1]))
+        point_item = point_candidates[0][2]
+        parse_value = _ocr_percent_value(point_item["raw"])
+        if parse_value is None:
+            continue
+
+        # Date: preferably a single OCR cell, otherwise the whole reconstructed row.
+        best_date: Optional[datetime] = None
+        date_raw = ""
+        for it in reversed(row_items):
+            dt = _ocr_date_value(it["raw"])
+            if dt:
+                best_date = dt
+                date_raw = it["raw"]
+                break
+        if best_date is None:
+            row_text = " ".join(it["raw"] for it in row_items)
+            best_date = _ocr_date_value(row_text)
+            if best_date:
+                date_raw = row_text
+
+        rows.append(
+            ScreenParseRow(
+                boss=boss,
+                parse=parse_value,
+                spec=spec,
+                best_date=best_date,
+                date_raw=date_raw,
+                attachment=attachment,
+            )
+        )
+
+    rows.sort(key=lambda r: (r.best_date or datetime(1970, 1, 1, tzinfo=timezone.utc), r.boss), reverse=True)
+    dkp_debug(
+        "OCR SCREEN-ONLY ROWS",
+        {
+            "spec": spec,
+            "rows": [
+                {
+                    "boss": r.boss,
+                    "parse": r.parse,
+                    "date": r.best_date.date().isoformat() if r.best_date else None,
+                    "attachment": r.attachment,
+                }
+                for r in rows
+            ],
+        },
+    )
+    return spec, rows
+
+
+async def extract_dkparse_screen_only(
+    message: discord.Message,
+) -> Tuple[Optional[str], str, str, List[ScreenParseRow]]:
+    """Read character + all DKPARSE rows from screenshots; ignore message text entirely."""
+    image_attachments = [a for a in message.attachments if is_image_attachment(a)]
+    if not image_attachments:
+        return None, "Aucun screenshot image joint au message.", "", []
+
+    if RapidOCR is None or Image is None or np is None:
+        missing = []
+        if RapidOCR is None:
+            missing.append("rapidocr_onnxruntime")
+        if Image is None:
+            missing.append("Pillow")
+        if np is None:
+            missing.append("numpy")
+        return (
+            None,
+            "OCR local indisponible (" + ", ".join(missing) + "). "
+            "Installer : pip install rapidocr_onnxruntime pillow numpy",
+            "",
+            [],
+        )
+
+    engine = get_ocr_engine()
+    if engine is None:
+        return None, "Impossible d'initialiser RapidOCR.", "", []
+
+    character: Optional[str] = None
+    spec = ""
+    rows: List[ScreenParseRow] = []
+    all_candidates: List[Dict[str, Any]] = []
+
+    for att in image_attachments[:4]:
+        try:
+            raw = await download_attachment_bytes(att)
+            image = Image.open(io.BytesIO(raw)).convert("RGB")
+            width, height = image.size
+            result, _elapsed = engine(np.array(image))
+
+            name, candidates = choose_character_from_ocr(result, width, height)
+            if name and not character:
+                character = name
+            for c in candidates[:10]:
+                c["attachment"] = att.filename
+            all_candidates.extend(candidates[:10])
+
+            img_spec, img_rows = parse_all_dkparse_rows_from_ocr(
+                result, width, height, att.filename
+            )
+            if img_spec and not spec:
+                spec = img_spec
+            rows.extend(img_rows)
+
+            dkp_debug(
+                "OCR SCREEN-ONLY COMPLET",
+                {
+                    "attachment": att.filename,
+                    "selected": name,
+                    "spec": img_spec,
+                    "row_count": len(img_rows),
+                },
+            )
+        except Exception as exc:
+            dkp_debug("OCR SCREEN-ONLY ECHEC", {"attachment": att.filename, "error": repr(exc)})
+
+    # Dedupe exact OCR duplicates across multiple attachments.
+    unique: Dict[Tuple[str, Optional[datetime], int], ScreenParseRow] = {}
+    for row in rows:
+        key = (row.boss, row.best_date, int(round(row.parse * 100)))
+        unique[key] = row
+    rows = list(unique.values())
+
+    if not character:
+        dkp_debug("OCR CANDIDATS GLOBAUX", all_candidates[:20])
+        return None, "Le nom du personnage n'a pas pu être lu de façon fiable sur le screenshot.", spec, rows
+
+    return character, f"Nom lu sur le screen : {character}", spec, rows
+
+
+def _screen_date_within_post_window(best_date: datetime, post_time: datetime) -> bool:
+    delta = (post_time.astimezone(timezone.utc).date() - best_date.date()).days
+    return -1 <= delta <= DKPARSE_MAX_DAYS
+
+
+def _lograid_date_set(reports: List[UwuReport]) -> set:
+    return {r.report_date.date() for r in reports if r.report_date is not None}
 
 # =============================================================================
 # DKPARSE
@@ -1889,261 +2145,191 @@ def build_kromaddon_dkparse_export(
     return "\n".join(lines)
 
 
+async def evaluate_dkparse_screen_message(
+    guild: discord.Guild,
+    message: discord.Message,
+    log_dates: Optional[set] = None,
+) -> DKParseScreenResult:
+    """
+    DKPARSE V2: screenshot only.
+
+    IMPORTANT: message.content is never used to select a boss/date/spec.
+    If a post contains both text and a screenshot, the post is fully processed
+    but its text is ignored.
+    """
+    issues: List[str] = []
+
+    if DKPARSE_CHANNEL_ID and message.channel.id != DKPARSE_CHANNEL_ID:
+        issues.append("Message hors du salon DKPARSE configuré.")
+
+    character, ocr_detail, spec, rows = await extract_dkparse_screen_only(message)
+    if not character:
+        issues.append(ocr_detail)
+        return DKParseScreenResult(
+            message_id=message.id,
+            character=None,
+            spec=spec,
+            raid_date=None,
+            rows=rows,
+            valid_hits=[],
+            issues=issues,
+            total=0,
+            ocr_detail=ocr_detail,
+        )
+
+    dated_rows = [r for r in rows if r.best_date is not None]
+    if not dated_rows:
+        issues.append("Aucune date Best Log lisible sur le screenshot.")
+        return DKParseScreenResult(
+            message_id=message.id,
+            character=character,
+            spec=spec,
+            raid_date=None,
+            rows=rows,
+            valid_hits=[],
+            issues=issues,
+            total=0,
+            ocr_detail=ocr_detail,
+        )
+
+    # The screenshot itself decides which raid the DKPARSE refers to:
+    # only the newest visible Best Log date is retained.
+    raid_date = max(r.best_date for r in dated_rows if r.best_date is not None)
+    assert raid_date is not None
+
+    if not _screen_date_within_post_window(raid_date, message.created_at):
+        delta = (message.created_at.astimezone(timezone.utc).date() - raid_date.date()).days
+        issues.append(
+            f"La date la plus récente du screen ({raid_date.strftime('%d/%m/%Y')}) "
+            f"est hors de la fenêtre DKPARSE ({delta} jour(s), max {DKPARSE_MAX_DAYS})."
+        )
+
+    if log_dates is None:
+        reports = await scan_whitelisted_reports(guild, message.created_at)
+        log_dates = _lograid_date_set(reports)
+
+    raid_exists = raid_date.date() in log_dates
+    if not raid_exists:
+        issues.append(
+            f"Aucun raid n'est enregistré dans #logs-raid le {raid_date.strftime('%d/%m/%Y')}."
+        )
+
+    valid_hits: List[ParseHit] = []
+    if raid_exists and _screen_date_within_post_window(raid_date, message.created_at):
+        for row in rows:
+            if row.best_date is None or row.best_date.date() != raid_date.date():
+                continue
+            amount = dkp_for_parse(row.parse)
+            if amount <= 0:
+                continue
+            valid_hits.append(
+                ParseHit(
+                    character=character,
+                    boss=row.boss,
+                    parse=row.parse,
+                    spec=row.spec or spec,
+                    report_url="",
+                    report_date=row.best_date,
+                    evidence="Screenshot OCR + date présente dans #logs-raid",
+                )
+            )
+
+    # Deduplicate same boss/date inside one post; highest parse wins if OCR duplicated it.
+    best_by_key: Dict[Tuple[str, datetime], ParseHit] = {}
+    for hit in valid_hits:
+        if hit.report_date is None:
+            continue
+        key = (hit.boss, hit.report_date)
+        old = best_by_key.get(key)
+        if old is None or hit.parse > old.parse:
+            best_by_key[key] = hit
+    valid_hits = sorted(best_by_key.values(), key=lambda h: h.boss)
+    total = sum(dkp_for_parse(h.parse) for h in valid_hits)
+
+    dkp_debug(
+        "DKPARSE SCREEN-ONLY RESULTAT",
+        {
+            "message_id": message.id,
+            "message_text_ignored": bool(message.content),
+            "character": character,
+            "spec": spec,
+            "raid_date": raid_date.date().isoformat(),
+            "raid_exists_in_lograid": raid_exists,
+            "valid_hits": [
+                {"boss": h.boss, "parse": h.parse, "dkp": dkp_for_parse(h.parse)}
+                for h in valid_hits
+            ],
+            "issues": issues,
+        },
+    )
+
+    return DKParseScreenResult(
+        message_id=message.id,
+        character=character,
+        spec=spec,
+        raid_date=raid_date,
+        rows=rows,
+        valid_hits=valid_hits,
+        issues=issues,
+        total=total,
+        ocr_detail=ocr_detail,
+    )
+
+
 async def analyze_dkparse_message(
     guild: discord.Guild, message: discord.Message
 ) -> Tuple[str, Optional[str]]:
-    if DKPARSE_CHANNEL_ID and message.channel.id != DKPARSE_CHANNEL_ID:
-        return (
-            "⚠️ Ce message n'est pas dans le salon DKPARSE configuré (`DKPARSE_CHANNEL_ID`).",
-            None,
-        )
+    result = await evaluate_dkparse_screen_message(guild, message)
 
-    requested_bosses = requested_bosses_from_post(message.content)
-    requested_spec = requested_spec_from_post(message.content)
-    dkp_debug(
-        "DEMANDE DKPARSE",
-        {
-            "content": message.content,
-            "requested_bosses": requested_bosses,
-            "requested_spec": requested_spec,
-        },
-    )
-
-    if not requested_bosses:
+    if not result.character:
         return (
             "⚠️ **DKPARSE À VÉRIFIER**\n"
-            "Aucun boss DKPARSE reconnu dans le texte du post.\n"
-            "Utilise par exemple : `BPC 90%+ = 500 dkp`, `Marrow +94%`, `Sindra +80%`.",
+            + "\n".join(result.issues or ["Aucun personnage lisible sur le screenshot."]),
             None,
         )
-
-    character, ocr_detail, screenshot_points = await extract_dkparse_screenshot_data(
-        message, requested_bosses
-    )
-    if not character:
-        return (
-            "⚠️ **DKPARSE À VÉRIFIER**\n"
-            f"{ocr_detail}\n"
-            "Aucun personnage n'est supposé à partir du nom Discord.",
-            None,
-        )
-
-    missing_points = [boss for boss in requested_bosses if boss not in screenshot_points]
-    dkp_debug(
-        "PERSONNAGE + POINTS DKPARSE",
-        {
-            "discord_author": f"{message.author} ({message.author.id})",
-            "character_from_screen": character,
-            "requested_bosses": requested_bosses,
-            "screenshot_points": screenshot_points,
-            "missing_points": missing_points,
-        },
-    )
-
-    reports = await scan_whitelisted_reports(guild, message.created_at)
-    reports = [r for r in reports if report_within_delay(r, message.created_at)]
-
-    requested_raid_date = requested_raid_date_from_post(
-        message.content, message.created_at
-    )
-
-    def _report_priority(report: UwuReport) -> Tuple[int, float]:
-        report_dt = report.report_date or report.posted_at
-        same_requested_day = (
-            requested_raid_date is not None
-            and report.report_date is not None
-            and report.report_date.date() == requested_raid_date.date()
-        )
-        return (0 if same_requested_day else 1, -report_dt.timestamp())
-
-    reports.sort(key=_report_priority)
-
-    dkp_debug(
-        "ORDRE RAPPORTS DKPARSE",
-        {
-            "requested_raid_date": (
-                requested_raid_date.date().isoformat()
-                if requested_raid_date else None
-            ),
-            "reports": [
-                {
-                    "url": r.url,
-                    "report_date": (
-                        r.report_date.date().isoformat()
-                        if r.report_date else None
-                    ),
-                }
-                for r in reports
-            ],
-        },
-    )
-
-    if not reports:
-        return (
-            f"⚠️ **DKPARSE À VÉRIFIER — {character}**\n"
-            f"Personnage lu sur le screen : **{character}**\n"
-            "Aucun rapport UwU exploitable trouvé dans #logs-raid pour cette demande.\n"
-            f"Fenêtre DKPARSE : {DKPARSE_MAX_DAYS} jours avant le post du joueur.",
-            None,
-        )
-
-    all_hits: List[ParseHit] = []
-    errors: List[str] = []
-    found_bosses: set[str] = set()
-
-    # Sequential on purpose: only requested bosses are queried, which avoids the
-    # hundreds of requests that previously triggered UwU HTTP 429.
-    for report in reports:
-        needed = [
-            boss for boss in requested_bosses
-            if boss not in found_bosses and boss in screenshot_points
-        ]
-        if not needed:
-            break
-        try:
-            final_url, raw_html = await fetch_uwu_report(report)
-            report2 = UwuReport(
-                url=canonical_uwu_url(final_url),
-                message_id=report.message_id,
-                posted_at=report.posted_at,
-                report_date=report.report_date or report_date_from_url(final_url),
-                label=report.label,
-            )
-
-            fight_urls = extract_uwu_fight_urls(raw_html, report2.url)
-            # Keep only bosses explicitly requested by the DKPARSE post.
-            by_boss: Dict[str, List[str]] = defaultdict(list)
-            for url in fight_urls:
-                boss = boss_from_uwu_url(url)
-                if boss in needed:
-                    by_boss[boss].append(url)
-
-            dkp_debug(
-                "UWU FIGHT LINKS FILTRÉS",
-                {
-                    "report": report2.url,
-                    "needed": needed,
-                    "counts": {boss: len(urls) for boss, urls in by_boss.items()},
-                },
-            )
-
-            for boss in needed:
-                urls = sorted(dict.fromkeys(by_boss.get(boss, [])), key=_fight_url_priority)
-                # Usually the first attempt URL is enough. Try a few variants only
-                # if necessary, then stop immediately once participation is proven.
-                for fight_url in urls[:6]:
-                    try:
-                        page_url, fight_html = await fetch_uwu_url(fight_url)
-                    except Exception as sub_exc:
-                        dkp_debug(
-                            "UWU FIGHT LECTURE ECHEC",
-                            {"url": fight_url, "error": f"{type(sub_exc).__name__}: {sub_exc}"},
-                        )
-                        continue
-
-                    hit = parse_presence_from_fight_page(
-                        fight_html,
-                        character,
-                        page_url,
-                        report2.report_date,
-                        screenshot_points[boss],
-                    )
-                    dkp_debug(
-                        "UWU FIGHT PAGE DEMANDÉE",
-                        {
-                            "url": page_url,
-                            "boss": boss,
-                            "character": character,
-                            "validated": bool(hit),
-                            "screenshot_parse": screenshot_points[boss],
-                        },
-                    )
-                    if hit:
-                        all_hits.append(hit)
-                        found_bosses.add(boss)
-                        break
-                    await asyncio.sleep(0.10)
-
-            await asyncio.sleep(0.15)
-
-        except Exception as exc:
-            error_text = f"{report.url}: {type(exc).__name__}: {exc}"
-            errors.append(error_text)
-            dkp_debug("UWU LECTURE ECHEC", {"url": report.url, "error": error_text})
-
-    hits = dedupe_hits(all_hits)
-    # Hard safety filter: output/export can NEVER contain a non-requested boss.
-    hits = [h for h in hits if h.boss in requested_bosses]
-    hits = [h for h in hits if dkp_for_parse(h.parse) > 0]
-
-    valid_hits: List[ParseHit] = []
-    uncertain_hits: List[ParseHit] = []
-    for hit in hits:
-        if requested_spec:
-            if hit.spec and hit.spec != requested_spec:
-                continue
-            if not hit.spec:
-                uncertain_hits.append(hit)
-                continue
-            valid_hits.append(hit)
-        else:
-            if hit.spec:
-                valid_hits.append(hit)
-            else:
-                uncertain_hits.append(hit)
 
     lines = [
-        f"**DKPARSE — {character}**",
-        f"Personnage lu sur le screen : **{character}**",
-        f"Post : {message.created_at.strftime('%d/%m/%Y')} — fenêtre : {DKPARSE_MAX_DAYS} jours",
-        f"Logs guilde examinés : {len(reports)}",
-        "",
+        f"**DKPARSE — {result.character}**",
+        f"Personnage lu sur le screen : **{result.character}**",
+        "Texte du post : **ignoré** (le screenshot est la seule source DKPARSE)",
     ]
 
-    for boss in missing_points:
-        lines.append(f"⚠️ **{boss}** — valeur `Points` illisible sur le screenshot")
+    if result.raid_date:
+        lines.append(f"Raid retenu d'après le screen : **{result.raid_date.strftime('%d/%m/%Y')}**")
+    if result.spec:
+        lines.append(f"Spec lue sur le screen : **{result.spec}**")
+    else:
+        lines.append("Spec : non lisible sur ce screen (non bloquant)")
 
-    if valid_hits:
-        total = 0
-        # Preserve requested-boss order from the post.
-        order = {boss: i for i, boss in enumerate(requested_bosses)}
-        valid_hits.sort(key=lambda h: order.get(h.boss, 999))
-        for hit in valid_hits:
+    if result.valid_hits:
+        lines += [""]
+        for hit in result.valid_hits:
             amount = dkp_for_parse(hit.parse)
-            total += amount
-            date_txt = hit.report_date.strftime("%d/%m/%Y") if hit.report_date else "date UwU inconnue"
+            spec_txt = f" — {hit.spec}" if hit.spec else ""
             lines.append(
-                f"✅ **{hit.boss}** — {hit.parse:.2f}% — {hit.spec} — "
-                f"{date_txt} → **+{amount} DKP VALIDÉ**"
+                f"✅ **{hit.boss}** — {hit.parse:.2f}%{spec_txt} — "
+                f"{hit.report_date.strftime('%d/%m/%Y') if hit.report_date else '?'} "
+                f"→ **+{amount} DKP VALIDÉ**"
             )
-        lines += ["", f"**BONUS DKPARSE TOTAL : +{total} DKP**"]
+        lines += ["", f"**BONUS DKPARSE TOTAL : +{result.total} DKP**"]
 
-    if uncertain_hits:
-        lines += ["", "**⚠️ À VÉRIFIER (spec non prouvée par UwU)**"]
-        for hit in uncertain_hits:
-            lines.append(f"• {hit.boss} — {hit.parse:.2f}%")
+    if result.issues:
+        lines += ["", "**⚠️ Vérifications / remarques :**"]
+        lines.extend(f"• {issue}" for issue in result.issues)
 
-    missing_presence = [
-        boss for boss in requested_bosses
-        if boss in screenshot_points and boss not in {h.boss for h in hits}
-    ]
-    if missing_presence:
-        lines += ["", "**⚠️ Boss demandés non validés dans les logs guilde :**"]
-        lines.extend(f"• {boss}" for boss in missing_presence)
-
-    if not valid_hits:
+    if not result.valid_hits:
         lines += [
             "",
             "⚠️ **DKPARSE À VÉRIFIER**",
-            f"Personnage lu sur le screen : **{character}**",
-            "Aucun boss demandé n'a pu être validé avec à la fois la valeur Points du screenshot "
-            "et la présence du personnage dans un rapport guilde éligible.",
+            "Aucun bonus n'a pu être validé uniquement avec le screenshot et la date de #logs-raid.",
         ]
-        if errors:
-            lines.append(f"{len(errors)} rapport(s) UwU ont rencontré une erreur après retry.")
         return "\n".join(lines), None
 
-    export = build_kromaddon_dkparse_export(character, message.created_at, valid_hits)
+    export = build_kromaddon_dkparse_export(
+        result.character,
+        message.created_at,
+        result.valid_hits,
+    )
     return "\n".join(lines), export
 
 
@@ -2195,6 +2381,599 @@ async def run_dkparse_check(
             traceback.print_exc()
         await interaction.followup.send(f"❌ DKPARSE : {exc}")
 
+
+
+
+# =============================================================================
+# DKPARSE weekly closure
+# =============================================================================
+
+def build_kromaddon_dkparse_batch(totals: Dict[str, int]) -> str:
+    """Compact clipboard format, analogous to RH|Name:Code used by Kromaddon."""
+    parts = ["DKPARSE"]
+    for name in sorted(totals, key=str.lower):
+        parts.append(f"{name}:{int(totals[name])}")
+    return "|".join(parts)
+
+
+def try_copy_host_clipboard(text: str) -> Tuple[bool, str]:
+    """
+    Best effort: copies to the clipboard of the MACHINE RUNNING THE BOT.
+    This cannot directly control the Discord client's clipboard on another PC.
+    """
+    if os.name == "nt":
+        try:
+            proc = subprocess.run(
+                ["powershell", "-NoProfile", "-Command", "Set-Clipboard"],
+                input=text,
+                text=True,
+                capture_output=True,
+                timeout=8,
+            )
+            if proc.returncode == 0:
+                return True, "copié dans le presse-papier Windows de la machine du bot"
+        except Exception as exc:
+            dkp_debug("PRESSE-PAPIER WINDOWS ECHEC", repr(exc))
+
+    try:
+        import tkinter  # stdlib, may fail on a headless host
+        root = tkinter.Tk()
+        root.withdraw()
+        root.clipboard_clear()
+        root.clipboard_append(text)
+        root.update()
+        root.destroy()
+        return True, "copié dans le presse-papier de la machine du bot"
+    except Exception as exc:
+        dkp_debug("PRESSE-PAPIER FALLBACK ECHEC", repr(exc))
+        return False, "presse-papier hôte indisponible ; utilise le bloc texte/fichier Discord"
+
+
+async def collect_dkparse_batch(
+    guild: discord.Guild,
+    channel: discord.TextChannel,
+) -> Tuple[Dict[str, int], List[str], int, int]:
+    """Analyze every screenshot post in DKPARSE and aggregate deduplicated bonuses."""
+    # One Discord-only scan of #logs-raid. No UwU HTTP request is made here.
+    reports = await scan_whitelisted_reports(guild, datetime.now(timezone.utc))
+    log_dates = _lograid_date_set(reports)
+
+    screen_messages = 0
+    total_messages = 0
+    warnings: List[str] = []
+    dedup: Dict[Tuple[str, str, datetime], ParseHit] = {}
+
+    async for msg in channel.history(limit=None, oldest_first=True):
+        total_messages += 1
+        if msg.author.bot:
+            continue
+        if not any(is_image_attachment(a) for a in msg.attachments):
+            continue
+
+        screen_messages += 1
+        result = await evaluate_dkparse_screen_message(guild, msg, log_dates=log_dates)
+        if not result.character:
+            warnings.append(f"Message {msg.id}: personnage illisible")
+            continue
+
+        if result.issues and not result.valid_hits:
+            warnings.append(
+                f"{result.character} / message {msg.id}: " + "; ".join(result.issues[:2])
+            )
+
+        for hit in result.valid_hits:
+            if hit.report_date is None:
+                continue
+            key = (hit.character.lower(), hit.boss, hit.report_date)
+            old = dedup.get(key)
+            if old is None or hit.parse > old.parse:
+                dedup[key] = hit
+
+    totals: Dict[str, int] = defaultdict(int)
+    display_names: Dict[str, str] = {}
+    for (char_l, _boss, _date), hit in dedup.items():
+        display_names.setdefault(char_l, hit.character)
+        totals[display_names[char_l]] += dkp_for_parse(hit.parse)
+
+    return dict(totals), warnings, screen_messages, total_messages
+
+
+class DKParsePurgeConfirmView(discord.ui.View):
+    def __init__(self, owner_id: int, channel_id: int):
+        super().__init__(timeout=900)
+        self.owner_id = owner_id
+        self.channel_id = channel_id
+
+    def _allowed(self, interaction: discord.Interaction) -> bool:
+        return interaction.user.id == self.owner_id or can_use_admin(interaction)
+
+    @discord.ui.button(
+        label="CONFIRMER ET VIDER LE SALON DKPARSE",
+        style=discord.ButtonStyle.danger,
+    )
+    async def confirm_purge(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ):
+        if not self._allowed(interaction):
+            await interaction.response.send_message("Permission refusée.", ephemeral=True)
+            return
+        if not interaction.guild:
+            await interaction.response.send_message("Serveur requis.", ephemeral=True)
+            return
+
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        try:
+            channel = await get_text_channel(
+                interaction.guild, self.channel_id, "DKPARSE_CHANNEL_ID"
+            )
+            deleted = await channel.purge(
+                limit=None,
+                reason=f"Clôture DKPARSE confirmée par {interaction.user}",
+                bulk=True,
+            )
+            try:
+                await interaction.edit_original_response(view=None)
+            except Exception:
+                pass
+            self.stop()
+            await interaction.followup.send(
+                f"✅ Salon DKPARSE vidé : {len(deleted)} message(s) supprimé(s).",
+                ephemeral=True,
+            )
+        except Exception as exc:
+            await interaction.followup.send(
+                f"❌ Suppression DKPARSE : {exc}", ephemeral=True
+            )
+
+    @discord.ui.button(label="Annuler", style=discord.ButtonStyle.secondary)
+    async def cancel_purge(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ):
+        if not self._allowed(interaction):
+            await interaction.response.send_message("Permission refusée.", ephemeral=True)
+            return
+        self.stop()
+        await interaction.response.edit_message(view=None)
+
+
+@bot.tree.command(
+    name="dkparse-cloture",
+    description="Exporte les DKPARSE de la semaine puis propose de vider le salon.",
+)
+async def dkparse_cloture(interaction: discord.Interaction):
+    if not can_use_admin(interaction):
+        await interaction.response.send_message("Permission refusée.", ephemeral=True)
+        return
+    if not interaction.guild:
+        await interaction.response.send_message("Serveur requis.", ephemeral=True)
+        return
+
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    try:
+        channel = await get_text_channel(
+            interaction.guild, DKPARSE_CHANNEL_ID, "DKPARSE_CHANNEL_ID"
+        )
+        totals, warnings, screen_messages, total_messages = await collect_dkparse_batch(
+            interaction.guild, channel
+        )
+
+        export_text = build_kromaddon_dkparse_batch(totals)
+        copied, clipboard_detail = try_copy_host_clipboard(export_text)
+
+        lines = [
+            "**Clôture DKPARSE — aperçu AVANT suppression**",
+            f"Screens analysés : **{screen_messages}**",
+            f"Messages actuellement dans le salon : **{total_messages}**",
+            f"Joueurs avec bonus : **{len(totals)}**",
+            "",
+        ]
+        if totals:
+            for name in sorted(totals, key=str.lower):
+                lines.append(f"• **{name}** : +{totals[name]} DKP")
+        else:
+            lines.append("Aucun bonus DKPARSE validé.")
+
+        if warnings:
+            lines += ["", f"⚠️ {len(warnings)} avertissement(s) avant suppression :"]
+            lines.extend(f"• {w}" for w in warnings[:12])
+            if len(warnings) > 12:
+                lines.append(f"• ... et {len(warnings) - 12} autre(s)")
+
+        lines += [
+            "",
+            f"Presse-papier : **{'OK' if copied else 'NON'}** — {clipboard_detail}",
+        ]
+
+        # Keep the confirmation/export message safely below Discord's 2000-char limit.
+        summary_text = "\n".join(lines)
+        for chunk in split_discord_text(summary_text):
+            await interaction.followup.send(chunk, ephemeral=True)
+
+        file = discord.File(
+            io.BytesIO(export_text.encode("utf-8")),
+            filename="Kromaddon_DKPARSE_BATCH.txt",
+        )
+        view = DKParsePurgeConfirmView(interaction.user.id, channel.id)
+        export_message = (
+            "**Texte Kromaddon :**\n"
+            f"```text\n{export_text}\n```\n"
+            "Clique sur le bouton rouge uniquement après avoir récupéré/importé ce texte."
+        )
+        await interaction.followup.send(
+            export_message,
+            file=file,
+            view=view,
+            ephemeral=True,
+        )
+    except Exception as exc:
+        if DKPARSE_DEBUG:
+            import traceback
+            traceback.print_exc()
+        await interaction.followup.send(f"❌ Clôture DKPARSE : {exc}", ephemeral=True)
+
+
+
+# =============================================================================
+# UwU PewPew equivalent
+# =============================================================================
+
+PEWPEW_TIERS: Tuple[Tuple[float, str], ...] = (
+    (0.2, "🔴 Top 0.2% 🔴"),
+    (2.0, "🟠 Top 2% 🟠"),
+    (5.0, "🟡 Top 5% 🟡"),
+    (10.0, "🟣 Top 10% 🟣"),
+    (15.0, "🔵 Top 15% 🔵"),
+    (20.0, "🟢 Top 20% 🟢"),
+    (25.0, "⚪ Top 25% ⚪"),
+    (33.0, "⚫ Top 33% ⚫"),
+)
+PEWPEW_STATE_FILE = APP_DIR / "uwu_pewpew_seen.json"
+PEWPEW_LOCK = asyncio.Lock()
+
+
+def _load_pewpew_seen() -> set:
+    try:
+        data = json.loads(PEWPEW_STATE_FILE.read_text(encoding="utf-8"))
+        if isinstance(data, list):
+            return {canonical_uwu_url(str(x)) for x in data if x}
+    except Exception:
+        pass
+    return set()
+
+
+PEWPEW_SEEN_REPORTS = _load_pewpew_seen()
+
+
+def _save_pewpew_seen() -> None:
+    try:
+        PEWPEW_STATE_FILE.write_text(
+            json.dumps(sorted(PEWPEW_SEEN_REPORTS), ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+    except Exception as exc:
+        dkp_debug("PEWPEW STATE SAVE ECHEC", repr(exc))
+
+
+def _generic_boss_from_uwu_url(url: str) -> str:
+    try:
+        q = parse_qs(urlsplit(html_lib.unescape(url)).query)
+        raw = (q.get("boss") or [""])[0]
+    except Exception:
+        raw = ""
+    if not raw:
+        return ""
+    known = normalize_boss(raw)
+    if known:
+        return known
+    words = raw.replace("_", "-").split("-")
+    small = {"of", "the", "and"}
+    pretty = []
+    for i, word in enumerate(words):
+        lw = word.lower()
+        pretty.append(lw if i > 0 and lw in small else lw.capitalize())
+    return " ".join(pretty)
+
+
+def _html_cells(row_html: str) -> List[str]:
+    cells = re.findall(r"(?is)<t[dh]\b[^>]*>(.*?)</t[dh]>", row_html)
+    return [html_to_text(c) for c in cells]
+
+
+def _extract_player_name_from_html_row(row_html: str, cells: List[str]) -> str:
+    # Strongest source: character/player link query.
+    patterns = [
+        r"(?i)[?&](?:name|player)=([A-Za-z]{2,12})(?:[&\"'])",
+        r"(?i)data-(?:player|name)=[\"']([A-Za-z]{2,12})[\"']",
+    ]
+    for pattern in patterns:
+        m = re.search(pattern, row_html)
+        if m and WOW_NAME_RE.fullmatch(m.group(1)):
+            return m.group(1)
+
+    # Then anchor text.
+    for raw in re.findall(r"(?is)<a\b[^>]*>(.*?)</a>", row_html):
+        text = html_to_text(raw)
+        for token in re.findall(r"\b[A-Za-z]{2,12}\b", text):
+            if WOW_NAME_RE.fullmatch(token) and token.lower() not in OCR_IGNORE_WORDS:
+                return token
+
+    # Finally inspect likely first cells, avoiding headers/class words.
+    for cell in cells[:3]:
+        for token in re.findall(r"\b[A-Za-z]{2,12}\b", cell):
+            if WOW_NAME_RE.fullmatch(token) and token.lower() not in OCR_IGNORE_WORDS:
+                if normalize_boss(token):
+                    continue
+                return token
+    return ""
+
+
+def parse_pewpew_hits_from_fight_page(
+    raw_html: str,
+    fight_url: str,
+) -> List[PewPewHit]:
+    """Extract player Points from an UwU fight table and convert to old PewPew top %."""
+    boss = _generic_boss_from_uwu_url(fight_url)
+    if not boss:
+        return []
+
+    rows_html = re.findall(r"(?is)<tr\b[^>]*>.*?</tr>", raw_html)
+    if not rows_html:
+        return []
+
+    header_cells: List[str] = []
+    points_idx: Optional[int] = None
+    name_idx: Optional[int] = None
+
+    for row in rows_html:
+        cells = _html_cells(row)
+        lowers = [c.strip().lower() for c in cells]
+        if any("point" in c for c in lowers):
+            header_cells = cells
+            for i, c in enumerate(lowers):
+                if "point" in c:
+                    points_idx = i
+                    break
+            for i, c in enumerate(lowers):
+                if c in {"player", "name", "character"} or "player" in c:
+                    name_idx = i
+                    break
+            break
+
+    hits: List[PewPewHit] = []
+    for row in rows_html:
+        cells = _html_cells(row)
+        if not cells:
+            continue
+        if header_cells and cells == header_cells:
+            continue
+
+        player = _extract_player_name_from_html_row(row, cells)
+        if not player:
+            continue
+
+        points: Optional[float] = None
+        if points_idx is not None and points_idx < len(cells):
+            points = _numeric(cells[points_idx])
+
+        # Fallback: look for a labelled Points value inside the row only.
+        if points is None:
+            m = re.search(
+                r"(?i)(?:points?|performance)\s*[:=]?\s*(\d{1,3}(?:[.,]\d+)?)",
+                html_to_text(row),
+            )
+            if m:
+                try:
+                    points = float(m.group(1).replace(",", "."))
+                except ValueError:
+                    points = None
+
+        if points is None or not (0.0 <= points <= 100.0):
+            continue
+
+        top_percent = max(0.0, min(100.0, 100.0 - points))
+        if top_percent > 33.0001:
+            continue
+
+        hits.append(
+            PewPewHit(
+                player=player,
+                boss=boss,
+                top_percent=top_percent,
+                points=points,
+                server_best=("server best" in html_to_text(row).lower() or points >= 99.995),
+            )
+        )
+
+    # Fallback: UwU sometimes embeds player performance data in JSON/JS instead
+    # of rendering a normal HTML table. Only explicit Points-like fields are
+    # accepted to avoid inventing a percentile from unrelated numbers.
+    seen = {(h.player.lower(), h.boss, round(h.points, 4)) for h in hits}
+    name_keys = ("name", "player", "playerName", "character", "characterName")
+    points_keys = (
+        "points", "performancePoints", "performance_points",
+        "playerPoints", "player_points",
+    )
+    for obj in json_candidates_from_html(raw_html):
+        for d in walk_dicts(obj):
+            raw_name = str(get_first(d, name_keys, "")).strip()
+            if not WOW_NAME_RE.fullmatch(raw_name):
+                continue
+            points = None
+            for key in points_keys:
+                if key in d:
+                    points = _numeric(d[key])
+                    if points is not None:
+                        break
+            if points is None or not (0.0 <= points <= 100.0):
+                continue
+            top_percent = max(0.0, min(100.0, 100.0 - points))
+            if top_percent > 33.0001:
+                continue
+            key = (raw_name.lower(), boss, round(points, 4))
+            if key in seen:
+                continue
+            seen.add(key)
+            blob = " ".join(str(v) for v in d.values() if isinstance(v, str)).lower()
+            hits.append(
+                PewPewHit(
+                    player=raw_name,
+                    boss=boss,
+                    top_percent=top_percent,
+                    points=points,
+                    server_best=("server best" in blob or points >= 99.995),
+                )
+            )
+
+    return hits
+
+
+def _pewpew_tier(value: float) -> Optional[float]:
+    for threshold, _label in PEWPEW_TIERS:
+        if value <= threshold + 1e-9:
+            return threshold
+    return None
+
+
+def _fmt_top_percent(value: float) -> str:
+    if abs(value - round(value)) < 0.05:
+        return f"{int(round(value))}%"
+    return f"{value:.1f}%"
+
+
+def format_pewpew_report(hits: List[PewPewHit]) -> str:
+    # Best result per player + boss across attempts.
+    best: Dict[Tuple[str, str], PewPewHit] = {}
+    display_name: Dict[str, str] = {}
+    for hit in hits:
+        pl = hit.player.lower()
+        display_name.setdefault(pl, hit.player)
+        key = (pl, hit.boss)
+        old = best.get(key)
+        if old is None or hit.top_percent < old.top_percent:
+            best[key] = hit
+
+    by_player: Dict[str, List[PewPewHit]] = defaultdict(list)
+    for (pl, _boss), hit in best.items():
+        by_player[pl].append(hit)
+
+    tier_players: Dict[float, List[Tuple[str, List[PewPewHit]]]] = defaultdict(list)
+    for pl, phits in by_player.items():
+        phits.sort(key=lambda h: (h.top_percent, h.boss))
+        tier = _pewpew_tier(phits[0].top_percent)
+        if tier is not None:
+            tier_players[tier].append((display_name[pl], phits))
+
+    if not tier_players:
+        return ""
+
+    lines = ["Congratulations to the following players for achieving high damage on bosses!"]
+    for threshold, label in PEWPEW_TIERS:
+        players = tier_players.get(threshold, [])
+        if not players:
+            continue
+        players.sort(key=lambda item: (item[1][0].top_percent, item[0].lower()))
+        lines.append(label)
+
+        for name, phits in players:
+            lead = [h for h in phits if h.top_percent <= threshold + 1e-9]
+            lead_parts = []
+            for h in lead:
+                value = "SERVER BEST!" if h.server_best else _fmt_top_percent(h.top_percent)
+                lead_parts.append(f"**{value}** on {h.boss}")
+
+            extras = []
+            thresholds = [t for t, _ in PEWPEW_TIERS if t > threshold]
+            for t in thresholds:
+                count = sum(1 for h in phits if h.top_percent <= t + 1e-9)
+                if count:
+                    label_num = "0.2" if t == 0.2 else str(int(t))
+                    extras.append(f"**{count}** top {label_num}%")
+
+            suffix = (", also " + ", ".join(extras)) if extras else ""
+            lines.append(f"  🔸  *{name}*: " + ", ".join(lead_parts) + suffix)
+
+    return "\n".join(lines)
+
+
+async def build_pewpew_report(report_url: str) -> str:
+    report_url = canonical_uwu_url(report_url)
+    final_url, raw_html = await _fetch_uwu_with_retry(
+        report_url,
+        "ApogeeUwUPewPew/1.0 (+Discord guild tooling)",
+    )
+    report_url = canonical_uwu_url(final_url)
+    fight_urls = extract_uwu_fight_urls(raw_html, report_url)
+
+    by_boss: Dict[str, List[str]] = defaultdict(list)
+    for url in fight_urls:
+        boss = _generic_boss_from_uwu_url(url)
+        if boss:
+            by_boss[boss].append(url)
+
+    hits: List[PewPewHit] = []
+    for boss, urls in by_boss.items():
+        unique_urls = sorted(dict.fromkeys(urls), key=_fight_url_priority)
+        # A couple of concrete attempts is enough to mimic the historical bot
+        # while keeping request volume low enough for UwU.
+        for fight_url in unique_urls[:max(1, UWU_PEWPEW_MAX_FIGHTS_PER_BOSS)]:
+            try:
+                page_url, fight_html = await _fetch_uwu_with_retry(
+                    fight_url,
+                    "ApogeeUwUPewPew/1.0 (+Discord guild tooling)",
+                )
+                hits.extend(parse_pewpew_hits_from_fight_page(fight_html, page_url))
+            except Exception as exc:
+                dkp_debug(
+                    "PEWPEW FIGHT ECHEC",
+                    {"boss": boss, "url": fight_url, "error": f"{type(exc).__name__}: {exc}"},
+                )
+            await asyncio.sleep(0.12)
+
+    return format_pewpew_report(hits)
+
+
+def _message_uwu_urls(message: discord.Message) -> List[str]:
+    parts = [message.content or ""]
+    for embed in message.embeds:
+        parts.extend([embed.url or "", embed.title or "", embed.description or ""])
+        for field in embed.fields:
+            parts.extend([field.name or "", field.value or ""])
+    return extract_uwu_urls("\n".join(x for x in parts if x))
+
+
+async def handle_uwu_pewpew_message(message: discord.Message) -> None:
+    if not UWU_PEWPEW_ENABLED:
+        return
+    if message.author.bot or not message.guild:
+        return
+    if message.channel.id != LOGS_RAID_CHANNEL_ID:
+        return
+
+    urls = _message_uwu_urls(message)
+    if not urls:
+        return
+
+    async with PEWPEW_LOCK:
+        for url in urls:
+            canonical = canonical_uwu_url(url)
+            if canonical in PEWPEW_SEEN_REPORTS:
+                continue
+            try:
+                report = await build_pewpew_report(canonical)
+                if report:
+                    for chunk in split_discord_text(report):
+                        await message.channel.send(
+                            chunk,
+                            allowed_mentions=discord.AllowedMentions.none(),
+                        )
+                # Mark successfully read reports even when nobody reached Top 33.
+                PEWPEW_SEEN_REPORTS.add(canonical)
+                _save_pewpew_seen()
+            except Exception as exc:
+                dkp_debug(
+                    "PEWPEW REPORT ECHEC",
+                    {"url": canonical, "error": f"{type(exc).__name__}: {exc}"},
+                )
 
 # =============================================================================
 # Discord commands / events
@@ -2268,7 +3047,7 @@ async def dkparse_check(interaction: discord.Interaction, message_id: str):
 
 @bot.tree.command(
     name="dkparse-logs",
-    description="Affiche les logs guilde UwU trouvés sur les 8 derniers jours.",
+    description="Affiche les dates de logs guilde trouvées dans #logs-raid.",
 )
 async def dkparse_logs(interaction: discord.Interaction):
     if not can_use_admin(interaction):
@@ -2369,6 +3148,13 @@ async def enforce_main_message(message: discord.Message):
 @bot.event
 async def on_message(message: discord.Message):
     await enforce_main_message(message)
+    if (
+        UWU_PEWPEW_ENABLED
+        and not message.author.bot
+        and message.guild
+        and message.channel.id == LOGS_RAID_CHANNEL_ID
+    ):
+        asyncio.create_task(handle_uwu_pewpew_message(message))
     await bot.process_commands(message)
 
 
@@ -2376,17 +3162,26 @@ async def on_message(message: discord.Message):
 async def on_message_edit(before: discord.Message, after: discord.Message):
     if after.channel.id == MAIN_CHANNEL_ID:
         await enforce_main_message(after)
+    if (
+        UWU_PEWPEW_ENABLED
+        and not after.author.bot
+        and after.guild
+        and after.channel.id == LOGS_RAID_CHANNEL_ID
+        and _message_uwu_urls(after)
+    ):
+        asyncio.create_task(handle_uwu_pewpew_message(after))
 
 
 @bot.event
 async def on_ready():
-    print("Apogee Raid-Helper Bot V4 + DKPARSE")
+    print("Apogee Raid-Helper Bot V5 + DKPARSE SCREEN-ONLY + UwU PewPew")
     print(f"Connecté en tant que {bot.user} ({bot.user.id})")
     print(f"#Main channel ID: {MAIN_CHANNEL_ID}")
     print(f"#logs-raid channel ID: {LOGS_RAID_CHANNEL_ID or 'NON CONFIGURE'}")
     print(f"#dkparse channel ID: {DKPARSE_CHANNEL_ID or 'NON CONFIGURE'}")
     print(f"DKPARSE window: {DKPARSE_MAX_DAYS} jours")
     print("DKPARSE OCR: " + ("RapidOCR OK" if (RapidOCR is not None and Image is not None and np is not None) else "INDISPONIBLE"))
+    print(f"UwU PewPew: {'ACTIVE' if UWU_PEWPEW_ENABLED else 'DESACTIVE'}")
 
 
 @bot.event
