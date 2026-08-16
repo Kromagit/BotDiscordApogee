@@ -39,14 +39,14 @@ except Exception:
 
 
 # =============================================================================
-# Apogee Discord Bot - Raid-Helper + DKPARSE + UwU PewPew
+# Apogee Discord Bot - Raid-Helper + DKPARSE + ApogeeBot
 # =============================================================================
 # DKPARSE V2 (SCREEN-ONLY):
 # - Le texte du post DKPARSE est TOUJOURS ignoré dès qu'un screenshot est présent.
 # - Le screenshot est la source de vérité : personnage, boss, Points, date, spec si visible.
-# - Le bot retient uniquement la date de Best Log la plus récente visible sur le screen.
-# - Seuls les boss de cette date qui atteignent un palier DKPARSE rapportent des DKP.
-# - #logs-raid sert uniquement à confirmer qu'au moins un lien de raid existe à cette date.
+# - Chaque ligne boss est évaluée avec sa propre date Best Log lue sur le screen.
+# - Seules les lignes dans la fenêtre DKPARSE et dont la date existe dans #logs-raid sont retenues.
+# - #logs-raid sert uniquement à confirmer qu'au moins un lien de raid existe à la même date.
 # - DKPARSE ne charge AUCUNE page UwU et ne vérifie plus la présence du joueur dans le raid.
 # - Le délai est calculé entre la date Best Log du screen et la date du post Discord.
 # - Les bonus sont cumulatifs.
@@ -58,7 +58,7 @@ except Exception:
 # - tente de copier ce texte dans le presse-papier de la machine qui exécute le bot ;
 # - propose ensuite une confirmation avant de vider entièrement le salon DKPARSE.
 #
-# UWU PEWPEW :
+# APOGEEBOT :
 # - surveille les nouveaux liens UwU dans #logs-raid ;
 # - analyse les pages de combat du rapport ;
 # - reproduit les catégories Top 0.2 / 2 / 5 / 10 / 15 / 20 / 25 / 33 % ;
@@ -771,64 +771,121 @@ def choose_character_from_ocr(
     image_width: int,
     image_height: int,
 ) -> Tuple[Optional[str], List[Dict[str, Any]]]:
+    """
+    Choose the character name from the UwU character table header.
+
+    Browser screenshots may contain tab/address-bar text above the actual page.
+    The old heuristic could therefore select something such as UwULogsAprX.
+    We now anchor the name to the visible UwU table: same horizontal band as
+    the `Icecrown` server label and above the Boss/Rank/Points header.
+    """
+    items = _ocr_result_items(ocr_result)
     candidates: List[Dict[str, Any]] = []
-
-    if isinstance(ocr_result, tuple) and ocr_result:
-        ocr_result = ocr_result[0]
-
-    if not isinstance(ocr_result, list):
+    if not items:
         return None, candidates
 
-    for item in ocr_result:
-        if not isinstance(item, (list, tuple)) or len(item) < 2:
-            continue
-
-        box = item[0]
-        raw_text = str(item[1] or "").strip()
-        try:
-            confidence = float(item[2]) if len(item) >= 3 else 0.5
-        except Exception:
-            confidence = 0.5
-
-        token = _clean_ocr_token(raw_text)
+    def valid_name_item(it: Dict[str, Any]) -> bool:
+        token = _clean_ocr_token(it["raw"])
         if not WOW_NAME_RE.fullmatch(token):
-            continue
-        if token.lower() in OCR_IGNORE_WORDS:
-            continue
+            return False
+        low = token.lower()
+        if low in OCR_IGNORE_WORDS:
+            return False
+        if "uwulog" in low or low.startswith("apogeebot"):
+            return False
+        if normalize_boss(token):
+            return False
+        return True
 
-        x1, y1, x2, y2 = _box_geometry(box)
-        cx = (x1 + x2) / 2.0
-        cy = (y1 + y2) / 2.0
+    raw_candidates = [it for it in items if valid_name_item(it)]
 
-        # Le nom UwU est normalement dans la partie haute du screenshot.
-        if image_height > 0 and cy > image_height * 0.42:
-            continue
+    # Locate table header row and the Icecrown server label.
+    table_headers = [
+        it for it in items
+        if it["lower"].strip() in {"boss", "rank", "points", "date"}
+        or "point" in it["lower"]
+    ]
+    table_y = None
+    if table_headers:
+        ys = sorted(it["cy"] for it in table_headers)
+        table_y = ys[len(ys)//2]
 
-        y_score = 1.0 - min(max(cy / max(image_height, 1), 0.0), 1.0)
-        x_target = image_width * 0.25
-        x_distance = abs(cx - x_target) / max(image_width, 1)
-        x_score = max(0.0, 1.0 - x_distance)
-        score = confidence * 3.0 + y_score * 2.2 + x_score * 1.2
+    ice_cells = [
+        it for it in items
+        if "icecrown" in re.sub(r"[^a-z]", "", it["lower"])
+        and (table_y is None or it["cy"] < table_y)
+    ]
+    ice = None
+    if ice_cells:
+        if table_y is not None:
+            ice = min(ice_cells, key=lambda it: abs(it["cy"] - table_y))
+        else:
+            ice = max(ice_cells, key=lambda it: it["confidence"])
 
+    def add_candidate(it: Dict[str, Any], anchor_score: float) -> None:
+        token = _clean_ocr_token(it["raw"])
+        score = it["confidence"] * 4.0 + anchor_score
         candidates.append({
             "name": token,
-            "raw": raw_text,
-            "confidence": confidence,
-            "x": round(cx, 1),
-            "y": round(cy, 1),
+            "raw": it["raw"],
+            "confidence": it["confidence"],
+            "x": round(it["cx"], 1),
+            "y": round(it["cy"], 1),
             "score": round(score, 4),
         })
 
-    candidates.sort(key=lambda c: c["score"], reverse=True)
+    # Strong path: character is left of Icecrown and on almost the same line.
+    if ice is not None:
+        y_tol = max(16.0, image_height * 0.045)
+        anchored = [
+            it for it in raw_candidates
+            if it["cx"] < ice["cx"]
+            and abs(it["cy"] - ice["cy"]) <= y_tol
+            and (table_y is None or it["cy"] < table_y)
+        ]
+        for it in anchored:
+            y_prox = max(0.0, 2.5 - abs(it["cy"] - ice["cy"]) / max(y_tol, 1.0) * 2.5)
+            x_prox = max(0.0, 1.5 - abs(it["cx"] - image_width * 0.28) / max(image_width, 1) * 2.0)
+            add_candidate(it, 5.0 + y_prox + x_prox)
 
+    # Second path: immediately above the Boss/Rank/Points table header.
+    if not candidates and table_y is not None:
+        header_band = [
+            it for it in raw_candidates
+            if image_height * 0.03 <= it["cy"] < table_y
+            and (table_y - it["cy"]) <= max(90.0, image_height * 0.18)
+            and it["cx"] < image_width * 0.62
+        ]
+        for it in header_band:
+            v = max(0.0, 3.0 - (table_y - it["cy"]) / max(image_height, 1) * 8.0)
+            x = max(0.0, 1.5 - abs(it["cx"] - image_width * 0.28) / max(image_width, 1) * 2.0)
+            add_candidate(it, 3.0 + v + x)
+
+    # Conservative fallback. Penalize browser chrome at the very top.
     if not candidates:
-        return None, candidates
+        for it in raw_candidates:
+            if image_height > 0 and it["cy"] > image_height * 0.42:
+                continue
+            y_score = 1.0 - min(max(it["cy"] / max(image_height, 1), 0.0), 1.0)
+            x_target = image_width * 0.25
+            x_distance = abs(it["cx"] - x_target) / max(image_width, 1)
+            x_score = max(0.0, 1.0 - x_distance)
+            chrome_penalty = 2.5 if image_height > 0 and it["cy"] < image_height * 0.035 else 0.0
+            score = it["confidence"] * 3.0 + y_score * 2.2 + x_score * 1.2 - chrome_penalty
+            token = _clean_ocr_token(it["raw"])
+            candidates.append({
+                "name": token,
+                "raw": it["raw"],
+                "confidence": it["confidence"],
+                "x": round(it["cx"], 1),
+                "y": round(it["cy"], 1),
+                "score": round(score, 4),
+            })
 
-    best = candidates[0]
-    if best["confidence"] < 0.35:
+    candidates.sort(key=lambda c: c["score"], reverse=True)
+    if not candidates or candidates[0]["confidence"] < 0.35:
         return None, candidates
-
-    return best["name"], candidates
+    return candidates[0]["name"], candidates
 
 
 async def extract_character_from_screenshot(
@@ -1127,11 +1184,242 @@ def _points_column_x(items: List[Dict[str, Any]], image_width: int, image_height
     return None
 
 
+def _infer_wow_class_from_ocr_items(items: List[Dict[str, Any]]) -> str:
+    """Read the WoW class from the whole UwU character screenshot."""
+    joined = " ".join(it["raw"] for it in items)
+    low = joined.lower()
+    padded = f" {low} "
+
+    class_hints = [
+        ("deathknight", ("death knight", "deathknight", "scourgelord")),
+        ("warlock", (" warlock ", "dark coven")),
+        ("warrior", (" warrior ", "ymirjar lord")),
+        ("paladin", (" paladin ", "lightsworn")),
+        ("hunter", (" hunter ", "ahn'kahar", "ahn kahar")),
+        ("priest", (" priest ", "crimson acolyte")),
+        ("druid", (" druid ", "lasherweave")),
+        ("rogue", (" rogue ", "shadowblade")),
+        ("mage", (" mage ", "bloodmage")),
+        ("shaman", (" shaman ", "frost witch")),
+    ]
+    for cls, hints in class_hints:
+        if any(h in padded for h in hints):
+            return cls
+    return ""
+
+
+# UwU uses the normal talent-tree order for ?spec=1/2/3.
+# Only specs tracked by the guild are mapped to Kromaddon labels.
+TRACKED_SPEC_BY_CLASS_INDEX = {
+    ("warrior", 2): "Fwar",
+    ("rogue", 2): "Combat",
+    ("paladin", 3): "Ret",
+    ("deathknight", 3): "UH",
+    ("druid", 1): "Boomie",
+    ("druid", 2): "FeralDPS",
+    ("mage", 2): "MageFeu",
+    ("priest", 3): "SP",
+    ("warlock", 2): "Démono",
+    ("hunter", 2): "MM",
+}
+
+
+def _spec_index_from_ocr_url(items: List[Dict[str, Any]]) -> Optional[int]:
+    """Read UwU's ?spec=N parameter from the browser address bar."""
+    if not items:
+        return None
+
+    ordered = sorted(items, key=lambda x: (x["cy"], x["cx"]))
+    joined = " ".join(it["raw"] for it in ordered)
+    compact = re.sub(r"\s+", "", joined.lower())
+
+    for text in (compact, joined.lower()):
+        for pattern in (
+            r"(?:[?&]|^)spec[=:]?([123])(?:[&#/]|$)",
+            r"\bspec\s*[=:]?\s*([123])\b",
+        ):
+            m = re.search(pattern, text)
+            if m:
+                return int(m.group(1))
+
+    spec_cells = [it for it in items if "spec" in it["lower"]]
+    for spec_cell in spec_cells:
+        nearby = [
+            it for it in items
+            if it["cx"] >= spec_cell["cx"]
+            and it["cx"] - spec_cell["cx"] <= 180
+            and abs(it["cy"] - spec_cell["cy"]) <= 18
+        ]
+        nearby.sort(key=lambda it: it["cx"])
+        text = " ".join(it["raw"] for it in nearby)
+        m = re.search(r"spec\D*([123])", text, re.IGNORECASE)
+        if m:
+            return int(m.group(1))
+    return None
+
+
+def _selected_spec_index_from_image(
+    image_array: Any,
+    items: List[Dict[str, Any]],
+    image_width: int,
+    image_height: int,
+) -> Optional[int]:
+    """
+    Detect the selected UwU spec icon in the top-right.
+    The three icons are 1/2/3 from left to right and the active one has a
+    bright purple border.
+    """
+    if image_array is None or np is None or image_width <= 0 or image_height <= 0:
+        return None
+
+    try:
+        arr = image_array
+        if getattr(arr, "ndim", 0) != 3 or arr.shape[2] < 3:
+            return None
+
+        ice_cells = [
+            it for it in items
+            if "icecrown" in re.sub(r"[^a-z]", "", it["lower"])
+        ]
+        if not ice_cells:
+            return None
+
+        table_headers = [
+            it for it in items
+            if it["lower"].strip() in {"boss", "rank", "points", "date"}
+            or "point" in it["lower"]
+        ]
+        table_y = None
+        if table_headers:
+            ys = sorted(it["cy"] for it in table_headers)
+            table_y = ys[len(ys) // 2]
+
+        usable_ice = [
+            it for it in ice_cells
+            if table_y is None or it["cy"] < table_y
+        ] or ice_cells
+
+        ice = (
+            min(usable_ice, key=lambda it: abs(it["cy"] - table_y))
+            if table_y is not None
+            else max(usable_ice, key=lambda it: it["confidence"])
+        )
+
+        y0 = max(0, int(ice["cy"]) - max(28, int(image_height * 0.030)))
+        y1 = min(image_height, int(ice["cy"]) + max(38, int(image_height * 0.045)))
+        x0 = max(0, int(image_width * 0.875))
+        x1 = min(image_width, int(image_width * 0.997))
+        if x1 - x0 < 60 or y1 - y0 < 20:
+            return None
+
+        crop = arr[y0:y1, x0:x1, :3]
+        slot_w = crop.shape[1] / 3.0
+        scores: List[int] = []
+
+        for idx in range(3):
+            a = int(round(idx * slot_w))
+            b = int(round((idx + 1) * slot_w))
+            slot = crop[:, a:b, :]
+            r = slot[:, :, 0].astype(np.int16)
+            g = slot[:, :, 1].astype(np.int16)
+            blue = slot[:, :, 2].astype(np.int16)
+
+            purple = (
+                (r >= 70)
+                & (blue >= 95)
+                & (g <= 105)
+                & (r >= g + 18)
+                & (blue >= g + 28)
+            )
+            scores.append(int(purple.sum()))
+
+        best_i = max(range(3), key=lambda i: scores[i])
+        best = scores[best_i]
+        second = sorted(scores, reverse=True)[1]
+
+        selected = best_i + 1 if best >= 18 and best >= second * 1.35 else None
+        dkp_debug(
+            "OCR SPEC ICON",
+            {"scores": scores, "selected_index": selected, "crop": [x0, y0, x1, y1]},
+        )
+        return selected
+    except Exception as exc:
+        dkp_debug("OCR SPEC ICON ECHEC", {"error": repr(exc)})
+        return None
+
+
+def _infer_dkparse_spec_from_ocr_items(
+    items: List[Dict[str, Any]],
+    image_array: Any = None,
+    image_width: int = 0,
+    image_height: int = 0,
+) -> str:
+    """
+    Active spec priority:
+      1) class + UwU URL ?spec=N
+      2) class + selected top-right spec icon
+      3) class + talent distribution fallback
+
+    We deliberately do NOT scan the entire page for any spec word first,
+    because UwU can display both dual-spec builds on the left.
+    """
+    if not items:
+        return ""
+
+    wow_class = _infer_wow_class_from_ocr_items(items)
+
+    url_spec_index = _spec_index_from_ocr_url(items)
+    if wow_class and url_spec_index:
+        label = TRACKED_SPEC_BY_CLASS_INDEX.get((wow_class, url_spec_index), "")
+        dkp_debug(
+            "OCR SPEC URL",
+            {"class": wow_class, "spec_index": url_spec_index, "label": label},
+        )
+        if label:
+            return label
+
+    icon_spec_index = _selected_spec_index_from_image(
+        image_array, items, image_width, image_height
+    )
+    if wow_class and icon_spec_index:
+        label = TRACKED_SPEC_BY_CLASS_INDEX.get((wow_class, icon_spec_index), "")
+        dkp_debug(
+            "OCR SPEC ICONE",
+            {"class": wow_class, "spec_index": icon_spec_index, "label": label},
+        )
+        if label:
+            return label
+
+    joined = " ".join(it["raw"] for it in items)
+    builds: List[Tuple[int, int, int]] = []
+    for m in re.finditer(
+        r"(?<!\d)(\d{1,2})\s*[/|]\s*(\d{1,2})\s*[/|]\s*(\d{1,2})(?!\d)",
+        joined,
+    ):
+        vals = tuple(int(x) for x in m.groups())
+        if sum(vals) <= 80 and max(vals) >= 30:
+            builds.append(vals)
+
+    if wow_class and builds:
+        candidates: List[str] = []
+        for vals in builds:
+            tree = max(range(3), key=lambda i: vals[i]) + 1
+            label = TRACKED_SPEC_BY_CLASS_INDEX.get((wow_class, tree), "")
+            if label:
+                candidates.append(label)
+        unique = list(dict.fromkeys(candidates))
+        if len(unique) == 1:
+            return unique[0]
+
+    return ""
+
+
 def parse_all_dkparse_rows_from_ocr(
     ocr_result: Any,
     image_width: int,
     image_height: int,
     attachment: str = "",
+    image_array: Any = None,
 ) -> Tuple[str, List[ScreenParseRow]]:
     """
     Parse ALL ICC DKPARSE rows visible in the screenshot.
@@ -1142,8 +1430,12 @@ def parse_all_dkparse_rows_from_ocr(
     if not items:
         return "", []
 
-    joined = " ".join(it["raw"] for it in items)
-    spec = normalize_spec(joined)
+    spec = _infer_dkparse_spec_from_ocr_items(
+        items,
+        image_array=image_array,
+        image_width=image_width,
+        image_height=image_height,
+    )
     points_x = _points_column_x(items, image_width, image_height)
     if points_x is None:
         dkp_debug("OCR SCREEN-ONLY POINTS HEADER INTROUVABLE")
@@ -1263,7 +1555,8 @@ async def extract_dkparse_screen_only(
             raw = await download_attachment_bytes(att)
             image = Image.open(io.BytesIO(raw)).convert("RGB")
             width, height = image.size
-            result, _elapsed = engine(np.array(image))
+            image_array = np.array(image)
+            result, _elapsed = engine(image_array)
 
             name, candidates = choose_character_from_ocr(result, width, height)
             if name and not character:
@@ -1273,7 +1566,11 @@ async def extract_dkparse_screen_only(
             all_candidates.extend(candidates[:10])
 
             img_spec, img_rows = parse_all_dkparse_rows_from_ocr(
-                result, width, height, att.filename
+                result,
+                width,
+                height,
+                att.filename,
+                image_array=image_array,
             )
             if img_spec and not spec:
                 spec = img_spec
@@ -1349,9 +1646,11 @@ def extract_uwu_urls(text: str) -> List[str]:
 
 
 def normalize_spec(raw: str) -> str:
+    """Recognize a tracked spec without substring false positives (ex: SP in spell)."""
     s = re.sub(r"\s+", " ", (raw or "").strip().lower())
     for alias, label in sorted(DKPARSE_SPECS.items(), key=lambda kv: -len(kv[0])):
-        if alias in s:
+        pattern = r"(?<![a-z0-9])" + re.escape(alias.lower()) + r"(?![a-z0-9])"
+        if re.search(pattern, s):
             return label
     return ""
 
@@ -2151,11 +2450,10 @@ async def evaluate_dkparse_screen_message(
     log_dates: Optional[set] = None,
 ) -> DKParseScreenResult:
     """
-    DKPARSE V2: screenshot only.
+    DKPARSE SCREEN-ONLY.
 
-    IMPORTANT: message.content is never used to select a boss/date/spec.
-    If a post contains both text and a screenshot, the post is fully processed
-    but its text is ignored.
+    The message text is ignored. Every visible boss row is evaluated from its
+    own Points + Best Log date. #logs-raid is only used as a date whitelist.
     """
     issues: List[str] = []
 
@@ -2192,49 +2490,66 @@ async def evaluate_dkparse_screen_message(
             ocr_detail=ocr_detail,
         )
 
-    # The screenshot itself decides which raid the DKPARSE refers to:
-    # only the newest visible Best Log date is retained.
-    raid_date = max(r.best_date for r in dated_rows if r.best_date is not None)
-    assert raid_date is not None
+    in_window_rows = [
+        r for r in dated_rows
+        if r.best_date is not None
+        and _screen_date_within_post_window(r.best_date, message.created_at)
+    ]
 
-    if not _screen_date_within_post_window(raid_date, message.created_at):
-        delta = (message.created_at.astimezone(timezone.utc).date() - raid_date.date()).days
+    if not in_window_rows:
+        newest = max(r.best_date for r in dated_rows if r.best_date is not None)
+        delta = (
+            message.created_at.astimezone(timezone.utc).date() - newest.date()
+        ).days
         issues.append(
-            f"La date la plus récente du screen ({raid_date.strftime('%d/%m/%Y')}) "
-            f"est hors de la fenêtre DKPARSE ({delta} jour(s), max {DKPARSE_MAX_DAYS})."
+            "Aucune date Best Log du screen n'est dans la fenêtre DKPARSE "
+            f"(max {DKPARSE_MAX_DAYS} jours). Date la plus récente : "
+            f"{newest.strftime('%d/%m/%Y')} ({delta} jour(s))."
+        )
+        # Important: no raid is retained and #logs-raid is not scanned.
+        return DKParseScreenResult(
+            message_id=message.id,
+            character=character,
+            spec=spec,
+            raid_date=None,
+            rows=rows,
+            valid_hits=[],
+            issues=issues,
+            total=0,
+            ocr_detail=ocr_detail,
         )
 
     if log_dates is None:
         reports = await scan_whitelisted_reports(guild, message.created_at)
         log_dates = _lograid_date_set(reports)
 
-    raid_exists = raid_date.date() in log_dates
-    if not raid_exists:
+    dates_needed = sorted({r.best_date.date() for r in in_window_rows if r.best_date})
+    missing_dates = [d for d in dates_needed if d not in log_dates]
+    for d in missing_dates:
         issues.append(
-            f"Aucun raid n'est enregistré dans #logs-raid le {raid_date.strftime('%d/%m/%Y')}."
+            f"Aucun raid n'est enregistré dans #logs-raid le {d.strftime('%d/%m/%Y')}."
         )
 
     valid_hits: List[ParseHit] = []
-    if raid_exists and _screen_date_within_post_window(raid_date, message.created_at):
-        for row in rows:
-            if row.best_date is None or row.best_date.date() != raid_date.date():
-                continue
-            amount = dkp_for_parse(row.parse)
-            if amount <= 0:
-                continue
-            valid_hits.append(
-                ParseHit(
-                    character=character,
-                    boss=row.boss,
-                    parse=row.parse,
-                    spec=row.spec or spec,
-                    report_url="",
-                    report_date=row.best_date,
-                    evidence="Screenshot OCR + date présente dans #logs-raid",
-                )
+    for row in in_window_rows:
+        if row.best_date is None or row.best_date.date() not in log_dates:
+            continue
+        amount = dkp_for_parse(row.parse)
+        if amount <= 0:
+            continue
+        valid_hits.append(
+            ParseHit(
+                character=character,
+                boss=row.boss,
+                parse=row.parse,
+                spec=row.spec or spec,
+                report_url="",
+                report_date=row.best_date,
+                evidence="Screenshot OCR + date présente dans #logs-raid",
             )
+        )
 
-    # Deduplicate same boss/date inside one post; highest parse wins if OCR duplicated it.
+    # Deduplicate same boss/date inside one post; highest parse wins.
     best_by_key: Dict[Tuple[str, datetime], ParseHit] = {}
     for hit in valid_hits:
         if hit.report_date is None:
@@ -2243,8 +2558,19 @@ async def evaluate_dkparse_screen_message(
         old = best_by_key.get(key)
         if old is None or hit.parse > old.parse:
             best_by_key[key] = hit
-    valid_hits = sorted(best_by_key.values(), key=lambda h: h.boss)
+    valid_hits = sorted(
+        best_by_key.values(),
+        key=lambda h: (h.report_date or datetime(1970,1,1,tzinfo=timezone.utc), h.boss),
+    )
     total = sum(dkp_for_parse(h.parse) for h in valid_hits)
+
+    if not valid_hits:
+        qualifying = [r for r in in_window_rows if dkp_for_parse(r.parse) > 0]
+        if not qualifying:
+            issues.append("Aucun boss du screen n'atteint le seuil DKPARSE minimum (70%).")
+
+    retained_dates = sorted({h.report_date for h in valid_hits if h.report_date})
+    raid_date = retained_dates[-1] if retained_dates else None
 
     dkp_debug(
         "DKPARSE SCREEN-ONLY RESULTAT",
@@ -2253,10 +2579,10 @@ async def evaluate_dkparse_screen_message(
             "message_text_ignored": bool(message.content),
             "character": character,
             "spec": spec,
-            "raid_date": raid_date.date().isoformat(),
-            "raid_exists_in_lograid": raid_exists,
+            "retained_dates": [d.date().isoformat() for d in retained_dates],
             "valid_hits": [
-                {"boss": h.boss, "parse": h.parse, "dkp": dkp_for_parse(h.parse)}
+                {"boss": h.boss, "parse": h.parse, "dkp": dkp_for_parse(h.parse),
+                 "date": h.report_date.date().isoformat() if h.report_date else None}
                 for h in valid_hits
             ],
             "issues": issues,
@@ -2291,11 +2617,17 @@ async def analyze_dkparse_message(
     lines = [
         f"**DKPARSE — {result.character}**",
         f"Personnage lu sur le screen : **{result.character}**",
-        "Texte du post : **ignoré** (le screenshot est la seule source DKPARSE)",
     ]
 
-    if result.raid_date:
-        lines.append(f"Raid retenu d'après le screen : **{result.raid_date.strftime('%d/%m/%Y')}**")
+    retained_dates = sorted({
+        h.report_date.date() for h in result.valid_hits if h.report_date is not None
+    })
+    if retained_dates:
+        label = "Raid retenu d'après le screen" if len(retained_dates) == 1 else "Raids retenus d'après le screen"
+        lines.append(
+            f"{label} : **" + ", ".join(d.strftime('%d/%m/%Y') for d in retained_dates) + "**"
+        )
+
     if result.spec:
         lines.append(f"Spec lue sur le screen : **{result.spec}**")
     else:
@@ -2313,16 +2645,32 @@ async def analyze_dkparse_message(
             )
         lines += ["", f"**BONUS DKPARSE TOTAL : +{result.total} DKP**"]
 
+    # If character + dated rows were read, a zero bonus is a deterministic
+    # rejection under the screen-only rules, not an uncertainty.
+    deterministic_reject = (
+        not result.valid_hits
+        and bool(result.rows)
+        and any(r.best_date is not None for r in result.rows)
+    )
+
     if result.issues:
-        lines += ["", "**⚠️ Vérifications / remarques :**"]
+        icon = "❌" if deterministic_reject else "⚠️"
+        lines += ["", f"**{icon} Vérifications / remarques :**"]
         lines.extend(f"• {issue}" for issue in result.issues)
 
     if not result.valid_hits:
-        lines += [
-            "",
-            "⚠️ **DKPARSE À VÉRIFIER**",
-            "Aucun bonus n'a pu être validé uniquement avec le screenshot et la date de #logs-raid.",
-        ]
+        if deterministic_reject:
+            lines += [
+                "",
+                "❌ **DKPARSE REFUSÉ**",
+                "Aucun bonus DKPARSE n'est valide d'après le screenshot et les dates de #logs-raid.",
+            ]
+        else:
+            lines += [
+                "",
+                "⚠️ **DKPARSE À VÉRIFIER**",
+                "Le screenshot n'a pas pu être lu avec assez de certitude pour décider.",
+            ]
         return "\n".join(lines), None
 
     export = build_kromaddon_dkparse_export(
@@ -2614,7 +2962,7 @@ async def dkparse_cloture(interaction: discord.Interaction):
 
 
 # =============================================================================
-# UwU PewPew equivalent
+# ApogeeBot equivalent
 # =============================================================================
 
 PEWPEW_TIERS: Tuple[Tuple[float, str], ...] = (
@@ -2627,7 +2975,7 @@ PEWPEW_TIERS: Tuple[Tuple[float, str], ...] = (
     (25.0, "⚪ Top 25% ⚪"),
     (33.0, "⚫ Top 33% ⚫"),
 )
-PEWPEW_STATE_FILE = APP_DIR / "uwu_pewpew_seen_v2.json"
+PEWPEW_STATE_FILE = APP_DIR / "apogeebot_seen_v3.json"
 PEWPEW_LOCK = asyncio.Lock()
 
 
@@ -2651,7 +2999,7 @@ def _save_pewpew_seen() -> None:
             encoding="utf-8",
         )
     except Exception as exc:
-        dkp_debug("PEWPEW STATE SAVE ECHEC", repr(exc))
+        dkp_debug("APOGEEBOT STATE SAVE ECHEC", repr(exc))
 
 
 def _generic_boss_from_uwu_url(url: str) -> str:
@@ -2938,25 +3286,266 @@ def _choose_pewpew_fight_url(urls: List[str]) -> Optional[str]:
     return sorted(unique, key=_fight_url_priority)[0]
 
 
+def _apogee_report_id(url: str) -> str:
+    try:
+        path = urlsplit(canonical_uwu_url(url)).path.rstrip("/")
+        return path.rsplit("/", 1)[-1]
+    except Exception:
+        return ""
+
+
+def _extract_report_id_from_text(text: str) -> str:
+    m = re.search(
+        r"(\\d{2}-\\d{2}-\\d{2}--\\d{2}-\\d{2}--[^/\\s\\\"'<>]+--[^/\\s\\\"'<>]+)",
+        str(text or ""),
+        re.IGNORECASE,
+    )
+    return m.group(1) if m else ""
+
+
+APOGEE_SPEC_TREE_HINTS = {
+    "blood": 1, "frost": 2, "unholy": 3,
+    "balance": 1, "feral": 2, "restoration": 3,
+    "beast mastery": 1, "marksmanship": 2, "survival": 3,
+    "arcane": 1, "fire": 2,
+    "holy": 1, "protection": 2, "retribution": 3,
+    "discipline": 1, "shadow": 3,
+    "assassination": 1, "combat": 2, "subtlety": 3,
+    "elemental": 1, "enhancement": 2,
+    "affliction": 1, "demonology": 2, "destruction": 3,
+    "arms": 1, "fury": 2,
+}
+
+
+def _infer_tree_index_from_row(row_html: str) -> int:
+    text = (html_to_text(row_html) + " " + row_html).lower()
+    # Longest/specific hints first to avoid generic collisions.
+    for hint in sorted(APOGEE_SPEC_TREE_HINTS, key=len, reverse=True):
+        if re.search(r"(?<![a-z])" + re.escape(hint) + r"(?![a-z])", text):
+            return APOGEE_SPEC_TREE_HINTS[hint]
+    # Query-style hints occasionally appear in player/spec links.
+    for pattern in (r"[?&]spec=(\\d)", r"data-spec=[\\\"']?(\\d)"):
+        m = re.search(pattern, row_html, re.IGNORECASE)
+        if m and m.group(1) in {"1", "2", "3"}:
+            return int(m.group(1))
+    return 0
+
+
+def extract_apogeebot_participants(raw_html: str) -> Dict[str, int]:
+    """Extract player names and, when visible, their talent-tree index."""
+    out: Dict[str, int] = {}
+    for row in re.findall(r"(?is)<tr\\b[^>]*>.*?</tr>", raw_html):
+        cells = _html_cells(row)
+        if not cells:
+            continue
+        name = _extract_player_name_from_html_row(row, cells)
+        if not name:
+            continue
+        low = name.lower()
+        tree = _infer_tree_index_from_row(row)
+        if low not in out or (out[low] == 0 and tree):
+            out[low] = tree
+
+    # Fallback to embedded JSON/JS participant objects.
+    for obj in json_candidates_from_html(raw_html):
+        for d in walk_dicts(obj):
+            name = str(get_first(d, ("playerName", "characterName", "player", "character", "name"), "")).strip()
+            if not WOW_NAME_RE.fullmatch(name):
+                continue
+            if normalize_boss(name) or name.lower() in OCR_IGNORE_WORDS:
+                continue
+            blob = " ".join(str(v) for v in d.values() if isinstance(v, str))
+            tree = _infer_tree_index_from_row(blob)
+            low = name.lower()
+            if low not in out or (out[low] == 0 and tree):
+                out[low] = tree
+    return out
+
+
+async def _post_uwu_character_json(player: str, spec_idx: int) -> Any:
+    """POST /character with transient-error retry."""
+    url = "https://uwu-logs.xyz/character"
+    timeout = aiohttp.ClientTimeout(total=30)
+    headers = {
+        "User-Agent": "ApogeeBot/3.0 (+Discord guild tooling)",
+        "Accept": "application/json,text/plain,*/*",
+    }
+    data = {"name": player, "server": UWU_SERVER, "spec": str(spec_idx)}
+    transient = {429, 500, 502, 503, 504}
+    last_status = None
+    last_error = None
+
+    for attempt in range(5):
+        try:
+            async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
+                async with session.post(url, data=data, allow_redirects=True) as resp:
+                    text = await resp.text(errors="replace")
+                    last_status = resp.status
+                    if resp.status == 200:
+                        try:
+                            return json.loads(text)
+                        except Exception:
+                            # Some deployments may wrap JSON in whitespace/text.
+                            return json.loads(text.strip())
+                    if resp.status in transient:
+                        retry_raw = resp.headers.get("Retry-After", "")
+                        try:
+                            delay = float(retry_raw)
+                        except Exception:
+                            delay = 0.8 * (2 ** attempt)
+                        if attempt < 4:
+                            await asyncio.sleep(max(0.6, min(delay, 8.0)))
+                            continue
+                        break
+                    raise RuntimeError(f"UwU HTTP {resp.status}")
+        except (aiohttp.ClientError, asyncio.TimeoutError, json.JSONDecodeError) as exc:
+            last_error = exc
+            if attempt < 4:
+                await asyncio.sleep(min(0.8 * (2 ** attempt), 8.0))
+                continue
+            break
+
+    if last_status is not None:
+        raise RuntimeError(f"UwU /character HTTP {last_status} après retries")
+    if last_error is not None:
+        raise RuntimeError(f"UwU /character: {type(last_error).__name__}: {last_error}")
+    raise RuntimeError("UwU /character impossible")
+
+
+def _apogeebot_hits_from_character_payload(
+    payload: Any,
+    player: str,
+    current_report_id: str,
+) -> List[PewPewHit]:
+    """
+    Read character Points and keep only personal-best rows whose report ID is
+    the report currently posted in #logs-raid. Old Apogee/UwU messages used
+    100 - Points as the displayed Top X% value.
+    """
+    found: Dict[Tuple[str, str], PewPewHit] = {}
+    current_low = current_report_id.lower()
+
+    def add_candidate(boss: str, points: Optional[float], report_id: str) -> None:
+        if not boss or points is None or not (0.0 <= points <= 100.0):
+            return
+        if not report_id or report_id.lower() != current_low:
+            return
+        top = max(0.0, min(100.0, 100.0 - points))
+        if top > 33.0001:
+            return
+        key = (player.lower(), boss)
+        hit = PewPewHit(
+            player=player,
+            boss=boss,
+            top_percent=top,
+            points=points,
+            server_best=(points >= 99.995),
+        )
+        old = found.get(key)
+        if old is None or hit.top_percent < old.top_percent:
+            found[key] = hit
+
+    # Dict-shaped API rows.
+    for d in walk_dicts(payload):
+        values = list(d.values())
+        blob = " ".join(str(v) for v in values if isinstance(v, (str, int, float)))
+        boss = ""
+        for key in ("boss", "bossName", "fight", "fightName", "encounter", "encounterName", "name"):
+            if key in d:
+                boss = normalize_boss(str(d[key]))
+                if boss:
+                    break
+        if not boss:
+            boss = normalize_boss(blob)
+
+        report_id = ""
+        for key in ("reportId", "report_id", "report", "reportName", "report_name", "log", "logId", "url"):
+            if key in d:
+                report_id = _extract_report_id_from_text(str(d[key])) or str(d[key]).strip().strip("/").split("/")[-1]
+                if report_id:
+                    break
+        if not report_id:
+            report_id = _extract_report_id_from_text(blob)
+
+        points = None
+        for key in ("points", "performancePoints", "performance_points", "playerPoints", "player_points", "score", "performance"):
+            if key in d:
+                n = _numeric(d[key])
+                if n is not None and 0 <= n <= 100:
+                    points = n
+                    break
+        add_candidate(boss, points, report_id)
+
+    # List-shaped rows: [Boss, Points, ..., ReportId, ...].
+    def walk_lists(obj: Any) -> Iterable[List[Any]]:
+        if isinstance(obj, list):
+            yield obj
+            for v in obj:
+                yield from walk_lists(v)
+        elif isinstance(obj, dict):
+            for v in obj.values():
+                yield from walk_lists(v)
+
+    for arr in walk_lists(payload):
+        if not (3 <= len(arr) <= 20):
+            continue
+        boss = ""
+        report_id = ""
+        numeric: List[float] = []
+        for v in arr:
+            if isinstance(v, str):
+                if not boss:
+                    boss = normalize_boss(v)
+                if not report_id:
+                    report_id = _extract_report_id_from_text(v)
+            elif isinstance(v, (int, float)):
+                n = float(v)
+                if 0 <= n <= 100:
+                    numeric.append(n)
+        # Points is normally the high 0..100 value; ranks >100 are excluded.
+        points = max(numeric) if numeric else None
+        add_candidate(boss, points, report_id)
+
+    return list(found.values())
+
+
+async def _apogeebot_character_hits(
+    player: str,
+    preferred_tree: int,
+    current_report_id: str,
+) -> Tuple[List[PewPewHit], int]:
+    order = []
+    if preferred_tree in (1, 2, 3):
+        order.append(preferred_tree)
+    order.extend(i for i in (1, 2, 3) if i not in order)
+
+    queries = 0
+    all_hits: List[PewPewHit] = []
+    for spec_idx in order:
+        payload = await _post_uwu_character_json(player, spec_idx)
+        queries += 1
+        hits = _apogeebot_hits_from_character_payload(payload, player, current_report_id)
+        if hits:
+            all_hits.extend(hits)
+            # A report's personal-best rows belong to the active spec; no need
+            # to hammer the two remaining specs once current-report hits exist.
+            break
+        await asyncio.sleep(0.08)
+    return all_hits, queries
+
+
 async def build_pewpew_report(
     report_url: str,
 ) -> Tuple[str, Dict[str, int]]:
-    """
-    Build the historical UwU PewPew-style report.
-
-    The stats dict is intentionally returned so the Discord handler can
-    distinguish:
-      - no fight links / UwU page format changed
-      - every fight request failed
-      - fights were read but nobody reached Top 33
-      - a valid report was produced
-    """
+    """Build ApogeeBot rankings for a newly posted UwU report."""
     report_url = canonical_uwu_url(report_url)
+    current_report_id = _apogee_report_id(report_url)
     final_url, raw_html = await _fetch_uwu_with_retry(
         report_url,
-        "ApogeeUwUPewPew/2.0 (+Discord guild tooling)",
+        "ApogeeBot/3.0 (+Discord guild tooling)",
     )
     report_url = canonical_uwu_url(final_url)
+    current_report_id = _apogee_report_id(report_url) or current_report_id
     fight_urls = extract_uwu_fight_urls(raw_html, report_url)
 
     by_boss: Dict[str, List[str]] = defaultdict(list)
@@ -2970,52 +3559,70 @@ async def build_pewpew_report(
         "bosses": len(by_boss),
         "pages_ok": 0,
         "pages_failed": 0,
+        "participants": 0,
+        "character_queries": 0,
         "hits": 0,
     }
-
     if not by_boss:
         return "", stats
 
-    hits: List[PewPewHit] = []
+    participants: Dict[str, Tuple[str, int]] = {}
+    fight_fallback_hits: List[PewPewHit] = []
 
     for boss, urls in by_boss.items():
         fight_url = _choose_pewpew_fight_url(urls)
         if not fight_url:
             continue
-
         try:
             page_url, fight_html = await _fetch_uwu_with_retry(
                 fight_url,
-                "ApogeeUwUPewPew/2.0 (+Discord guild tooling)",
+                "ApogeeBot/3.0 (+Discord guild tooling)",
             )
             stats["pages_ok"] += 1
 
-            page_hits = parse_pewpew_hits_from_fight_page(fight_html, page_url)
-            hits.extend(page_hits)
-            stats["hits"] += len(page_hits)
+            for low, tree in extract_apogeebot_participants(fight_html).items():
+                # Recover display casing from a row when possible.
+                display = low
+                for row in re.findall(r"(?is)<tr\\b[^>]*>.*?</tr>", fight_html):
+                    cells = _html_cells(row)
+                    name = _extract_player_name_from_html_row(row, cells) if cells else ""
+                    if name and name.lower() == low:
+                        display = name
+                        break
+                old = participants.get(low)
+                if old is None or (old[1] == 0 and tree):
+                    participants[low] = (display, tree)
 
-            print(
-                f"[PEWPEW] {boss}: page OK, "
-                f"{len(page_hits)} joueur(s) Top 33 détecté(s)"
-            )
+            # Keep legacy fight parser only as a fallback if /character is
+            # unavailable. It is no longer the primary ranking source.
+            fight_fallback_hits.extend(parse_pewpew_hits_from_fight_page(fight_html, page_url))
         except Exception as exc:
             stats["pages_failed"] += 1
-            print(
-                f"[PEWPEW] ECHEC {boss}: "
-                f"{type(exc).__name__}: {exc}"
-            )
+            print(f"[APOGEEBOT] ECHEC {boss}: {type(exc).__name__}: {exc}")
             dkp_debug(
-                "PEWPEW FIGHT ECHEC",
-                {
-                    "boss": boss,
-                    "url": fight_url,
-                    "error": f"{type(exc).__name__}: {exc}",
-                },
+                "APOGEEBOT FIGHT ECHEC",
+                {"boss": boss, "url": fight_url, "error": f"{type(exc).__name__}: {exc}"},
             )
+        await asyncio.sleep(0.15)
 
-        # Keep request rate gentle.
-        await asyncio.sleep(0.20)
+    stats["participants"] = len(participants)
 
+    hits: List[PewPewHit] = []
+    for _low, (player, tree) in list(participants.items())[:40]:
+        try:
+            phits, qcount = await _apogeebot_character_hits(player, tree, current_report_id)
+            stats["character_queries"] += qcount
+            hits.extend(phits)
+            if phits:
+                print(f"[APOGEEBOT] {player}: {len(phits)} résultat(s) Top 33 du rapport")
+        except Exception as exc:
+            print(f"[APOGEEBOT] /character {player}: {type(exc).__name__}: {exc}")
+        await asyncio.sleep(0.12)
+
+    if not hits and fight_fallback_hits:
+        hits = fight_fallback_hits
+
+    stats["hits"] = len(hits)
     return format_pewpew_report(hits), stats
 
 
@@ -3064,12 +3671,12 @@ async def handle_uwu_pewpew_message(
     urls = _message_uwu_urls(message)
     if not urls:
         print(
-            f"[PEWPEW] Message {message.id} reçu dans #logs-raid "
+            f"[APOGEEBOT] Message {message.id} reçu dans #logs-raid "
             "mais aucun lien UwU détecté."
         )
         return
 
-    print(f"[PEWPEW] Message {message.id}: {len(urls)} rapport(s) UwU détecté(s)")
+    print(f"[APOGEEBOT] Message {message.id}: {len(urls)} rapport(s) UwU détecté(s)")
     await _pewpew_set_reaction(message, "🔎")
 
     final_status = "✅"
@@ -3079,19 +3686,19 @@ async def handle_uwu_pewpew_message(
             canonical = canonical_uwu_url(url)
 
             if canonical in PEWPEW_SEEN_REPORTS and not force:
-                print(f"[PEWPEW] Déjà traité: {canonical}")
+                print(f"[APOGEEBOT] Déjà traité: {canonical}")
                 continue
 
-            print(f"[PEWPEW] Analyse: {canonical}")
+            print(f"[APOGEEBOT] Analyse: {canonical}")
 
             try:
                 report, stats = await build_pewpew_report(canonical)
-                print(f"[PEWPEW] Résultat {canonical}: {stats}")
+                print(f"[APOGEEBOT] Résultat {canonical}: {stats}")
 
                 if stats["fight_links"] <= 0 or stats["bosses"] <= 0:
                     final_status = "⚠️"
                     await message.reply(
-                        "⚠️ **UwU PewPew : rapport détecté, mais aucun combat "
+                        "⚠️ **ApogeeBot : rapport détecté, mais aucun combat "
                         "n'a pu être extrait de la page UwU.**\n"
                         "Le rapport n'est pas marqué comme traité : tu peux le "
                         "reposter après correction du bot/site.",
@@ -3103,7 +3710,7 @@ async def handle_uwu_pewpew_message(
                 if stats["pages_ok"] <= 0:
                     final_status = "⚠️"
                     await message.reply(
-                        "⚠️ **UwU PewPew : rapport détecté, mais aucune page de "
+                        "⚠️ **ApogeeBot : rapport détecté, mais aucune page de "
                         "combat UwU n'a pu être lue.**\n"
                         f"Pages en échec : {stats['pages_failed']}. "
                         "Le rapport n'est pas marqué comme traité.",
@@ -3131,8 +3738,8 @@ async def handle_uwu_pewpew_message(
                     # Important diagnostic: this is a successful read with no
                     # qualifying result, not a silent parser/network failure.
                     await message.reply(
-                        "ℹ️ **UwU PewPew : rapport analysé.** "
-                        "Aucun joueur Top 33% détecté sur les combats lisibles.",
+                        "ℹ️ **ApogeeBot : rapport analysé.** "
+                        "Aucun nouveau meilleur résultat Top 33% détecté pour ce rapport.",
                         mention_author=False,
                         allowed_mentions=discord.AllowedMentions.none(),
                     )
@@ -3143,11 +3750,11 @@ async def handle_uwu_pewpew_message(
             except Exception as exc:
                 final_status = "⚠️"
                 print(
-                    f"[PEWPEW] ERREUR RAPPORT {canonical}: "
+                    f"[APOGEEBOT] ERREUR RAPPORT {canonical}: "
                     f"{type(exc).__name__}: {exc}"
                 )
                 dkp_debug(
-                    "PEWPEW REPORT ECHEC",
+                    "APOGEEBOT REPORT ECHEC",
                     {
                         "url": canonical,
                         "error": f"{type(exc).__name__}: {exc}",
@@ -3155,7 +3762,7 @@ async def handle_uwu_pewpew_message(
                 )
                 try:
                     await message.reply(
-                        "⚠️ **UwU PewPew : erreur pendant l'analyse du rapport.**\n"
+                        "⚠️ **ApogeeBot : erreur pendant l'analyse du rapport.**\n"
                         f"`{type(exc).__name__}: {str(exc)[:500]}`\n"
                         "Le rapport n'est pas marqué comme traité.",
                         mention_author=False,
@@ -3208,8 +3815,8 @@ async def main_audit(interaction: discord.Interaction):
 
 
 @bot.tree.command(
-    name="pewpew-test",
-    description="Force l'analyse UwU PewPew d'un message #logs-raid.",
+    name="apogee-log-test",
+    description="Force l'analyse ApogeeBot d'un message #logs-raid.",
 )
 @app_commands.describe(message_id="ID du message Discord contenant le lien UwU")
 async def pewpew_test(interaction: discord.Interaction, message_id: str):
@@ -3250,7 +3857,7 @@ async def pewpew_test(interaction: discord.Interaction, message_id: str):
 
     except Exception as exc:
         await interaction.followup.send(
-            f"❌ PewPew test : {type(exc).__name__}: {exc}",
+            f"❌ ApogeeBot test : {type(exc).__name__}: {exc}",
             ephemeral=True,
         )
 
@@ -3395,7 +4002,7 @@ async def on_message(message: discord.Message):
         and message.channel.id == LOGS_RAID_CHANNEL_ID
     ):
         print(
-            f"[PEWPEW] Nouveau message #logs-raid: "
+            f"[APOGEEBOT] Nouveau message #logs-raid: "
             f"id={message.id} auteur={message.author}"
         )
         asyncio.create_task(handle_uwu_pewpew_message(message))
@@ -3418,14 +4025,14 @@ async def on_message_edit(before: discord.Message, after: discord.Message):
 
 @bot.event
 async def on_ready():
-    print("Apogee Raid-Helper Bot V5 + DKPARSE SCREEN-ONLY + UwU PewPew")
+    print("Apogee Raid-Helper Bot V5 + DKPARSE SCREEN-ONLY + ApogeeBot")
     print(f"Connecté en tant que {bot.user} ({bot.user.id})")
     print(f"#Main channel ID: {MAIN_CHANNEL_ID}")
     print(f"#logs-raid channel ID: {LOGS_RAID_CHANNEL_ID or 'NON CONFIGURE'}")
     print(f"#dkparse channel ID: {DKPARSE_CHANNEL_ID or 'NON CONFIGURE'}")
     print(f"DKPARSE window: {DKPARSE_MAX_DAYS} jours")
     print("DKPARSE OCR: " + ("RapidOCR OK" if (RapidOCR is not None and Image is not None and np is not None) else "INDISPONIBLE"))
-    print(f"UwU PewPew: {'ACTIVE' if UWU_PEWPEW_ENABLED else 'DESACTIVE'}")
+    print(f"ApogeeBot: {'ACTIVE' if UWU_PEWPEW_ENABLED else 'DESACTIVE'}")
 
 
 @bot.event
