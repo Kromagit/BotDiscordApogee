@@ -2975,8 +2975,9 @@ PEWPEW_TIERS: Tuple[Tuple[float, str], ...] = (
     (25.0, "⚪ Top 25% ⚪"),
     (33.0, "⚫ Top 33% ⚫"),
 )
-PEWPEW_STATE_FILE = APP_DIR / "apogeebot_seen_v5.json"
+PEWPEW_STATE_FILE = APP_DIR / "apogeebot_seen_v6.json"
 PEWPEW_LOCK = asyncio.Lock()
+PEWPEW_IN_FLIGHT: set = set()
 
 
 def _load_pewpew_seen() -> set:
@@ -3025,6 +3026,46 @@ def _generic_boss_from_uwu_url(url: str) -> str:
 def _html_cells(row_html: str) -> List[str]:
     cells = re.findall(r"(?is)<t[dh]\b[^>]*>(.*?)</t[dh]>", row_html)
     return [html_to_text(c) for c in cells]
+
+
+
+def _html_raw_cells(row_html: str) -> List[str]:
+    return re.findall(r"(?is)<t[dh]\b[^>]*>.*?</t[dh]>", row_html)
+
+
+def _extract_explicit_points_from_html(fragment: str) -> Optional[float]:
+    text = html_lib.unescape(fragment or "")
+    patterns = [
+        r'(?ix)(?:data[-_:])?(?:performance[-_ ]?points?|player[-_ ]?points?|points?)\s*=\s*["\']?\s*(\d{1,3}(?:[.,]\d+)?)',
+        r'(?ix)["\']?(?:performancePoints|performance_points|playerPoints|player_points|points)["\']?\s*:\s*["\']?\s*(\d{1,3}(?:[.,]\d+)?)',
+        r'(?ix)(?:performance\s*)?points?\s*[:=]\s*(\d{1,3}(?:[.,]\d+)?)',
+    ]
+    for pattern in patterns:
+        for m in re.finditer(pattern, text):
+            try:
+                value=float(m.group(1).replace(',', '.'))
+            except ValueError:
+                continue
+            if 0.0 <= value <= 100.0:
+                return value
+    return None
+
+
+def _extract_name_from_raw_name_cell(cell_html: str, cell_text: str) -> str:
+    patterns = [
+        r'(?i)[?&](?:name|player)=([A-Za-z]{2,12})(?=[&"\'<> ]|$)',
+        r'(?i)data-(?:player|name)=["\']([A-Za-z]{2,12})["\']',
+        r'(?i)/character/([A-Za-z]{2,12})(?=[/?#"\'<> ]|$)',
+    ]
+    for pattern in patterns:
+        m=re.search(pattern, cell_html or '')
+        if m and WOW_NAME_RE.fullmatch(m.group(1)):
+            return m.group(1)
+    for token in re.findall(r'\b[A-Za-z]{2,12}\b', cell_text or ''):
+        low=token.lower()
+        if WOW_NAME_RE.fullmatch(token) and low not in OCR_IGNORE_WORDS and low not in {'image','rank','dps','damage','total','heal','points','player','name'} and not normalize_boss(token):
+            return token
+    return ''
 
 
 def _extract_player_name_from_html_row(row_html: str, cells: List[str]) -> str:
@@ -3118,218 +3159,67 @@ def parse_pewpew_hits_from_fight_page(
     raw_html: str,
     fight_url: str,
 ) -> List[PewPewHit]:
-    """
-    Extract the current raid's rankings directly from one UwU fight page.
-
-    UwU fight pages expose:
-      Name | Rank | Dps% | Useful Damage | ...
-
-    `Dps%` is the performance metric relative to top-1 DPS.
-    Historical PewPew displayed:
-        top_percent = 100 - Dps%
-
-    Example:
-        Dps% = 98.3  -> Top 1.7%
-        Dps% = 86.1  -> Top 13.9%
-
-    Explicit `points` fields remain supported as fallbacks.
-    """
-    boss = _generic_boss_from_uwu_url(fight_url)
-    if not boss or boss == "All":
+    """Use explicit Performance Points only. Top%% = 100 - Points."""
+    boss=_generic_boss_from_uwu_url(fight_url)
+    if not boss or boss == 'All':
         return []
-
-    found: Dict[Tuple[str, str], PewPewHit] = {}
-
-    def add(hit: Optional[PewPewHit]) -> None:
-        if hit is None:
-            return
-        key = (hit.player.lower(), hit.boss)
-        old = found.get(key)
-        if old is None or hit.top_percent < old.top_percent:
-            found[key] = hit
-
-    rows_html = re.findall(r"(?is)<tr\b[^>]*>.*?</tr>", raw_html)
-
-    header_cells: List[str] = []
-    name_idx: Optional[int] = None
-    dps_pct_idx: Optional[int] = None
-    points_idx: Optional[int] = None
-    top_idx: Optional[int] = None
-
-    for row in rows_html:
-        cells = _html_cells(row)
-        if not cells:
-            continue
-
-        lowers = [re.sub(r"\s+", " ", c.strip().lower()) for c in cells]
-        has_name = any(
-            c == "name" or "player" in c or "character" in c
-            for c in lowers
-        )
-        has_dps_pct = any(
-            c in {"dps%", "dps %"} or ("dps" in c and "%" in c)
-            for c in lowers
-        )
-
-        if has_name and has_dps_pct:
-            header_cells = cells
-
-            for i, c in enumerate(lowers):
-                if c == "name" or "player" in c or "character" in c:
-                    name_idx = i
-                    break
-
-            for i, c in enumerate(lowers):
-                if c in {"dps%", "dps %"} or ("dps" in c and "%" in c):
-                    dps_pct_idx = i
-                    break
-
-            for i, c in enumerate(lowers):
-                if "point" in c:
-                    points_idx = i
-                    break
-
-            for i, c in enumerate(lowers):
-                if (
-                    "percentile" in c
-                    or "top %" in c
-                    or "top%" in c
-                    or "rank %" in c
-                ):
-                    top_idx = i
-                    break
+    rows_html=re.findall(r'(?is)<tr\b[^>]*>.*?</tr>',raw_html)
+    found: Dict[Tuple[str,str],PewPewHit]={}
+    header_idx=None; name_idx=None
+    for ri,row in enumerate(rows_html):
+        cells=_html_cells(row)
+        lowers=[re.sub(r'\s+',' ',c.strip().lower()) for c in cells]
+        if not cells: continue
+        if any(c == 'name' or 'player' in c for c in lowers):
+            header_idx=ri
+            for i,c in enumerate(lowers):
+                if c == 'name' or 'player' in c or 'character' in c:
+                    name_idx=i; break
             break
-
-    for row in rows_html:
-        cells = _html_cells(row)
-        if not cells:
-            continue
-        if header_cells and cells == header_cells:
-            continue
-
-        player = ""
+    for ri,row in enumerate(rows_html):
+        if header_idx is not None and ri == header_idx: continue
+        cells=_html_cells(row); raw_cells=_html_raw_cells(row)
+        if not cells: continue
+        player=''
         if name_idx is not None and name_idx < len(cells):
-            for token in re.findall(r"\b[A-Za-z][A-Za-z0-9]{1,11}\b", cells[name_idx]):
-                if WOW_NAME_RE.fullmatch(token) and token.lower() not in OCR_IGNORE_WORDS:
-                    if not normalize_boss(token):
-                        player = token
-                        break
-
-        if not player:
-            player = _extract_player_name_from_html_row(row, cells)
-        if not player:
-            continue
-
-        row_text = html_to_text(row)
-
-        # PRIMARY SOURCE: UwU's Dps% table column.
-        points: Optional[float] = None
-        if dps_pct_idx is not None and dps_pct_idx < len(cells):
-            n = _numeric(cells[dps_pct_idx])
-            if n is not None and 0.0 <= n <= 100.0:
-                points = n
-
-        # Secondary explicit Points fields.
-        if points is None and points_idx is not None and points_idx < len(cells):
-            n = _numeric(cells[points_idx])
-            if n is not None and 0.0 <= n <= 100.0:
-                points = n
-
+            raw_name=raw_cells[name_idx] if name_idx < len(raw_cells) else ''
+            player=_extract_name_from_raw_name_cell(raw_name,cells[name_idx])
+        if not player: player=_extract_player_name_from_html_row(row,cells)
+        if not player: continue
+        points=_extract_explicit_points_from_html(row)
         if points is None:
-            points = _extract_points_like_value(row, row_text)
-
-        direct_top: Optional[float] = None
-        if points is None and top_idx is not None and top_idx < len(cells):
-            n = _numeric(cells[top_idx])
-            if n is not None and 0.0 <= n <= 33.0001:
-                direct_top = n
-
-        if points is None and direct_top is None:
-            direct_top = _extract_direct_top_percent(row, row_text)
-
-        add(_pewpew_hit_from_values(
-            player,
-            boss,
-            points=points,
-            direct_top=direct_top,
-            blob=row_text,
-        ))
-
-    # Embedded JSON/JS fallback.
-    name_keys = ("name", "player", "playerName", "character", "characterName")
-    points_keys = (
-        "points",
-        "performancePoints",
-        "performance_points",
-        "playerPoints",
-        "player_points",
-        "dpsPercent",
-        "dps_percent",
-    )
-    top_keys = ("topPercent", "top_percent", "rankPercent", "rank_percent")
-
-    for obj in json_candidates_from_html(raw_html):
-        for d in walk_dicts(obj):
-            raw_name = str(get_first(d, name_keys, "")).strip()
-            if (
-                not WOW_NAME_RE.fullmatch(raw_name)
-                or normalize_boss(raw_name)
-                or raw_name.lower() in OCR_IGNORE_WORDS
-            ):
-                continue
-
-            points = None
-            for key in points_keys:
-                if key in d:
-                    n = _numeric(d[key])
-                    if n is not None and 0.0 <= n <= 100.0:
-                        points = n
-                        break
-
-            direct_top = None
-            if points is None:
-                for key in top_keys:
-                    if key in d:
-                        n = _numeric(d[key])
-                        if n is not None and 0.0 <= n <= 33.0001:
-                            direct_top = n
-                            break
-
-            blob = " ".join(
-                str(v) for v in d.values()
-                if isinstance(v, (str, int, float))
-            )
-            add(_pewpew_hit_from_values(
-                raw_name,
-                boss,
-                points=points,
-                direct_top=direct_top,
-                blob=blob,
-            ))
-
+            for raw_cell in raw_cells:
+                points=_extract_explicit_points_from_html(raw_cell)
+                if points is not None: break
+        if points is None: continue
+        top_percent=max(0.0,min(100.0,100.0-points))
+        if top_percent > 33.0001: continue
+        hit=PewPewHit(player=player,boss=boss,top_percent=top_percent,points=points,server_best=(points>=99.995))
+        key=(player.lower(),boss); old=found.get(key)
+        if old is None or hit.top_percent < old.top_percent: found[key]=hit
     return list(found.values())
 
 
 def _pewpew_page_debug_summary(raw_html: str) -> Dict[str, Any]:
     rows=re.findall(r'(?is)<tr\b[^>]*>.*?</tr>',raw_html)
-    headers=[]
-    for row in rows[:50]:
+    headers=[]; sample_rows=[]; header_seen=False
+    for row in rows:
         cells=_html_cells(row)
-        if cells and any(word in ' '.join(cells).lower() for word in ('player','name','points','performance','rank','dps')):
-            headers.append(cells[:12])
-            if len(headers)>=5:
-                break
-    labels=sorted(set(m.group(1).lower() for m in re.finditer(r'(?i)(points|performancePoints|performance_points|playerPoints|player_points|topPercent|top_percent|rankPercent|rank_percent)',raw_html)))
-    return {
-        'rows': len(rows),
-        'candidate_headers': headers,
-        'has_dps_percent_column': any(
-            any(('dps%' in c.lower()) or ('dps %' in c.lower()) for c in h)
-            for h in headers
-        ),
-        'performance_labels': labels[:20],
-        'html_chars': len(raw_html),
-    }
+        if not cells: continue
+        low_join=' '.join(cells).lower()
+        is_header=(('name' in low_join or 'player' in low_join) and ('rank' in low_join or 'dps%%' in low_join or 'dps %%' in low_join))
+        if is_header:
+            headers.append(cells[:12]); header_seen=True; continue
+        if header_seen and len(sample_rows)<4:
+            raw_cells=_html_raw_cells(row)
+            sample_rows.append({'cells':cells[:10],'player_guess':_extract_player_name_from_html_row(row,cells),'explicit_points':_extract_explicit_points_from_html(row),'raw_first_cells':[re.sub(r'\s+',' ',x)[:700] for x in raw_cells[:4]]})
+    points_contexts=[]
+    for m in re.finditer(r'(?i)points?',raw_html):
+        a=max(0,m.start()-180); b=min(len(raw_html),m.end()+260)
+        snippet=re.sub(r'\s+',' ',html_lib.unescape(raw_html[a:b]))
+        if snippet not in points_contexts: points_contexts.append(snippet[:700])
+        if len(points_contexts)>=5: break
+    return {'rows':len(rows),'candidate_headers':headers[:5],'sample_player_rows':sample_rows,'points_contexts':points_contexts,'html_chars':len(raw_html)}
 
 
 def _pewpew_tier(value: float) -> Optional[float]:
@@ -3453,7 +3343,7 @@ def _apogee_report_id(url: str) -> str:
 
 def _extract_report_id_from_text(text: str) -> str:
     m = re.search(
-        r"(\\d{2}-\\d{2}-\\d{2}--\\d{2}-\\d{2}--[^/\\s\\\"'<>]+--[^/\\s\\\"'<>]+)",
+        r"(\d{2}-\d{2}-\d{2}--\d{2}-\d{2}--[^/\s\"'<>]+--[^/\s\"'<>]+)",
         str(text or ""),
         re.IGNORECASE,
     )
@@ -3481,7 +3371,7 @@ def _infer_tree_index_from_row(row_html: str) -> int:
         if re.search(r"(?<![a-z])" + re.escape(hint) + r"(?![a-z])", text):
             return APOGEE_SPEC_TREE_HINTS[hint]
     # Query-style hints occasionally appear in player/spec links.
-    for pattern in (r"[?&]spec=(\d)", r"data-spec=[\\\"']?(\\d)"):
+    for pattern in (r"[?&]spec=(\d)", r"data-spec=[\"']?(\d)"):
         m = re.search(pattern, row_html, re.IGNORECASE)
         if m and m.group(1) in {"1", "2", "3"}:
             return int(m.group(1))
@@ -3808,8 +3698,12 @@ async def handle_uwu_pewpew_message(
             if canonical in PEWPEW_SEEN_REPORTS and not force:
                 print(f"[APOGEEBOT] Déjà traité: {canonical}")
                 continue
+            if canonical in PEWPEW_IN_FLIGHT and not force:
+                print(f"[APOGEEBOT] Déjà en cours d'analyse: {canonical}")
+                continue
 
             print(f"[APOGEEBOT] Analyse: {canonical}")
+            PEWPEW_IN_FLIGHT.add(canonical)
 
             try:
                 report, stats = await build_pewpew_report(canonical)
@@ -3855,17 +3749,17 @@ async def handle_uwu_pewpew_message(
                                 allowed_mentions=discord.AllowedMentions.none(),
                             )
                 else:
-                    # Important diagnostic: this is a successful read with no
-                    # qualifying result, not a silent parser/network failure.
+                    final_status = "⚠️"
                     await message.reply(
                         "⚠️ **ApogeeBot : rapport lu, mais aucun classement Top 33 "
                         "n'a pu être extrait avec certitude.**\n"
-                        "Ce message indique un problème de lecture/parsing, pas que "
-                        "le raid n'a réellement aucun Top 33. Consulte la console "
-                        "`[APOGEEBOT]` pour le détail.",
+                        "Le rapport **n'est pas marqué comme traité**. "
+                        "La console `[APOGEEBOT]` affiche maintenant les premières "
+                        "lignes joueurs et le contexte exact autour de `Points`.",
                         mention_author=False,
                         allowed_mentions=discord.AllowedMentions.none(),
                     )
+                    continue
 
                 PEWPEW_SEEN_REPORTS.add(canonical)
                 _save_pewpew_seen()
@@ -3893,6 +3787,8 @@ async def handle_uwu_pewpew_message(
                     )
                 except discord.HTTPException:
                     pass
+            finally:
+                PEWPEW_IN_FLIGHT.discard(canonical)
 
     await _pewpew_remove_own_reaction(message, "🔎")
     await _pewpew_set_reaction(message, final_status)
