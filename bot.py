@@ -2627,7 +2627,7 @@ PEWPEW_TIERS: Tuple[Tuple[float, str], ...] = (
     (25.0, "⚪ Top 25% ⚪"),
     (33.0, "⚫ Top 33% ⚫"),
 )
-PEWPEW_STATE_FILE = APP_DIR / "uwu_pewpew_seen.json"
+PEWPEW_STATE_FILE = APP_DIR / "uwu_pewpew_seen_v2.json"
 PEWPEW_LOCK = asyncio.Lock()
 
 
@@ -2895,11 +2895,66 @@ def format_pewpew_report(hits: List[PewPewHit]) -> str:
     return "\n".join(lines)
 
 
-async def build_pewpew_report(report_url: str) -> str:
+def _pewpew_attempt_number(url: str) -> int:
+    try:
+        q = parse_qs(urlsplit(html_lib.unescape(url)).query)
+        raw = (q.get("attempt") or ["-1"])[0]
+        return int(raw)
+    except Exception:
+        return -1
+
+
+def _choose_pewpew_fight_url(urls: List[str]) -> Optional[str]:
+    """
+    Pick one concrete fight per boss.
+
+    UwU usually exposes:
+      - one or more concrete ?attempt=...&s=...&f=... links
+      - a ?boss=...&mode=... link
+      - a generic ?boss=... link
+
+    The highest concrete attempt is normally the final/kill attempt and avoids
+    hammering UwU with several requests per boss.
+    """
+    unique = list(dict.fromkeys(urls))
+    if not unique:
+        return None
+
+    concrete = []
+    for url in unique:
+        q = parse_qs(urlsplit(html_lib.unescape(url)).query)
+        if "attempt" in q and ("s" in q or "f" in q):
+            concrete.append(url)
+
+    if concrete:
+        concrete.sort(key=lambda u: (_pewpew_attempt_number(u), u), reverse=True)
+        return concrete[0]
+
+    with_attempt = [u for u in unique if "attempt" in parse_qs(urlsplit(html_lib.unescape(u)).query)]
+    if with_attempt:
+        with_attempt.sort(key=lambda u: (_pewpew_attempt_number(u), u), reverse=True)
+        return with_attempt[0]
+
+    return sorted(unique, key=_fight_url_priority)[0]
+
+
+async def build_pewpew_report(
+    report_url: str,
+) -> Tuple[str, Dict[str, int]]:
+    """
+    Build the historical UwU PewPew-style report.
+
+    The stats dict is intentionally returned so the Discord handler can
+    distinguish:
+      - no fight links / UwU page format changed
+      - every fight request failed
+      - fights were read but nobody reached Top 33
+      - a valid report was produced
+    """
     report_url = canonical_uwu_url(report_url)
     final_url, raw_html = await _fetch_uwu_with_retry(
         report_url,
-        "ApogeeUwUPewPew/1.0 (+Discord guild tooling)",
+        "ApogeeUwUPewPew/2.0 (+Discord guild tooling)",
     )
     report_url = canonical_uwu_url(final_url)
     fight_urls = extract_uwu_fight_urls(raw_html, report_url)
@@ -2910,26 +2965,58 @@ async def build_pewpew_report(report_url: str) -> str:
         if boss:
             by_boss[boss].append(url)
 
-    hits: List[PewPewHit] = []
-    for boss, urls in by_boss.items():
-        unique_urls = sorted(dict.fromkeys(urls), key=_fight_url_priority)
-        # A couple of concrete attempts is enough to mimic the historical bot
-        # while keeping request volume low enough for UwU.
-        for fight_url in unique_urls[:max(1, UWU_PEWPEW_MAX_FIGHTS_PER_BOSS)]:
-            try:
-                page_url, fight_html = await _fetch_uwu_with_retry(
-                    fight_url,
-                    "ApogeeUwUPewPew/1.0 (+Discord guild tooling)",
-                )
-                hits.extend(parse_pewpew_hits_from_fight_page(fight_html, page_url))
-            except Exception as exc:
-                dkp_debug(
-                    "PEWPEW FIGHT ECHEC",
-                    {"boss": boss, "url": fight_url, "error": f"{type(exc).__name__}: {exc}"},
-                )
-            await asyncio.sleep(0.12)
+    stats: Dict[str, int] = {
+        "fight_links": len(fight_urls),
+        "bosses": len(by_boss),
+        "pages_ok": 0,
+        "pages_failed": 0,
+        "hits": 0,
+    }
 
-    return format_pewpew_report(hits)
+    if not by_boss:
+        return "", stats
+
+    hits: List[PewPewHit] = []
+
+    for boss, urls in by_boss.items():
+        fight_url = _choose_pewpew_fight_url(urls)
+        if not fight_url:
+            continue
+
+        try:
+            page_url, fight_html = await _fetch_uwu_with_retry(
+                fight_url,
+                "ApogeeUwUPewPew/2.0 (+Discord guild tooling)",
+            )
+            stats["pages_ok"] += 1
+
+            page_hits = parse_pewpew_hits_from_fight_page(fight_html, page_url)
+            hits.extend(page_hits)
+            stats["hits"] += len(page_hits)
+
+            print(
+                f"[PEWPEW] {boss}: page OK, "
+                f"{len(page_hits)} joueur(s) Top 33 détecté(s)"
+            )
+        except Exception as exc:
+            stats["pages_failed"] += 1
+            print(
+                f"[PEWPEW] ECHEC {boss}: "
+                f"{type(exc).__name__}: {exc}"
+            )
+            dkp_debug(
+                "PEWPEW FIGHT ECHEC",
+                {
+                    "boss": boss,
+                    "url": fight_url,
+                    "error": f"{type(exc).__name__}: {exc}",
+                },
+            )
+
+        # Keep request rate gentle.
+        await asyncio.sleep(0.20)
+
+    return format_pewpew_report(hits), stats
 
 
 def _message_uwu_urls(message: discord.Message) -> List[str]:
@@ -2941,7 +3028,32 @@ def _message_uwu_urls(message: discord.Message) -> List[str]:
     return extract_uwu_urls("\n".join(x for x in parts if x))
 
 
-async def handle_uwu_pewpew_message(message: discord.Message) -> None:
+async def _pewpew_set_reaction(
+    message: discord.Message,
+    emoji: str,
+) -> None:
+    try:
+        await message.add_reaction(emoji)
+    except discord.HTTPException:
+        pass
+
+
+async def _pewpew_remove_own_reaction(
+    message: discord.Message,
+    emoji: str,
+) -> None:
+    try:
+        if bot.user:
+            await message.remove_reaction(emoji, bot.user)
+    except discord.HTTPException:
+        pass
+
+
+async def handle_uwu_pewpew_message(
+    message: discord.Message,
+    *,
+    force: bool = False,
+) -> None:
     if not UWU_PEWPEW_ENABLED:
         return
     if message.author.bot or not message.guild:
@@ -2951,29 +3063,109 @@ async def handle_uwu_pewpew_message(message: discord.Message) -> None:
 
     urls = _message_uwu_urls(message)
     if not urls:
+        print(
+            f"[PEWPEW] Message {message.id} reçu dans #logs-raid "
+            "mais aucun lien UwU détecté."
+        )
         return
+
+    print(f"[PEWPEW] Message {message.id}: {len(urls)} rapport(s) UwU détecté(s)")
+    await _pewpew_set_reaction(message, "🔎")
+
+    final_status = "✅"
 
     async with PEWPEW_LOCK:
         for url in urls:
             canonical = canonical_uwu_url(url)
-            if canonical in PEWPEW_SEEN_REPORTS:
+
+            if canonical in PEWPEW_SEEN_REPORTS and not force:
+                print(f"[PEWPEW] Déjà traité: {canonical}")
                 continue
+
+            print(f"[PEWPEW] Analyse: {canonical}")
+
             try:
-                report = await build_pewpew_report(canonical)
+                report, stats = await build_pewpew_report(canonical)
+                print(f"[PEWPEW] Résultat {canonical}: {stats}")
+
+                if stats["fight_links"] <= 0 or stats["bosses"] <= 0:
+                    final_status = "⚠️"
+                    await message.reply(
+                        "⚠️ **UwU PewPew : rapport détecté, mais aucun combat "
+                        "n'a pu être extrait de la page UwU.**\n"
+                        "Le rapport n'est pas marqué comme traité : tu peux le "
+                        "reposter après correction du bot/site.",
+                        mention_author=False,
+                        allowed_mentions=discord.AllowedMentions.none(),
+                    )
+                    continue
+
+                if stats["pages_ok"] <= 0:
+                    final_status = "⚠️"
+                    await message.reply(
+                        "⚠️ **UwU PewPew : rapport détecté, mais aucune page de "
+                        "combat UwU n'a pu être lue.**\n"
+                        f"Pages en échec : {stats['pages_failed']}. "
+                        "Le rapport n'est pas marqué comme traité.",
+                        mention_author=False,
+                        allowed_mentions=discord.AllowedMentions.none(),
+                    )
+                    continue
+
                 if report:
+                    first = True
                     for chunk in split_discord_text(report):
-                        await message.channel.send(
-                            chunk,
-                            allowed_mentions=discord.AllowedMentions.none(),
-                        )
-                # Mark successfully read reports even when nobody reached Top 33.
+                        if first:
+                            await message.reply(
+                                chunk,
+                                mention_author=False,
+                                allowed_mentions=discord.AllowedMentions.none(),
+                            )
+                            first = False
+                        else:
+                            await message.channel.send(
+                                chunk,
+                                allowed_mentions=discord.AllowedMentions.none(),
+                            )
+                else:
+                    # Important diagnostic: this is a successful read with no
+                    # qualifying result, not a silent parser/network failure.
+                    await message.reply(
+                        "ℹ️ **UwU PewPew : rapport analysé.** "
+                        "Aucun joueur Top 33% détecté sur les combats lisibles.",
+                        mention_author=False,
+                        allowed_mentions=discord.AllowedMentions.none(),
+                    )
+
                 PEWPEW_SEEN_REPORTS.add(canonical)
                 _save_pewpew_seen()
+
             except Exception as exc:
+                final_status = "⚠️"
+                print(
+                    f"[PEWPEW] ERREUR RAPPORT {canonical}: "
+                    f"{type(exc).__name__}: {exc}"
+                )
                 dkp_debug(
                     "PEWPEW REPORT ECHEC",
-                    {"url": canonical, "error": f"{type(exc).__name__}: {exc}"},
+                    {
+                        "url": canonical,
+                        "error": f"{type(exc).__name__}: {exc}",
+                    },
                 )
+                try:
+                    await message.reply(
+                        "⚠️ **UwU PewPew : erreur pendant l'analyse du rapport.**\n"
+                        f"`{type(exc).__name__}: {str(exc)[:500]}`\n"
+                        "Le rapport n'est pas marqué comme traité.",
+                        mention_author=False,
+                        allowed_mentions=discord.AllowedMentions.none(),
+                    )
+                except discord.HTTPException:
+                    pass
+
+    await _pewpew_remove_own_reaction(message, "🔎")
+    await _pewpew_set_reaction(message, final_status)
 
 # =============================================================================
 # Discord commands / events
@@ -3013,6 +3205,54 @@ async def main_audit(interaction: discord.Interaction):
         await interaction.followup.send("\n".join(lines), ephemeral=True)
     except Exception as exc:
         await interaction.followup.send(f"❌ Audit : {exc}", ephemeral=True)
+
+
+@bot.tree.command(
+    name="pewpew-test",
+    description="Force l'analyse UwU PewPew d'un message #logs-raid.",
+)
+@app_commands.describe(message_id="ID du message Discord contenant le lien UwU")
+async def pewpew_test(interaction: discord.Interaction, message_id: str):
+    if not can_use_admin(interaction):
+        await interaction.response.send_message("Permission refusée.", ephemeral=True)
+        return
+    if not interaction.guild:
+        await interaction.response.send_message("Serveur requis.", ephemeral=True)
+        return
+    if not message_id.isdigit():
+        await interaction.response.send_message("ID de message invalide.", ephemeral=True)
+        return
+
+    await interaction.response.defer(ephemeral=True, thinking=True)
+
+    try:
+        channel = await get_text_channel(
+            interaction.guild,
+            LOGS_RAID_CHANNEL_ID,
+            "LOGS_RAID_CHANNEL_ID",
+        )
+        message = await channel.fetch_message(int(message_id))
+
+        urls = _message_uwu_urls(message)
+        if not urls:
+            await interaction.followup.send(
+                "Aucun lien UwU détecté dans ce message.",
+                ephemeral=True,
+            )
+            return
+
+        await interaction.followup.send(
+            f"Analyse forcée lancée pour {len(urls)} rapport(s). "
+            "Le résultat sera posté en réponse au message dans #logs-raid.",
+            ephemeral=True,
+        )
+        await handle_uwu_pewpew_message(message, force=True)
+
+    except Exception as exc:
+        await interaction.followup.send(
+            f"❌ PewPew test : {type(exc).__name__}: {exc}",
+            ephemeral=True,
+        )
 
 
 @bot.tree.command(
@@ -3154,6 +3394,10 @@ async def on_message(message: discord.Message):
         and message.guild
         and message.channel.id == LOGS_RAID_CHANNEL_ID
     ):
+        print(
+            f"[PEWPEW] Nouveau message #logs-raid: "
+            f"id={message.id} auteur={message.author}"
+        )
         asyncio.create_task(handle_uwu_pewpew_message(message))
     await bot.process_commands(message)
 
