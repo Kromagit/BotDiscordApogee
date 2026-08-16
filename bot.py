@@ -2975,7 +2975,7 @@ PEWPEW_TIERS: Tuple[Tuple[float, str], ...] = (
     (25.0, "⚪ Top 25% ⚪"),
     (33.0, "⚫ Top 33% ⚫"),
 )
-PEWPEW_STATE_FILE = APP_DIR / "apogeebot_seen_v7.json"
+PEWPEW_STATE_FILE = APP_DIR / "apogeebot_seen_v8.json"
 PEWPEW_LOCK = asyncio.Lock()
 PEWPEW_IN_FLIGHT: set = set()
 
@@ -3201,7 +3201,7 @@ def parse_pewpew_hits_from_fight_page(
 
 
 def _pewpew_page_debug_summary(raw_html: str) -> Dict[str, Any]:
-    rows = re.findall(r"(?is)<tr\\b[^>]*>.*?</tr>", raw_html)
+    rows = re.findall(r"(?is)<tr\b[^>]*>.*?</tr>", raw_html)
 
     headers: List[List[str]] = []
     sample_rows: List[Dict[str, Any]] = []
@@ -3230,7 +3230,7 @@ def _pewpew_page_debug_summary(raw_html: str) -> Dict[str, Any]:
                     "player_guess": _extract_player_name_from_html_row(row, cells),
                     "explicit_points": _extract_explicit_points_from_html(row),
                     "raw_first_cells": [
-                        re.sub(r"\\s+", " ", x)[:700]
+                        re.sub(r"\s+", " ", x)[:700]
                         for x in raw_cells[:4]
                     ],
                 }
@@ -3247,14 +3247,14 @@ def _pewpew_page_debug_summary(raw_html: str) -> Dict[str, Any]:
 
     js_keyword_contexts: List[str] = []
     keyword_re = re.compile(
-        r"(?i)(add-player-rank|points-rank|points-dps|fetch\\s*\\(|XMLHttpRequest|"
+        r"(?i)(add-player-rank|points-rank|points-dps|fetch\s*\(|XMLHttpRequest|"
         r"performancePoints|performance_points|rankPercent|rank_percent|"
         r"/rank|/ranking|/points|dpsPercent|dps_percent)"
     )
     for m in keyword_re.finditer(raw_html):
         a = max(0, m.start() - 260)
         b = min(len(raw_html), m.end() + 520)
-        snippet = re.sub(r"\\s+", " ", html_lib.unescape(raw_html[a:b]))
+        snippet = re.sub(r"\s+", " ", html_lib.unescape(raw_html[a:b]))
         if snippet not in js_keyword_contexts:
             js_keyword_contexts.append(snippet[:1100])
         if len(js_keyword_contexts) >= 12:
@@ -3642,14 +3642,14 @@ def _resolve_uwu_asset_url(page_url: str, asset: str) -> str:
 def _js_relevant_snippets(js_text: str) -> List[str]:
     out: List[str] = []
     pattern = re.compile(
-        r"(?i)(add-player-rank|points-rank|points-dps|fetch\\s*\\(|XMLHttpRequest|"
+        r"(?i)(add-player-rank|points-rank|points-dps|fetch\s*\(|XMLHttpRequest|"
         r"performancePoints|performance_points|rankPercent|rank_percent|"
         r"/rank|/ranking|/points|dpsPercent|dps_percent)"
     )
     for m in pattern.finditer(js_text or ""):
         a = max(0, m.start() - 360)
         b = min(len(js_text), m.end() + 900)
-        snippet = re.sub(r"\\s+", " ", js_text[a:b])
+        snippet = re.sub(r"\s+", " ", js_text[a:b])
         if snippet not in out:
             out.append(snippet[:1500])
         if len(out) >= 12:
@@ -4164,6 +4164,7 @@ async def on_message_edit(before: discord.Message, after: discord.Message):
         and not after.author.bot
         and after.guild
         and after.channel.id == LOGS_RAID_CHANNEL_ID
+        and before.content != after.content
         and _message_uwu_urls(after)
     ):
         asyncio.create_task(handle_uwu_pewpew_message(after))
