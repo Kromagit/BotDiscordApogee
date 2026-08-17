@@ -3435,12 +3435,27 @@ def _infer_tree_index_from_row(row_html: str) -> int:
     return 0
 
 
-APOGEEBOT_NON_PLAYER_ROWS = {"name", "total"}
+APOGEEBOT_NON_PLAYER_ROWS = {
+    "name", "total", "player", "players", "guild", "server",
+    "duration", "date", "raid", "report",
+}
 
 
-def extract_apogeebot_participants(raw_html: str) -> Dict[str, int]:
+def _apogeebot_report_metadata_names(report_id: str) -> set:
+    """Return report author/server tokens that must never be treated as players."""
+    ignored = set(APOGEEBOT_NON_PLAYER_ROWS)
+    parts = [p.strip().lower() for p in str(report_id or "").split("--") if p.strip()]
+    # Canonical UwU report id: YY-MM-DD--HH-MM--Author--Server
+    if len(parts) >= 4:
+        ignored.add(parts[-2])  # uploader / report author
+        ignored.add(parts[-1])  # realm/server
+    return ignored
+
+
+def extract_apogeebot_participants(raw_html: str, report_id: str = "") -> Dict[str, int]:
     """Extract player names and, when visible, their talent-tree index."""
     out: Dict[str, int] = {}
+    ignored_names = _apogeebot_report_metadata_names(report_id)
     for row in re.findall(r"(?is)<tr\b[^>]*>.*?</tr>", raw_html):
         cells = _html_cells(row)
         if not cells:
@@ -3449,7 +3464,11 @@ def extract_apogeebot_participants(raw_html: str) -> Dict[str, int]:
         if not name:
             continue
         low = name.lower()
-        if low in APOGEEBOT_NON_PLAYER_ROWS:
+        if (
+            low in ignored_names
+            or normalize_boss(name)
+            or low in OCR_IGNORE_WORDS
+        ):
             continue
         tree = _infer_tree_index_from_row(row)
         if low not in out or (out[low] == 0 and tree):
@@ -3463,7 +3482,7 @@ def extract_apogeebot_participants(raw_html: str) -> Dict[str, int]:
                 continue
             low = name.lower()
             if (
-                low in APOGEEBOT_NON_PLAYER_ROWS
+                low in ignored_names
                 or normalize_boss(name)
                 or low in OCR_IGNORE_WORDS
             ):
@@ -3491,7 +3510,9 @@ async def _post_uwu_character_json(player: str, spec_idx: int) -> Any:
     for attempt in range(5):
         try:
             async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
-                async with session.post(url, json=data, allow_redirects=True) as resp:
+                # UwU /character expects application/x-www-form-urlencoded fields.
+                # Sending the same dict as JSON returns HTTP 422.
+                async with session.post(url, data=data, allow_redirects=True) as resp:
                     text = await resp.text(errors="replace")
                     last_status = resp.status
                     if resp.status == 200:
@@ -3510,7 +3531,10 @@ async def _post_uwu_character_json(player: str, spec_idx: int) -> Any:
                             await asyncio.sleep(max(0.6, min(delay, 8.0)))
                             continue
                         break
-                    raise RuntimeError(f"UwU HTTP {resp.status}")
+                    detail = re.sub(r"\s+", " ", text).strip()[:500]
+                    raise RuntimeError(
+                        f"UwU HTTP {resp.status}" + (f": {detail}" if detail else "")
+                    )
         except (aiohttp.ClientError, asyncio.TimeoutError, json.JSONDecodeError) as exc:
             last_error = exc
             if attempt < 4:
@@ -3794,7 +3818,7 @@ async def build_pewpew_report(report_url: str) -> Tuple[str, Dict[str, int]]:
     report_url = canonical_uwu_url(final_url)
     current_report_id = _apogee_report_id(report_url)
 
-    participants = extract_apogeebot_participants(raw_html)
+    participants = extract_apogeebot_participants(raw_html, current_report_id)
 
     stats = {
         'participants': len(participants),
