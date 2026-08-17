@@ -3435,6 +3435,9 @@ def _infer_tree_index_from_row(row_html: str) -> int:
     return 0
 
 
+APOGEEBOT_NON_PLAYER_ROWS = {"name", "total"}
+
+
 def extract_apogeebot_participants(raw_html: str) -> Dict[str, int]:
     """Extract player names and, when visible, their talent-tree index."""
     out: Dict[str, int] = {}
@@ -3446,6 +3449,8 @@ def extract_apogeebot_participants(raw_html: str) -> Dict[str, int]:
         if not name:
             continue
         low = name.lower()
+        if low in APOGEEBOT_NON_PLAYER_ROWS:
+            continue
         tree = _infer_tree_index_from_row(row)
         if low not in out or (out[low] == 0 and tree):
             out[low] = tree
@@ -3456,11 +3461,15 @@ def extract_apogeebot_participants(raw_html: str) -> Dict[str, int]:
             name = str(get_first(d, ("playerName", "characterName", "player", "character", "name"), "")).strip()
             if not WOW_NAME_RE.fullmatch(name):
                 continue
-            if normalize_boss(name) or name.lower() in OCR_IGNORE_WORDS:
+            low = name.lower()
+            if (
+                low in APOGEEBOT_NON_PLAYER_ROWS
+                or normalize_boss(name)
+                or low in OCR_IGNORE_WORDS
+            ):
                 continue
             blob = " ".join(str(v) for v in d.values() if isinstance(v, str))
             tree = _infer_tree_index_from_row(blob)
-            low = name.lower()
             if low not in out or (out[low] == 0 and tree):
                 out[low] = tree
     return out
@@ -3482,7 +3491,7 @@ async def _post_uwu_character_json(player: str, spec_idx: int) -> Any:
     for attempt in range(5):
         try:
             async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
-                async with session.post(url, data=data, allow_redirects=True) as resp:
+                async with session.post(url, json=data, allow_redirects=True) as resp:
                     text = await resp.text(errors="replace")
                     last_status = resp.status
                     if resp.status == 200:
@@ -3521,7 +3530,6 @@ async def _post_uwu_character_json(player: str, spec_idx: int) -> Any:
 # confirm/adjust the parsing assumptions below without spamming the console
 # on every subsequent call.
 _APOGEEBOT_PAYLOAD_SAMPLE_LOGGED = False
-
 
 def _apogeebot_hits_from_character_payload(
     payload: Any,
