@@ -58,13 +58,15 @@ except Exception:
 # - tente de copier ce texte dans le presse-papier de la machine qui exécute le bot ;
 # - propose ensuite une confirmation avant de vider entièrement le salon DKPARSE.
 #
-# APOGEEBOT :
-# - surveille les nouveaux liens UwU dans #logs-raid ;
-# - lit chaque KILL du rapport posté (Useful DPS + spec) ;
-# - envoie ces valeurs à l'API POST /rank d'uwu-logs, comme report_main.js ;
-# - classe la performance de CE KILL, sans utiliser le meilleur parse historique ;
-# - reproduit les catégories Top 0.2 / 2 / 5 / 10 / 15 / 20 / 25 / 33 % ;
-# - garde en mémoire les URLs déjà traitées pour éviter les doublons après redémarrage.
+# APOGEEBOT — 3 parties :
+# - Export inscrit : export Raid-Helper en texte pour Kromaddon ;
+# - KAparse : analyse SCREEN-ONLY automatique dès qu'un membre poste un screenshot
+#   dans le salon configuré (le texte éventuel est ignoré) ;
+# - Analyse Log : lit chaque KILL du rapport UwU posté, classe CE KILL via POST /rank,
+#   puis ajoute dans le même message les joueurs ayant établi un nouveau meilleur
+#   log personnel sur un ou plusieurs boss de ce rapport. /character n'est utilisé
+#   QUE pour détecter ces améliorations, jamais pour calculer le classement du raid.
+# - catégories Analyse Log : Top 0.2 / 2 / 5 / 10 / 15 / 20 / 25 / 33 %.
 # =============================================================================
 
 
@@ -283,6 +285,15 @@ class PewPewHit:
     top_percent: float
     points: float
     server_best: bool = False
+
+
+@dataclass(frozen=True)
+class ParseImprovement:
+    """Personal-best boss row whose current best report is the posted raid."""
+    player: str
+    boss: str
+    percentile: Optional[float] = None
+    spec: str = ""
 
 
 def rh_debug(title: str, value: Any = None) -> None:
@@ -643,7 +654,7 @@ class ExportView(discord.ui.View):
 async def run_rh_list(interaction: discord.Interaction, message: discord.Message):
     if not can_use_admin(interaction):
         await interaction.response.send_message(
-            "Tu n'as pas la permission d'utiliser RH List.", ephemeral=True
+            "Tu n'as pas la permission d'utiliser Export inscrit.", ephemeral=True
         )
         return
     if not interaction.guild:
@@ -713,7 +724,7 @@ async def run_rh_list(interaction: discord.Interaction, message: discord.Message
     except Exception as exc:
         if RH_DEBUG:
             print(repr(exc))
-        await interaction.followup.send(f"❌ RH List : {exc}")
+        await interaction.followup.send(f"❌ Export inscrit : {exc}")
 
 
 # =============================================================================
@@ -2460,7 +2471,7 @@ async def evaluate_dkparse_screen_message(
     issues: List[str] = []
 
     if DKPARSE_CHANNEL_ID and message.channel.id != DKPARSE_CHANNEL_ID:
-        issues.append("Message hors du salon DKPARSE configuré.")
+        issues.append("Message hors du salon KAparse configuré.")
 
     character, ocr_detail, spec, rows = await extract_dkparse_screen_only(message)
     if not character:
@@ -2504,7 +2515,7 @@ async def evaluate_dkparse_screen_message(
             message.created_at.astimezone(timezone.utc).date() - newest.date()
         ).days
         issues.append(
-            "Aucune date Best Log du screen n'est dans la fenêtre DKPARSE "
+            "Aucune date Best Log du screen n'est dans la fenêtre KAparse "
             f"(max {DKPARSE_MAX_DAYS} jours). Date la plus récente : "
             f"{newest.strftime('%d/%m/%Y')} ({delta} jour(s))."
         )
@@ -2569,7 +2580,7 @@ async def evaluate_dkparse_screen_message(
     if not valid_hits:
         qualifying = [r for r in in_window_rows if dkp_for_parse(r.parse) > 0]
         if not qualifying:
-            issues.append("Aucun boss du screen n'atteint le seuil DKPARSE minimum (70%).")
+            issues.append("Aucun boss du screen n'atteint le seuil KAparse minimum (70%).")
 
     retained_dates = sorted({h.report_date for h in valid_hits if h.report_date})
     raid_date = retained_dates[-1] if retained_dates else None
@@ -2611,13 +2622,13 @@ async def analyze_dkparse_message(
 
     if not result.character:
         return (
-            "⚠️ **DKPARSE À VÉRIFIER**\n"
+            "⚠️ **KAPARSE À VÉRIFIER**\n"
             + "\n".join(result.issues or ["Aucun personnage lisible sur le screenshot."]),
             None,
         )
 
     lines = [
-        f"**DKPARSE — {result.character}**",
+        f"**KAparse — {result.character}**",
         f"Personnage lu sur le screen : **{result.character}**",
     ]
 
@@ -2645,7 +2656,7 @@ async def analyze_dkparse_message(
                 f"{hit.report_date.strftime('%d/%m/%Y') if hit.report_date else '?'} "
                 f"→ **+{amount} DKP VALIDÉ**"
             )
-        lines += ["", f"**BONUS DKPARSE TOTAL : +{result.total} DKP**"]
+        lines += ["", f"**BONUS KAPARSE TOTAL : +{result.total} DKP**"]
 
     # If character + dated rows were read, a zero bonus is a deterministic
     # rejection under the screen-only rules, not an uncertainty.
@@ -2664,13 +2675,13 @@ async def analyze_dkparse_message(
         if deterministic_reject:
             lines += [
                 "",
-                "❌ **DKPARSE REFUSÉ**",
-                "Aucun bonus DKPARSE n'est valide d'après le screenshot et les dates de #logs-raid.",
+                "❌ **KAPARSE REFUSÉ**",
+                "Aucun bonus KAparse n'est valide d'après le screenshot et les dates de #logs-raid.",
             ]
         else:
             lines += [
                 "",
-                "⚠️ **DKPARSE À VÉRIFIER**",
+                "⚠️ **KAPARSE À VÉRIFIER**",
                 "Le screenshot n'a pas pu être lu avec assez de certitude pour décider.",
             ]
         return "\n".join(lines), None
@@ -2688,16 +2699,16 @@ class DKParseExportView(discord.ui.View):
         super().__init__(timeout=900)
         self.export_text = export_text
 
-    @discord.ui.button(label="Export DKPARSE Kromaddon", style=discord.ButtonStyle.success)
+    @discord.ui.button(label="Export KAparse Kromaddon", style=discord.ButtonStyle.success)
     async def export_dkparse(
         self, interaction: discord.Interaction, button: discord.ui.Button
     ):
         file = discord.File(
             io.BytesIO(self.export_text.encode("utf-8")),
-            filename="Kromaddon_DKPARSE.txt",
+            filename="Kromaddon_KAparse.txt",
         )
         await interaction.response.send_message(
-            "Export DKPARSE prêt pour Kromaddon :",
+            "Export KAparse prêt pour Kromaddon :",
             file=file,
             ephemeral=True,
         )
@@ -2708,7 +2719,7 @@ async def run_dkparse_check(
 ):
     if not can_use_admin(interaction):
         await interaction.response.send_message(
-            "Tu n'as pas la permission de valider les DKPARSE.", ephemeral=True
+            "Tu n'as pas la permission de valider les KAparse.", ephemeral=True
         )
         return
     if not interaction.guild:
@@ -2729,7 +2740,63 @@ async def run_dkparse_check(
         if DKPARSE_DEBUG:
             import traceback
             traceback.print_exc()
-        await interaction.followup.send(f"❌ DKPARSE : {exc}")
+        await interaction.followup.send(f"❌ KAparse : {exc}")
+
+
+KAPARSE_AUTO_IN_FLIGHT: set = set()
+
+
+async def handle_kaparse_auto_message(message: discord.Message) -> None:
+    """Automatically analyse every user screenshot posted in the KAparse channel."""
+    if message.author.bot or not message.guild:
+        return
+    if not DKPARSE_CHANNEL_ID or message.channel.id != DKPARSE_CHANNEL_ID:
+        return
+    if not any(is_image_attachment(att) for att in message.attachments):
+        return
+    if message.id in KAPARSE_AUTO_IN_FLIGHT:
+        return
+
+    KAPARSE_AUTO_IN_FLIGHT.add(message.id)
+    try:
+        try:
+            await message.add_reaction("🔎")
+        except discord.HTTPException:
+            pass
+
+        report, export = await analyze_dkparse_message(message.guild, message)
+        kwargs = {
+            "mention_author": False,
+            "allowed_mentions": discord.AllowedMentions.none(),
+        }
+        if export:
+            await message.reply(report, view=DKParseExportView(export), **kwargs)
+            final_emoji = "✅"
+        else:
+            await message.reply(report, **kwargs)
+            final_emoji = "❌" if "KAPARSE REFUSÉ" in report else "⚠️"
+
+        try:
+            if bot.user:
+                await message.remove_reaction("🔎", bot.user)
+            await message.add_reaction(final_emoji)
+        except discord.HTTPException:
+            pass
+
+    except Exception as exc:
+        if DKPARSE_DEBUG:
+            import traceback
+            traceback.print_exc()
+        try:
+            await message.reply(
+                f"❌ **KAparse : erreur pendant l'analyse automatique.**\n`{type(exc).__name__}: {str(exc)[:500]}`",
+                mention_author=False,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+        except discord.HTTPException:
+            pass
+    finally:
+        KAPARSE_AUTO_IN_FLIGHT.discard(message.id)
 
 
 
@@ -2838,7 +2905,7 @@ class DKParsePurgeConfirmView(discord.ui.View):
         return interaction.user.id == self.owner_id or can_use_admin(interaction)
 
     @discord.ui.button(
-        label="CONFIRMER ET VIDER LE SALON DKPARSE",
+        label="CONFIRMER ET VIDER LE SALON KAPARSE",
         style=discord.ButtonStyle.danger,
     )
     async def confirm_purge(
@@ -2867,12 +2934,12 @@ class DKParsePurgeConfirmView(discord.ui.View):
                 pass
             self.stop()
             await interaction.followup.send(
-                f"✅ Salon DKPARSE vidé : {len(deleted)} message(s) supprimé(s).",
+                f"✅ Salon KAparse vidé : {len(deleted)} message(s) supprimé(s).",
                 ephemeral=True,
             )
         except Exception as exc:
             await interaction.followup.send(
-                f"❌ Suppression DKPARSE : {exc}", ephemeral=True
+                f"❌ Suppression KAparse : {exc}", ephemeral=True
             )
 
     @discord.ui.button(label="Annuler", style=discord.ButtonStyle.secondary)
@@ -2887,8 +2954,8 @@ class DKParsePurgeConfirmView(discord.ui.View):
 
 
 @bot.tree.command(
-    name="dkparse-cloture",
-    description="Exporte les DKPARSE de la semaine puis propose de vider le salon.",
+    name="kaparse-cloture",
+    description="Exporte les KAparse de la semaine puis propose de vider le salon.",
 )
 async def dkparse_cloture(interaction: discord.Interaction):
     if not can_use_admin(interaction):
@@ -2911,7 +2978,7 @@ async def dkparse_cloture(interaction: discord.Interaction):
         copied, clipboard_detail = try_copy_host_clipboard(export_text)
 
         lines = [
-            "**Clôture DKPARSE — aperçu AVANT suppression**",
+            "**Clôture KAparse — aperçu AVANT suppression**",
             f"Screens analysés : **{screen_messages}**",
             f"Messages actuellement dans le salon : **{total_messages}**",
             f"Joueurs avec bonus : **{len(totals)}**",
@@ -2921,7 +2988,7 @@ async def dkparse_cloture(interaction: discord.Interaction):
             for name in sorted(totals, key=str.lower):
                 lines.append(f"• **{name}** : +{totals[name]} DKP")
         else:
-            lines.append("Aucun bonus DKPARSE validé.")
+            lines.append("Aucun bonus KAparse validé.")
 
         if warnings:
             lines += ["", f"⚠️ {len(warnings)} avertissement(s) avant suppression :"]
@@ -2977,7 +3044,7 @@ PEWPEW_TIERS: Tuple[Tuple[float, str], ...] = (
     (25.0, "⚪ Top 25% ⚪"),
     (33.0, "⚫ Top 33% ⚫"),
 )
-PEWPEW_STATE_FILE = APP_DIR / "apogeebot_seen_v9.json"
+PEWPEW_STATE_FILE = APP_DIR / "apogeebot_seen_v10.json"
 PEWPEW_LOCK = asyncio.Lock()
 PEWPEW_IN_FLIGHT: set = set()
 
@@ -3293,6 +3360,7 @@ def _fmt_top_percent(value: float) -> str:
 
 
 def format_pewpew_report(hits: List[PewPewHit]) -> str:
+    """Format only the Top tiers for Analyse Log."""
     # Best result per player + boss across attempts.
     best: Dict[Tuple[str, str], PewPewHit] = {}
     display_name: Dict[str, str] = {}
@@ -3318,7 +3386,7 @@ def format_pewpew_report(hits: List[PewPewHit]) -> str:
     if not tier_players:
         return ""
 
-    lines = ["Congratulations to the following players for achieving high damage on bosses!"]
+    lines = ["**Classement du raid**"]
     for threshold, label in PEWPEW_TIERS:
         players = tier_players.get(threshold, [])
         if not players:
@@ -3331,7 +3399,7 @@ def format_pewpew_report(hits: List[PewPewHit]) -> str:
             lead_parts = []
             for h in lead:
                 value = "SERVER BEST!" if h.server_best else _fmt_top_percent(h.top_percent)
-                lead_parts.append(f"**{value}** on {h.boss}")
+                lead_parts.append(f"**{value}** sur {h.boss}")
 
             extras = []
             thresholds = [t for t, _ in PEWPEW_TIERS if t > threshold]
@@ -3341,11 +3409,77 @@ def format_pewpew_report(hits: List[PewPewHit]) -> str:
                     label_num = "0.2" if t == 0.2 else str(int(t))
                     extras.append(f"**{count}** top {label_num}%")
 
-            suffix = (", also " + ", ".join(extras)) if extras else ""
+            suffix = (", aussi " + ", ".join(extras)) if extras else ""
             lines.append(f"  🔸  *{name}*: " + ", ".join(lead_parts) + suffix)
 
     return "\n".join(lines)
 
+
+def format_analysis_log(
+    hits: List[PewPewHit],
+    improvements: List[ParseImprovement],
+    improvement_failures: int = 0,
+) -> str:
+    """One Discord message: current-raid rankings, then personal improvements."""
+    lines = ["**Analyse Log**"]
+
+    ranking = format_pewpew_report(hits)
+    if ranking:
+        lines += ["", ranking]
+    else:
+        lines += ["", "**Classement du raid**", "Aucun joueur Top 33 sur ce raid."]
+
+    lines += ["", "**📈 Parses améliorées sur ce raid**"]
+
+    best_improvements: Dict[Tuple[str, str], ParseImprovement] = {}
+    display_names: Dict[str, str] = {}
+    for imp in improvements:
+        pl = imp.player.lower()
+        display_names.setdefault(pl, imp.player)
+        key = (pl, imp.boss)
+        old = best_improvements.get(key)
+        if old is None:
+            best_improvements[key] = imp
+        elif imp.percentile is not None and (
+            old.percentile is None or imp.percentile > old.percentile
+        ):
+            best_improvements[key] = imp
+
+    by_player: Dict[str, List[ParseImprovement]] = defaultdict(list)
+    for (pl, _boss), imp in best_improvements.items():
+        by_player[pl].append(imp)
+
+    if not by_player:
+        if improvement_failures:
+            lines.append(
+                f"Aucune amélioration confirmée ; ⚠️ {improvement_failures} vérification(s) /character ont échoué."
+            )
+        else:
+            lines.append("Aucune amélioration de parse détectée sur ce raid.")
+        return "\n".join(lines)
+
+    def player_sort(item):
+        pl, rows = item
+        best_pct = max((r.percentile for r in rows if r.percentile is not None), default=-1.0)
+        return (-len(rows), -best_pct, display_names.get(pl, pl).lower())
+
+    for pl, rows in sorted(by_player.items(), key=player_sort):
+        rows.sort(key=lambda r: (-(r.percentile if r.percentile is not None else -1.0), r.boss))
+        parts = []
+        for row in rows:
+            if row.percentile is None:
+                parts.append(f"**{row.boss}**")
+            else:
+                parts.append(f"**{row.boss} {row.percentile:.2f}%**")
+        lines.append(f"• **{display_names.get(pl, pl)}** — " + ", ".join(parts))
+
+    if improvement_failures:
+        lines += [
+            "",
+            f"⚠️ {improvement_failures} vérification(s) d'amélioration ont échoué ; la liste peut être incomplète.",
+        ]
+
+    return "\n".join(lines)
 
 def _pewpew_attempt_number(url: str) -> int:
     try:
@@ -3738,16 +3872,231 @@ def _apogeebot_hits_from_rank_payload(
     return hits
 
 
-async def build_pewpew_report(report_url: str) -> Tuple[str, Dict[str, int]]:
-    """Rank each player's performance in each KILL of the posted UwU report.
+def _apogeebot_tree_index_from_spec(spec: str) -> int:
+    """Convert UwU's visible spec name to the class talent-tree index 1/2/3."""
+    s = re.sub(r"\s+", " ", html_lib.unescape(spec or "").strip().lower())
+    exact = {
+        "blood death knight": 1,
+        "frost death knight": 2,
+        "unholy death knight": 3,
+        "balance druid": 1,
+        "feral combat druid": 2,
+        "restoration druid": 3,
+        "beast mastery hunter": 1,
+        "marksmanship hunter": 2,
+        "survival hunter": 3,
+        "arcane mage": 1,
+        "fire mage": 2,
+        "frost mage": 3,
+        "holy paladin": 1,
+        "protection paladin": 2,
+        "retribution paladin": 3,
+        "discipline priest": 1,
+        "holy priest": 2,
+        "shadow priest": 3,
+        "assassination rogue": 1,
+        "combat rogue": 2,
+        "subtlety rogue": 3,
+        "elemental shaman": 1,
+        "enhancement shaman": 2,
+        "restoration shaman": 3,
+        "affliction warlock": 1,
+        "demonology warlock": 2,
+        "destruction warlock": 3,
+        "arms warrior": 1,
+        "fury warrior": 2,
+        "protection warrior": 3,
+    }
+    if s in exact:
+        return exact[s]
 
-    This deliberately ignores personal-best history. For every kill page we
-    reproduce UwU's own report_main.js request to POST /rank using the Useful
-    DPS and spec visible in that kill.
+    # Conservative fallback for deployments that shorten the spec label.
+    if s in {"blood", "balance", "beast mastery", "arcane", "discipline", "assassination", "elemental", "affliction", "arms"}:
+        return 1
+    if s in {"marksmanship", "fire", "combat", "enhancement", "demonology", "fury", "feral combat"}:
+        return 2
+    if s in {"unholy", "survival", "shadow", "subtlety", "destruction"}:
+        return 3
+    return 0
+
+
+async def _get_uwu_character_for_improvements(
+    player: str,
+    spec_idx: int,
+    server: str,
+) -> Dict[str, Any]:
+    """Fetch current personal-best rows. Used ONLY by the improvement section."""
+    get_url = f"https://uwu-logs.xyz/character/{server}/{player}/{int(spec_idx)}"
+    post_url = "https://uwu-logs.xyz/character"
+    timeout = aiohttp.ClientTimeout(total=30)
+    headers = {
+        "User-Agent": "ApogeeBot/10.0 (+improvement detection)",
+        "Accept": "application/json,text/plain,*/*",
+    }
+    transient = {429, 500, 502, 503, 504}
+    last_error = None
+
+    # GET is the simplest/current structured endpoint. POST JSON is a fallback.
+    requests = [
+        ("GET", get_url, None),
+        ("POST", post_url, {"server": server, "name": player, "spec_i": int(spec_idx)}),
+    ]
+
+    for method, url, payload in requests:
+        for attempt in range(4):
+            try:
+                async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
+                    if method == "GET":
+                        ctx = session.get(url, allow_redirects=True)
+                    else:
+                        ctx = session.post(url, json=payload, allow_redirects=True)
+                    async with ctx as resp:
+                        body = await resp.text(errors="replace")
+                        if resp.status == 200:
+                            parsed = json.loads(body)
+                            if not isinstance(parsed, dict):
+                                raise RuntimeError("UwU /character n'a pas renvoyé un objet JSON")
+                            return parsed
+                        if resp.status in transient and attempt < 3:
+                            await asyncio.sleep(min(0.7 * (2 ** attempt), 6.0))
+                            continue
+                        # 404/405/422 on GET/POST lets the next transport try.
+                        detail = re.sub(r"\s+", " ", body).strip()[:500]
+                        last_error = RuntimeError(
+                            f"UwU /character {method} HTTP {resp.status}"
+                            + (f": {detail}" if detail else "")
+                        )
+                        break
+            except (aiohttp.ClientError, asyncio.TimeoutError, json.JSONDecodeError) as exc:
+                last_error = exc
+                if attempt < 3:
+                    await asyncio.sleep(min(0.7 * (2 ** attempt), 6.0))
+                    continue
+                break
+
+    if last_error is not None:
+        raise RuntimeError(f"UwU /character amélioration: {type(last_error).__name__}: {last_error}")
+    raise RuntimeError("UwU /character amélioration impossible")
+
+
+def _character_report_improvements(
+    payload: Dict[str, Any],
+    player: str,
+    current_report_id: str,
+    current_percentiles: Dict[Tuple[str, str], float],
+    current_specs: Dict[Tuple[str, str], str],
+) -> List[ParseImprovement]:
+    """Rows whose current personal-best report_id is exactly the posted raid."""
+    bosses = payload.get("bosses")
+    if not isinstance(bosses, dict):
+        return []
+
+    report_low = current_report_id.lower()
+    out: List[ParseImprovement] = []
+    for raw_boss, raw in bosses.items():
+        if not isinstance(raw, dict) or not raw:
+            continue
+        report_id = str(
+            raw.get("report_id")
+            or raw.get("reportId")
+            or raw.get("report")
+            or ""
+        ).strip().strip("/")
+        if report_id.lower() != report_low:
+            continue
+
+        boss = normalize_boss(str(raw_boss)) or str(raw_boss).strip()
+        if not boss:
+            continue
+        key = (player.lower(), boss.lower())
+        out.append(
+            ParseImprovement(
+                player=player,
+                boss=boss,
+                percentile=current_percentiles.get(key),
+                spec=current_specs.get(key, ""),
+            )
+        )
+    return out
+
+
+async def _detect_report_improvements(
+    report_id: str,
+    server: str,
+    player_specs: Dict[str, set],
+    display_names: Dict[str, str],
+    current_percentiles: Dict[Tuple[str, str], float],
+    current_specs: Dict[Tuple[str, str], str],
+) -> Tuple[List[ParseImprovement], int, int]:
+    """Check personal-best source report for each spec actually played in the raid."""
+    found: Dict[Tuple[str, str], ParseImprovement] = {}
+    queries = 0
+    failures = 0
+
+    for player_low in sorted(player_specs):
+        player = display_names.get(player_low, player_low.capitalize())
+        spec_names = sorted(player_specs[player_low])
+        tree_indices = []
+        for spec_name in spec_names:
+            idx = _apogeebot_tree_index_from_spec(spec_name)
+            if idx and idx not in tree_indices:
+                tree_indices.append(idx)
+
+        if not tree_indices:
+            dkp_debug(
+                "ANALYSE LOG SPEC NON MAPPÉE",
+                {"player": player, "specs": spec_names},
+            )
+            continue
+
+        for spec_idx in tree_indices:
+            try:
+                payload = await _get_uwu_character_for_improvements(player, spec_idx, server)
+                queries += 1
+                rows = _character_report_improvements(
+                    payload,
+                    player,
+                    report_id,
+                    current_percentiles,
+                    current_specs,
+                )
+                for row in rows:
+                    key = (row.player.lower(), row.boss.lower())
+                    old = found.get(key)
+                    if old is None or (
+                        row.percentile is not None
+                        and (old.percentile is None or row.percentile > old.percentile)
+                    ):
+                        found[key] = row
+            except Exception as exc:
+                failures += 1
+                print(
+                    f"[ANALYSE LOG] Amélioration ECHEC {player} spec {spec_idx}: "
+                    f"{type(exc).__name__}: {exc}"
+                )
+                dkp_debug(
+                    "ANALYSE LOG /character ECHEC",
+                    {
+                        "player": player,
+                        "spec_idx": spec_idx,
+                        "error": f"{type(exc).__name__}: {exc}",
+                    },
+                )
+            await asyncio.sleep(0.08)
+
+    return list(found.values()), queries, failures
+
+
+async def build_pewpew_report(report_url: str) -> Tuple[str, Dict[str, int]]:
+    """Analyse Log: current-kill /rank + personal improvements from this report.
+
+    Ranking is ALWAYS based on each kill's Useful DPS/spec submitted to /rank.
+    /character is called only afterwards to answer a different question:
+    "is this posted report now the source of this player's personal best on boss X?"
     """
     report_url = canonical_uwu_url(report_url)
     final_url, landing_html = await _fetch_uwu_with_retry(
-        report_url, "ApogeeBot/9.0 (+report rank)"
+        report_url, "ApogeeBot/10.0 (+Analyse Log)"
     )
     report_url = canonical_uwu_url(final_url)
     report_id = _apogee_report_id(report_url)
@@ -3756,7 +4105,7 @@ async def build_pewpew_report(report_url: str) -> Tuple[str, Dict[str, int]]:
 
     stats: Dict[str, int] = {
         "participants": 0,
-        "queries": 0,
+        "queries": 0,                  # /rank queries
         "players_ok": 0,
         "players_failed": 0,
         "players_with_hits": 0,
@@ -3764,37 +4113,56 @@ async def build_pewpew_report(report_url: str) -> Tuple[str, Dict[str, int]]:
         "kills_detected": len(kill_urls),
         "kills_ranked": 0,
         "kills_failed": 0,
+        "improvement_queries": 0,      # /character, improvement-only
+        "improvement_query_failures": 0,
+        "improved_players": 0,
+        "improvements": 0,
     }
 
     if not report_id or not kill_urls:
-        print(f"[APOGEEBOT] Aucun kill exploitable détecté dans {report_id or report_url}")
+        print(f"[ANALYSE LOG] Aucun kill exploitable détecté dans {report_id or report_url}")
         return "", stats
 
     all_participants: set = set()
     all_ranked_players: set = set()
     hits: List[PewPewHit] = []
 
-    print(f"[APOGEEBOT] {len(kill_urls)} kill(s) détecté(s) dans {report_id}")
+    # For improvement detection we remember only specs actually seen in this raid
+    # and the percentile produced by /rank for the current boss kill.
+    player_specs: Dict[str, set] = defaultdict(set)
+    display_names: Dict[str, str] = {}
+    current_percentiles: Dict[Tuple[str, str], float] = {}
+    current_specs: Dict[Tuple[str, str], str] = {}
+
+    print(f"[ANALYSE LOG] {len(kill_urls)} kill(s) détecté(s) dans {report_id}")
 
     for index, fight_url in enumerate(kill_urls, start=1):
         boss_hint, mode_hint = _apogeebot_fight_name_mode("", fight_url)
         try:
             _final, fight_html = await _fetch_uwu_with_retry(
-                fight_url, "ApogeeBot/9.0 (+kill rank)"
+                fight_url, "ApogeeBot/10.0 (+kill rank)"
             )
             boss, mode, dps, specs = _apogeebot_rank_input_from_fight(fight_html, fight_url)
             boss = boss or boss_hint
             mode = mode or mode_hint
 
             if boss in APOGEEBOT_IGNORED_RANK_BOSSES:
-                print(f"[APOGEEBOT] SKIP {boss}: boss non classé par UwU /rank")
+                print(f"[ANALYSE LOG] SKIP {boss}: boss non classé par UwU /rank")
                 continue
             if not boss or mode not in {"10N", "10H", "25N", "25H"}:
                 raise RuntimeError(f"boss/mode illisible ({boss!r}, {mode!r})")
             if not dps or not specs:
                 raise RuntimeError("aucun Useful DPS + spec extrait de la page du kill")
 
-            all_participants.update(name.lower() for name in dps)
+            for name in dps:
+                low = name.lower()
+                all_participants.add(low)
+                display_names.setdefault(low, name)
+                spec_name = specs.get(name, "")
+                if spec_name:
+                    player_specs[low].add(spec_name)
+                    current_specs[(low, boss.lower())] = spec_name
+
             rank_payload = {
                 "server": server,
                 "boss": boss,
@@ -3803,7 +4171,7 @@ async def build_pewpew_report(report_url: str) -> Tuple[str, Dict[str, int]]:
                 "specs": specs,
             }
             dkp_debug(
-                "APOGEEBOT /rank INPUT",
+                "ANALYSE LOG /rank INPUT",
                 {
                     "kill": index,
                     "boss": boss,
@@ -3826,14 +4194,27 @@ async def build_pewpew_report(report_url: str) -> Tuple[str, Dict[str, int]]:
                 if isinstance(value, dict)
             )
 
+            # Keep every current-raid percentile, not only Top 33: the improvement
+            # section may contain a personal best at e.g. 55%.
+            for player, raw in rank_data.items():
+                if not isinstance(raw, dict):
+                    continue
+                percentile = _numeric(raw.get("percentile"))
+                if percentile is None or not 0.0 <= percentile <= 100.0:
+                    continue
+                key = (str(player).lower(), boss.lower())
+                old = current_percentiles.get(key)
+                if old is None or float(percentile) > old:
+                    current_percentiles[key] = float(percentile)
+
             kill_hits = _apogeebot_hits_from_rank_payload(rank_data, boss)
             hits.extend(kill_hits)
             print(
-                f"[APOGEEBOT] {boss} {mode}: {len(rank_data)} joueur(s) classé(s), "
+                f"[ANALYSE LOG] {boss} {mode}: {len(rank_data)} joueur(s) classé(s), "
                 f"{len(kill_hits)} résultat(s) Top 33"
             )
             dkp_debug(
-                "APOGEEBOT /rank OUTPUT",
+                "ANALYSE LOG /rank OUTPUT",
                 {
                     "boss": boss,
                     "mode": mode,
@@ -3851,11 +4232,11 @@ async def build_pewpew_report(report_url: str) -> Tuple[str, Dict[str, int]]:
         except Exception as exc:
             stats["kills_failed"] += 1
             print(
-                f"[APOGEEBOT] ECHEC KILL {boss_hint or '?'} {mode_hint or '?'}: "
+                f"[ANALYSE LOG] ECHEC KILL {boss_hint or '?'} {mode_hint or '?'}: "
                 f"{type(exc).__name__}: {exc}"
             )
             dkp_debug(
-                "APOGEEBOT KILL ECHEC",
+                "ANALYSE LOG KILL ECHEC",
                 {
                     "url": fight_url,
                     "boss": boss_hint,
@@ -3872,15 +4253,29 @@ async def build_pewpew_report(report_url: str) -> Tuple[str, Dict[str, int]]:
     stats["hits"] = len(hits)
 
     if stats["kills_ranked"] <= 0:
-        print(f"[APOGEEBOT] Aucun kill n'a pu être classé via /rank pour {report_id}")
+        print(f"[ANALYSE LOG] Aucun kill n'a pu être classé via /rank pour {report_id}")
         return "", stats
 
-    if not hits:
-        print(f"[APOGEEBOT] Aucun Top 33 dans les kills classés du rapport {report_id}")
-        return "", stats
+    improvements, imp_queries, imp_failures = await _detect_report_improvements(
+        report_id,
+        server,
+        player_specs,
+        display_names,
+        current_percentiles,
+        current_specs,
+    )
+    stats["improvement_queries"] = imp_queries
+    stats["improvement_query_failures"] = imp_failures
+    stats["improved_players"] = len({x.player.lower() for x in improvements})
+    stats["improvements"] = len(improvements)
 
-    return format_pewpew_report(hits), stats
+    print(
+        f"[ANALYSE LOG] Améliorations: {stats['improved_players']} joueur(s), "
+        f"{stats['improvements']} boss, {imp_queries} requête(s) /character, "
+        f"{imp_failures} échec(s)"
+    )
 
+    return format_analysis_log(hits, improvements, imp_failures), stats
 
 def _message_uwu_urls(message: discord.Message) -> List[str]:
     parts = [message.content or ""]
@@ -3927,12 +4322,12 @@ async def handle_uwu_pewpew_message(
     urls = _message_uwu_urls(message)
     if not urls:
         print(
-            f"[APOGEEBOT] Message {message.id} reçu dans #logs-raid "
+            f"[ANALYSE LOG] Message {message.id} reçu dans #logs-raid "
             "mais aucun lien UwU détecté."
         )
         return
 
-    print(f"[APOGEEBOT] Message {message.id}: {len(urls)} rapport(s) UwU détecté(s)")
+    print(f"[ANALYSE LOG] Message {message.id}: {len(urls)} rapport(s) UwU détecté(s)")
     await _pewpew_set_reaction(message, "🔎")
 
     final_status = "✅"
@@ -3942,23 +4337,23 @@ async def handle_uwu_pewpew_message(
             canonical = canonical_uwu_url(url)
 
             if canonical in PEWPEW_SEEN_REPORTS and not force:
-                print(f"[APOGEEBOT] Déjà traité: {canonical}")
+                print(f"[ANALYSE LOG] Déjà traité: {canonical}")
                 continue
             if canonical in PEWPEW_IN_FLIGHT and not force:
-                print(f"[APOGEEBOT] Déjà en cours d'analyse: {canonical}")
+                print(f"[ANALYSE LOG] Déjà en cours d'analyse: {canonical}")
                 continue
 
-            print(f"[APOGEEBOT] Analyse: {canonical}")
+            print(f"[ANALYSE LOG] Analyse: {canonical}")
             PEWPEW_IN_FLIGHT.add(canonical)
 
             try:
                 report, stats = await build_pewpew_report(canonical)
-                print(f"[APOGEEBOT] Résultat {canonical}: {stats}")
+                print(f"[ANALYSE LOG] Résultat {canonical}: {stats}")
 
                 if stats["participants"] <= 0:
                     final_status = "⚠️"
                     await message.reply(
-                        "⚠️ **ApogeeBot : rapport détecté, mais aucun participant "
+                        "⚠️ **Analyse Log : rapport détecté, mais aucun participant "
                         "n'a pu être extrait de la page UwU.**\n"
                         "Le rapport n'est pas marqué comme traité : tu peux le "
                         "reposter après correction du bot/site.",
@@ -3970,7 +4365,7 @@ async def handle_uwu_pewpew_message(
                 if stats.get("kills_ranked", 0) <= 0:
                     final_status = "⚠️"
                     await message.reply(
-                        "⚠️ **ApogeeBot : rapport détecté, mais aucun kill "
+                        "⚠️ **Analyse Log : rapport détecté, mais aucun kill "
                         "n'a pu être classé via l'API UwU `/rank`.**\n"
                         f"Kills détectés : {stats.get('kills_detected', 0)} — "
                         f"échecs : {stats.get('kills_failed', 0)}. "
@@ -3981,24 +4376,41 @@ async def handle_uwu_pewpew_message(
                     continue
 
                 if report:
-                    first = True
-                    for chunk in split_discord_text(report):
-                        if first:
-                            await message.reply(
-                                chunk,
-                                mention_author=False,
-                                allowed_mentions=discord.AllowedMentions.none(),
+                    # The user explicitly wants rankings + improvements in ONE Discord message.
+                    # Plain content is used while it fits; otherwise one embed keeps all chunks
+                    # inside the same reply instead of sending follow-up messages.
+                    if len(report) <= 1900:
+                        await message.reply(
+                            report,
+                            mention_author=False,
+                            allowed_mentions=discord.AllowedMentions.none(),
+                        )
+                    else:
+                        embed = discord.Embed(title="Analyse Log")
+                        report_body = report
+                        if report_body.startswith("**Analyse Log**"):
+                            report_body = report_body[len("**Analyse Log**"):].lstrip("\n")
+                        chunks = split_discord_text(report_body, max_len=950)
+                        for i, chunk in enumerate(chunks[:6]):
+                            embed.add_field(
+                                name="\u200b" if i else "Résultats",
+                                value=chunk,
+                                inline=False,
                             )
-                            first = False
-                        else:
-                            await message.channel.send(
-                                chunk,
-                                allowed_mentions=discord.AllowedMentions.none(),
+                        if len(chunks) > 6:
+                            embed.add_field(
+                                name="⚠️ Sortie trop longue",
+                                value=f"{len(chunks)-6} bloc(s) supplémentaire(s) non affiché(s).",
+                                inline=False,
                             )
+                        await message.reply(
+                            embed=embed,
+                            mention_author=False,
+                            allowed_mentions=discord.AllowedMentions.none(),
+                        )
                 else:
-                    # Analyse valide : /rank a répondu, mais personne n'est Top 33.
                     print(
-                        f"[APOGEEBOT] Rapport classé correctement, aucun Top 33: {canonical}"
+                        f"[ANALYSE LOG] Rapport classé mais aucun texte de sortie: {canonical}"
                     )
 
                 PEWPEW_SEEN_REPORTS.add(canonical)
@@ -4007,7 +4419,7 @@ async def handle_uwu_pewpew_message(
             except Exception as exc:
                 final_status = "⚠️"
                 print(
-                    f"[APOGEEBOT] ERREUR RAPPORT {canonical}: "
+                    f"[ANALYSE LOG] ERREUR RAPPORT {canonical}: "
                     f"{type(exc).__name__}: {exc}"
                 )
                 dkp_debug(
@@ -4019,7 +4431,7 @@ async def handle_uwu_pewpew_message(
                 )
                 try:
                     await message.reply(
-                        "⚠️ **ApogeeBot : erreur pendant l'analyse du rapport.**\n"
+                        "⚠️ **Analyse Log : erreur pendant l'analyse du rapport.**\n"
                         f"`{type(exc).__name__}: {str(exc)[:500]}`\n"
                         "Le rapport n'est pas marqué comme traité.",
                         mention_author=False,
@@ -4037,14 +4449,14 @@ async def handle_uwu_pewpew_message(
 # Discord commands / events
 # =============================================================================
 
-@app_commands.context_menu(name="RH List")
+@app_commands.context_menu(name="Export inscrit")
 async def rh_list_context(
     interaction: discord.Interaction, message: discord.Message
 ):
     await run_rh_list(interaction, message)
 
 
-@app_commands.context_menu(name="DKPARSE")
+@app_commands.context_menu(name="KAparse")
 async def dkparse_context(
     interaction: discord.Interaction, message: discord.Message
 ):
@@ -4074,8 +4486,8 @@ async def main_audit(interaction: discord.Interaction):
 
 
 @bot.tree.command(
-    name="apogee-log-test",
-    description="Force l'analyse ApogeeBot d'un message #logs-raid.",
+    name="analyse-log-test",
+    description="Force Analyse Log sur un message #logs-raid.",
 )
 @app_commands.describe(message_id="ID du message Discord contenant le lien UwU")
 async def pewpew_test(interaction: discord.Interaction, message_id: str):
@@ -4116,13 +4528,13 @@ async def pewpew_test(interaction: discord.Interaction, message_id: str):
 
     except Exception as exc:
         await interaction.followup.send(
-            f"❌ ApogeeBot test : {type(exc).__name__}: {exc}",
+            f"❌ Analyse Log test : {type(exc).__name__}: {exc}",
             ephemeral=True,
         )
 
 
 @bot.tree.command(
-    name="dkparse-check",
+    name="kaparse-check",
     description="Valide un message DKPARSE par son ID Discord.",
 )
 @app_commands.describe(message_id="ID du message posté dans le salon DKPARSE")
@@ -4152,7 +4564,7 @@ async def dkparse_check(interaction: discord.Interaction, message_id: str):
 
 
 @bot.tree.command(
-    name="dkparse-logs",
+    name="kaparse-logs",
     description="Affiche les dates de logs guilde trouvées dans #logs-raid.",
 )
 async def dkparse_logs(interaction: discord.Interaction):
@@ -4254,6 +4666,21 @@ async def enforce_main_message(message: discord.Message):
 @bot.event
 async def on_message(message: discord.Message):
     await enforce_main_message(message)
+
+    # KAparse: any user image in the configured channel is analysed automatically.
+    if (
+        not message.author.bot
+        and message.guild
+        and DKPARSE_CHANNEL_ID
+        and message.channel.id == DKPARSE_CHANNEL_ID
+        and any(is_image_attachment(att) for att in message.attachments)
+    ):
+        print(
+            f"[KAPARSE] Nouveau screen: id={message.id} auteur={message.author}"
+        )
+        asyncio.create_task(handle_kaparse_auto_message(message))
+
+    # Analyse Log: automatic on every UwU report posted in #logs-raid.
     if (
         UWU_PEWPEW_ENABLED
         and not message.author.bot
@@ -4261,7 +4688,7 @@ async def on_message(message: discord.Message):
         and message.channel.id == LOGS_RAID_CHANNEL_ID
     ):
         print(
-            f"[APOGEEBOT] Nouveau message #logs-raid: "
+            f"[ANALYSE LOG] Nouveau message #logs-raid: "
             f"id={message.id} auteur={message.author}"
         )
         asyncio.create_task(handle_uwu_pewpew_message(message))
@@ -4285,14 +4712,14 @@ async def on_message_edit(before: discord.Message, after: discord.Message):
 
 @bot.event
 async def on_ready():
-    print("Apogee Raid-Helper Bot V5 + DKPARSE SCREEN-ONLY + ApogeeBot")
+    print("ApogeeBot — Export inscrit + KAparse + Analyse Log")
     print(f"Connecté en tant que {bot.user} ({bot.user.id})")
     print(f"#Main channel ID: {MAIN_CHANNEL_ID}")
     print(f"#logs-raid channel ID: {LOGS_RAID_CHANNEL_ID or 'NON CONFIGURE'}")
-    print(f"#dkparse channel ID: {DKPARSE_CHANNEL_ID or 'NON CONFIGURE'}")
-    print(f"DKPARSE window: {DKPARSE_MAX_DAYS} jours")
-    print("DKPARSE OCR: " + ("RapidOCR OK" if (RapidOCR is not None and Image is not None and np is not None) else "INDISPONIBLE"))
-    print(f"ApogeeBot: {'ACTIVE' if UWU_PEWPEW_ENABLED else 'DESACTIVE'} (kills du rapport via API /rank)")
+    print(f"#KAparse channel ID: {DKPARSE_CHANNEL_ID or 'NON CONFIGURE'}")
+    print(f"KAparse window: {DKPARSE_MAX_DAYS} jours")
+    print("KAparse OCR: " + ("RapidOCR OK" if (RapidOCR is not None and Image is not None and np is not None) else "INDISPONIBLE"))
+    print(f"Analyse Log: {'ACTIVE' if UWU_PEWPEW_ENABLED else 'DESACTIVE'} (/rank raid + /character améliorations)")
 
 
 @bot.event
