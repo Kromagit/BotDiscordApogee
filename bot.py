@@ -3044,7 +3044,7 @@ PEWPEW_TIERS: Tuple[Tuple[float, str], ...] = (
     (25.0, "⚪ Top 25% ⚪"),
     (33.0, "⚫ Top 33% ⚫"),
 )
-PEWPEW_STATE_FILE = APP_DIR / "apogeebot_seen_v10.json"
+PEWPEW_STATE_FILE = APP_DIR / "apogeebot_seen_v11.json"
 PEWPEW_LOCK = asyncio.Lock()
 PEWPEW_IN_FLIGHT: set = set()
 
@@ -3398,7 +3398,9 @@ def format_pewpew_report(hits: List[PewPewHit]) -> str:
             lead = [h for h in phits if h.top_percent <= threshold + 1e-9]
             lead_parts = []
             for h in lead:
-                value = "SERVER BEST!" if h.server_best else _fmt_top_percent(h.top_percent)
+                # `h.points` is UwU /rank's percentile: the actual parse value.
+                # The Top category still uses 100 - percentile via h.top_percent.
+                value = "SERVER BEST!" if h.server_best else f"{h.points:.2f}%"
                 lead_parts.append(f"**{value}** sur {h.boss}")
 
             extras = []
@@ -3694,7 +3696,7 @@ def _apogeebot_kill_urls(raw_html: str, report_url: str) -> List[str]:
         q = parse_qs(urlsplit(html_lib.unescape(url)).query)
         boss = (q.get("boss") or [""])[0]
         mode = (q.get("mode") or [""])[0].upper()
-        if not boss or mode not in {"10N", "10H", "25N", "25H"}:
+        if not boss or mode not in {"10H", "25H"}:
             continue
         if "attempt" not in q or not ("s" in q or "f" in q):
             continue
@@ -3930,7 +3932,7 @@ async def _get_uwu_character_for_improvements(
     post_url = "https://uwu-logs.xyz/character"
     timeout = aiohttp.ClientTimeout(total=30)
     headers = {
-        "User-Agent": "ApogeeBot/10.0 (+improvement detection)",
+        "User-Agent": "ApogeeBot/11.0 (+improvement detection)",
         "Accept": "application/json,text/plain,*/*",
     }
     transient = {429, 500, 502, 503, 504}
@@ -3985,8 +3987,14 @@ def _character_report_improvements(
     current_report_id: str,
     current_percentiles: Dict[Tuple[str, str], float],
     current_specs: Dict[Tuple[str, str], str],
+    current_dps: Dict[Tuple[str, str], float],
 ) -> List[ParseImprovement]:
-    """Rows whose current personal-best report_id is exactly the posted raid."""
+    """Detect personal bests made in the posted heroic raid.
+
+    Primary proof is UwU's character `report_id`. As a robust fallback, the
+    current kill's Useful DPS may equal the character endpoint's `dps_max`;
+    that field is UwU's best DPS row for the player/spec/boss.
+    """
     bosses = payload.get("bosses")
     if not isinstance(bosses, dict):
         return []
@@ -4002,13 +4010,43 @@ def _character_report_improvements(
             or raw.get("report")
             or ""
         ).strip().strip("/")
-        if report_id.lower() != report_low:
-            continue
 
         boss = normalize_boss(str(raw_boss)) or str(raw_boss).strip()
         if not boss:
             continue
         key = (player.lower(), boss.lower())
+
+        # Only bosses actually processed from a HEROIC kill in this report can
+        # count as an improvement. This also guarantees NM parses never leak in.
+        if key not in current_percentiles:
+            continue
+
+        same_report = bool(report_id) and report_id.lower() == report_low
+        best_dps = _numeric(raw.get("dps_max"))
+        raid_dps = current_dps.get(key)
+        # report_main.js submits displayed Useful DPS +0.1; allow a tiny rounding
+        # tolerance against /character's more precise dps_max.
+        same_best_dps = (
+            best_dps is not None
+            and raid_dps is not None
+            and abs(float(best_dps) - float(raid_dps)) <= 0.25
+        )
+        if not (same_report or same_best_dps):
+            continue
+
+        if same_best_dps and not same_report:
+            dkp_debug(
+                "ANALYSE LOG AMELIORATION DPS_MAX",
+                {
+                    "player": player,
+                    "boss": boss,
+                    "report_character": report_id,
+                    "report_posted": current_report_id,
+                    "dps_max": best_dps,
+                    "raid_dps": raid_dps,
+                },
+            )
+
         out.append(
             ParseImprovement(
                 player=player,
@@ -4027,6 +4065,7 @@ async def _detect_report_improvements(
     display_names: Dict[str, str],
     current_percentiles: Dict[Tuple[str, str], float],
     current_specs: Dict[Tuple[str, str], str],
+    current_dps: Dict[Tuple[str, str], float],
 ) -> Tuple[List[ParseImprovement], int, int]:
     """Check personal-best source report for each spec actually played in the raid."""
     found: Dict[Tuple[str, str], ParseImprovement] = {}
@@ -4059,6 +4098,7 @@ async def _detect_report_improvements(
                     report_id,
                     current_percentiles,
                     current_specs,
+                    current_dps,
                 )
                 for row in rows:
                     key = (row.player.lower(), row.boss.lower())
@@ -4096,7 +4136,7 @@ async def build_pewpew_report(report_url: str) -> Tuple[str, Dict[str, int]]:
     """
     report_url = canonical_uwu_url(report_url)
     final_url, landing_html = await _fetch_uwu_with_retry(
-        report_url, "ApogeeBot/10.0 (+Analyse Log)"
+        report_url, "ApogeeBot/11.0 (+Analyse Log)"
     )
     report_url = canonical_uwu_url(final_url)
     report_id = _apogee_report_id(report_url)
@@ -4133,6 +4173,7 @@ async def build_pewpew_report(report_url: str) -> Tuple[str, Dict[str, int]]:
     display_names: Dict[str, str] = {}
     current_percentiles: Dict[Tuple[str, str], float] = {}
     current_specs: Dict[Tuple[str, str], str] = {}
+    current_dps: Dict[Tuple[str, str], float] = {}
 
     print(f"[ANALYSE LOG] {len(kill_urls)} kill(s) détecté(s) dans {report_id}")
 
@@ -4140,11 +4181,20 @@ async def build_pewpew_report(report_url: str) -> Tuple[str, Dict[str, int]]:
         boss_hint, mode_hint = _apogeebot_fight_name_mode("", fight_url)
         try:
             _final, fight_html = await _fetch_uwu_with_retry(
-                fight_url, "ApogeeBot/10.0 (+kill rank)"
+                fight_url, "ApogeeBot/11.0 (+kill rank)"
             )
             boss, mode, dps, specs = _apogeebot_rank_input_from_fight(fight_html, fight_url)
             boss = boss or boss_hint
             mode = mode or mode_hint
+
+            # Analyse Log is HEROIC ONLY. Normal-mode parses are deliberately
+            # ignored and never sent to /rank or to improvement detection.
+            if mode in {"10N", "25N"}:
+                print(f"[ANALYSE LOG] SKIP {boss or boss_hint or '?'} {mode}: mode normal ignoré")
+                continue
+            if mode == "TBD":
+                print(f"[ANALYSE LOG] SKIP {boss or boss_hint or '?'} TBD: mode non classable")
+                continue
 
             if boss in APOGEEBOT_IGNORED_RANK_BOSSES:
                 print(f"[ANALYSE LOG] SKIP {boss}: boss non classé par UwU /rank")
@@ -4162,6 +4212,7 @@ async def build_pewpew_report(report_url: str) -> Tuple[str, Dict[str, int]]:
                 if spec_name:
                     player_specs[low].add(spec_name)
                     current_specs[(low, boss.lower())] = spec_name
+                current_dps[(low, boss.lower())] = float(dps[name])
 
             rank_payload = {
                 "server": server,
@@ -4263,6 +4314,7 @@ async def build_pewpew_report(report_url: str) -> Tuple[str, Dict[str, int]]:
         display_names,
         current_percentiles,
         current_specs,
+        current_dps,
     )
     stats["improvement_queries"] = imp_queries
     stats["improvement_query_failures"] = imp_failures
@@ -4719,7 +4771,7 @@ async def on_ready():
     print(f"#KAparse channel ID: {DKPARSE_CHANNEL_ID or 'NON CONFIGURE'}")
     print(f"KAparse window: {DKPARSE_MAX_DAYS} jours")
     print("KAparse OCR: " + ("RapidOCR OK" if (RapidOCR is not None and Image is not None and np is not None) else "INDISPONIBLE"))
-    print(f"Analyse Log: {'ACTIVE' if UWU_PEWPEW_ENABLED else 'DESACTIVE'} (/rank raid + /character améliorations)")
+    print(f"Analyse Log: {'ACTIVE' if UWU_PEWPEW_ENABLED else 'DESACTIVE'} (/rank HEROIC + détection PB /character+dps_max)")
 
 
 @bot.event
