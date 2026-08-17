@@ -60,9 +60,9 @@ except Exception:
 #
 # APOGEEBOT :
 # - surveille les nouveaux liens UwU dans #logs-raid ;
-# - interroge l'API POST /character d'uwu-logs pour chaque participant du rapport
-#   (même approche que DKPARSE : pas de scraping HTML des fight pages, qui ne
-#   contiennent jamais les valeurs Points/Dps% calculées côté client par UwU) ;
+# - lit chaque KILL du rapport posté (Useful DPS + spec) ;
+# - envoie ces valeurs à l'API POST /rank d'uwu-logs, comme report_main.js ;
+# - classe la performance de CE KILL, sans utiliser le meilleur parse historique ;
 # - reproduit les catégories Top 0.2 / 2 / 5 / 10 / 15 / 20 / 25 / 33 % ;
 # - garde en mémoire les URLs déjà traitées pour éviter les doublons après redémarrage.
 # =============================================================================
@@ -2977,7 +2977,7 @@ PEWPEW_TIERS: Tuple[Tuple[float, str], ...] = (
     (25.0, "⚪ Top 25% ⚪"),
     (33.0, "⚫ Top 33% ⚫"),
 )
-PEWPEW_STATE_FILE = APP_DIR / "apogeebot_seen_v8.json"
+PEWPEW_STATE_FILE = APP_DIR / "apogeebot_seen_v9.json"
 PEWPEW_LOCK = asyncio.Lock()
 PEWPEW_IN_FLIGHT: set = set()
 
@@ -3167,7 +3167,7 @@ def parse_pewpew_hits_from_fight_page(
     la page HTML brute renvoyée par le serveur uwu-logs ne contient jamais
     les valeurs points-rank / points-dps (elles sont calculées côté client
     en JavaScript après chargement). build_pewpew_report n'appelle plus
-    cette fonction — voir _apogeebot_character_hits / POST /character.
+    cette fonction — le flux actif utilise désormais Useful DPS + POST /rank.
     """
     boss=_generic_boss_from_uwu_url(fight_url)
     if not boss or boss == 'All':
@@ -3494,15 +3494,180 @@ def extract_apogeebot_participants(raw_html: str, report_id: str = "") -> Dict[s
     return out
 
 
-async def _post_uwu_character_json(player: str, spec_idx: int) -> Any:
-    """POST /character with transient-error retry."""
-    url = "https://uwu-logs.xyz/character"
+APOGEEBOT_IGNORED_RANK_BOSSES = {
+    "Gunship",
+    "Gunship Battle",
+    "Valithria Dreamwalker",
+}
+
+
+def _html_attr(tag_html: str, name: str) -> str:
+    """Return one HTML attribute value from an opening tag/attribute blob."""
+    pattern = r"(?is)\b" + re.escape(name) + r"\s*=\s*([\"'])(.*?)\1"
+    m = re.search(pattern, tag_html or "")
+    return html_lib.unescape(m.group(2)).strip() if m else ""
+
+
+def _apogeebot_report_server(report_url: str) -> str:
+    report_id = _apogee_report_id(report_url)
+    parts = [p for p in report_id.split("--") if p]
+    if parts:
+        candidate = parts[-1].strip()
+        if candidate:
+            return candidate
+    return UWU_SERVER
+
+
+def _apogeebot_kill_urls(raw_html: str, report_url: str) -> List[str]:
+    """Extract concrete kill links from an UwU report landing page.
+
+    UwU renders SEGMENTS_KILLS as <a class="... kill-link ..."> links. We use
+    those links directly so wipes and historical character data can never enter
+    ApogeeBot's ranking calculation.
+    """
+    base = canonical_uwu_url(report_url)
+    base_parts = urlsplit(base)
+    found: List[str] = []
+
+    for m in re.finditer(r"(?is)<a\b([^>]*)>(.*?)</a>", raw_html or ""):
+        attrs = m.group(1)
+        classes = _html_attr(attrs, "class").lower().split()
+        if "kill-link" not in classes:
+            continue
+        href = _html_attr(attrs, "href")
+        if not href or "boss=" not in href.lower():
+            continue
+        absolute = urljoin(base, href)
+        parts = urlsplit(absolute)
+        if parts.netloc.lower() not in {"uwu-logs.xyz", "www.uwu-logs.xyz"}:
+            continue
+        if parts.path.rstrip("/") != base_parts.path.rstrip("/"):
+            continue
+        q = parse_qs(parts.query)
+        if not (q.get("boss") and q.get("mode")):
+            continue
+        url = urlunsplit(("https", "uwu-logs.xyz", parts.path, parts.query, ""))
+        if url not in found:
+            found.append(url)
+
+    if found:
+        return found
+
+    # Conservative fallback for a deployment where the CSS class changes:
+    # concrete segment links only, grouped by boss+mode, highest attempt first.
+    grouped: Dict[Tuple[str, str], List[str]] = defaultdict(list)
+    for url in extract_uwu_fight_urls(raw_html, report_url):
+        q = parse_qs(urlsplit(html_lib.unescape(url)).query)
+        boss = (q.get("boss") or [""])[0]
+        mode = (q.get("mode") or [""])[0].upper()
+        if not boss or mode not in {"10N", "10H", "25N", "25H"}:
+            continue
+        if "attempt" not in q or not ("s" in q or "f" in q):
+            continue
+        grouped[(boss, mode)].append(url)
+
+    fallback: List[str] = []
+    for urls in grouped.values():
+        urls.sort(key=lambda u: (_pewpew_attempt_number(u), u), reverse=True)
+        fallback.append(urls[0])
+    return fallback
+
+
+def _apogeebot_fight_name_mode(raw_html: str, fight_url: str) -> Tuple[str, str]:
+    boss = ""
+    mode = ""
+
+    m = re.search(
+        r"(?is)<[^>]+\bid=[\"']slice-name[\"'][^>]*>(.*?)</[^>]+>",
+        raw_html or "",
+    )
+    if m:
+        visible_boss = html_to_text(m.group(1)).strip()
+        boss = normalize_boss(visible_boss) or visible_boss
+
+    m = re.search(
+        r"(?is)<[^>]+\bid=[\"']slice-tries[\"'][^>]*>(.*?)</[^>]+>",
+        raw_html or "",
+    )
+    if m:
+        visible = html_to_text(m.group(1)).upper()
+        mm = re.search(r"\b(10N|10H|25N|25H)\b", visible)
+        if mm:
+            mode = mm.group(1)
+
+    q = parse_qs(urlsplit(html_lib.unescape(fight_url)).query)
+    if not boss:
+        raw_boss = (q.get("boss") or [""])[0]
+        boss = normalize_boss(raw_boss) or _generic_boss_from_uwu_url(fight_url)
+    if not mode:
+        candidate = (q.get("mode") or [""])[0].upper()
+        if candidate in {"10N", "10H", "25N", "25H"}:
+            mode = candidate
+
+    return boss, mode
+
+
+def _apogeebot_parse_number(raw: str) -> Optional[float]:
+    value = html_lib.unescape(raw or "")
+    value = value.replace("\xa0", "").replace(" ", "").strip()
+    if not value:
+        return None
+    if "," in value and "." not in value:
+        value = value.replace(",", ".")
+    value = re.sub(r"[^0-9.+-]", "", value)
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if number >= 0 else None
+
+
+def _apogeebot_rank_input_from_fight(
+    raw_html: str,
+    fight_url: str,
+) -> Tuple[str, str, Dict[str, float], Dict[str, str]]:
+    """Reproduce UwU report_main.js make_rank_data() from server-rendered HTML."""
+    boss, mode = _apogeebot_fight_name_mode(raw_html, fight_url)
+    dps: Dict[str, float] = {}
+    specs: Dict[str, str] = {}
+
+    for row in re.findall(r"(?is)<tr\b[^>]*>.*?</tr>", raw_html or ""):
+        tds = re.findall(r"(?is)<td\b([^>]*)>(.*?)</td>", row)
+        if not tds:
+            continue
+
+        player = ""
+        spec = ""
+        useful_dps: Optional[float] = None
+
+        for attrs, inner in tds:
+            classes = set(_html_attr(attrs, "class").lower().split())
+            if "player-cell" in classes:
+                spec = _html_attr(attrs, "title")
+                anchor = re.search(r"(?is)<a\b[^>]*>(.*?)</a>", inner)
+                candidate = html_to_text(anchor.group(1) if anchor else inner).strip()
+                if candidate.lower() != "total" and WOW_NAME_RE.fullmatch(candidate):
+                    player = candidate
+            elif "useful" in classes and "per-sec-cell" in classes:
+                useful_dps = _apogeebot_parse_number(html_to_text(inner))
+
+        if not player or useful_dps is None or not spec:
+            continue
+        dps[player] = float(useful_dps) + 0.1
+        specs[player] = spec
+
+    return boss, mode, dps, specs
+
+
+async def _post_uwu_rank(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """POST the current kill's DPS/spec table to UwU /rank as JSON."""
+    url = "https://uwu-logs.xyz/rank"
     timeout = aiohttp.ClientTimeout(total=30)
     headers = {
-        "User-Agent": "ApogeeBot/3.0 (+Discord guild tooling)",
+        "User-Agent": "ApogeeBot/9.0 (+Discord guild tooling)",
         "Accept": "application/json,text/plain,*/*",
+        "Content-Type": "application/json",
     }
-    data = {"name": player, "server": UWU_SERVER, "spec": str(spec_idx)}
     transient = {429, 500, 502, 503, 504}
     last_status = None
     last_error = None
@@ -3510,17 +3675,14 @@ async def _post_uwu_character_json(player: str, spec_idx: int) -> Any:
     for attempt in range(5):
         try:
             async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
-                # UwU /character expects application/x-www-form-urlencoded fields.
-                # Sending the same dict as JSON returns HTTP 422.
-                async with session.post(url, data=data, allow_redirects=True) as resp:
-                    text = await resp.text(errors="replace")
+                async with session.post(url, json=payload, allow_redirects=True) as resp:
+                    body = await resp.text(errors="replace")
                     last_status = resp.status
                     if resp.status == 200:
-                        try:
-                            return json.loads(text)
-                        except Exception:
-                            # Some deployments may wrap JSON in whitespace/text.
-                            return json.loads(text.strip())
+                        parsed = json.loads(body)
+                        if not isinstance(parsed, dict):
+                            raise RuntimeError("UwU /rank n'a pas renvoyé un objet JSON")
+                        return parsed
                     if resp.status in transient:
                         retry_raw = resp.headers.get("Retry-After", "")
                         try:
@@ -3531,9 +3693,9 @@ async def _post_uwu_character_json(player: str, spec_idx: int) -> Any:
                             await asyncio.sleep(max(0.6, min(delay, 8.0)))
                             continue
                         break
-                    detail = re.sub(r"\s+", " ", text).strip()[:500]
+                    detail = re.sub(r"\s+", " ", body).strip()[:800]
                     raise RuntimeError(
-                        f"UwU HTTP {resp.status}" + (f": {detail}" if detail else "")
+                        f"UwU /rank HTTP {resp.status}" + (f": {detail}" if detail else "")
                     )
         except (aiohttp.ClientError, asyncio.TimeoutError, json.JSONDecodeError) as exc:
             last_error = exc
@@ -3543,334 +3705,179 @@ async def _post_uwu_character_json(player: str, spec_idx: int) -> Any:
             break
 
     if last_status is not None:
-        raise RuntimeError(f"UwU /character HTTP {last_status} après retries")
+        raise RuntimeError(f"UwU /rank HTTP {last_status} après retries")
     if last_error is not None:
-        raise RuntimeError(f"UwU /character: {type(last_error).__name__}: {last_error}")
-    raise RuntimeError("UwU /character impossible")
+        raise RuntimeError(f"UwU /rank: {type(last_error).__name__}: {last_error}")
+    raise RuntimeError("UwU /rank impossible")
 
 
-# Payload sample dump: only the first successful /character response of the
-# process is logged in full, so Kroma can eyeball the real shape once and
-# confirm/adjust the parsing assumptions below without spamming the console
-# on every subsequent call.
-_APOGEEBOT_PAYLOAD_SAMPLE_LOGGED = False
-
-def _apogeebot_hits_from_character_payload(
-    payload: Any,
-    player: str,
-    current_report_id: str,
+def _apogeebot_hits_from_rank_payload(
+    payload: Dict[str, Any],
+    boss: str,
 ) -> List[PewPewHit]:
-    """
-    Read character Points and keep only personal-best rows whose report ID is
-    the report currently posted in #logs-raid. Old Apogee/UwU messages used
-    100 - Points as the displayed Top X% value.
-
-    IMPORTANT (non vérifié en direct, réseau indisponible dans cet environnement) :
-    d'après les notes de session confirmées contre le repo GitHub d'uwu-logs
-    (c_player_classes.py / top_character.py), le champ `points` renvoyé par
-    /character est une valeur brute où points/100 = pourcentage affiché
-    (ex. 9850 -> 98.50%), et NON déjà une valeur 0..100. La normalisation
-    ci-dessous applique donc /100 quand la valeur brute dépasse 100, et laisse
-    la valeur telle quelle sinon (au cas où un déploiement renverrait déjà un
-    pourcentage 0..100 pour un champ différemment nommé). Si le premier dump
-    de payload réel (voir dkp_debug ci-dessous) montre un format différent,
-    ajuster `_normalize_points_field` en conséquence.
-    """
-    global _APOGEEBOT_PAYLOAD_SAMPLE_LOGGED
-    if not _APOGEEBOT_PAYLOAD_SAMPLE_LOGGED:
-        dkp_debug(
-            "APOGEEBOT /character PAYLOAD ECHANTILLON (premier appel du process)",
-            {"player": player, "current_report_id": current_report_id, "payload": payload},
-        )
-        _APOGEEBOT_PAYLOAD_SAMPLE_LOGGED = True
-
-    def _normalize_points_field(raw: float) -> Optional[float]:
-        """Convert a raw /character `points`-like field to a 0..100 percentage."""
-        if raw is None:
-            return None
-        if raw > 100.0:
-            # Raw score format confirmed against uwu-logs source: /100 = %.
-            value = raw / 100.0
-        else:
-            value = raw
-        return value if 0.0 <= value <= 100.0 else None
-
-    found: Dict[Tuple[str, str], PewPewHit] = {}
-    current_low = current_report_id.lower()
-
-    def add_candidate(boss: str, raw_points: Optional[float], report_id: str) -> None:
-        if not boss or raw_points is None:
-            return
-        points = _normalize_points_field(raw_points)
-        if points is None:
-            return
-        if not report_id or report_id.lower() != current_low:
-            return
-        top = max(0.0, min(100.0, 100.0 - points))
-        if top > 33.0001:
-            return
-        key = (player.lower(), boss)
-        hit = PewPewHit(
-            player=player,
-            boss=boss,
-            top_percent=top,
-            points=points,
-            server_best=(points >= 99.995),
-        )
-        old = found.get(key)
-        if old is None or hit.top_percent < old.top_percent:
-            found[key] = hit
-
-    # Dict-shaped API rows.
-    for d in walk_dicts(payload):
-        values = list(d.values())
-        blob = " ".join(str(v) for v in values if isinstance(v, (str, int, float)))
-        boss = ""
-        for key in ("boss", "bossName", "fight", "fightName", "encounter", "encounterName", "name"):
-            if key in d:
-                boss = normalize_boss(str(d[key]))
-                if boss:
-                    break
-        if not boss:
-            boss = normalize_boss(blob)
-
-        report_id = ""
-        for key in ("reportId", "report_id", "report", "reportName", "report_name", "log", "logId", "url"):
-            if key in d:
-                report_id = _extract_report_id_from_text(str(d[key])) or str(d[key]).strip().strip("/").split("/")[-1]
-                if report_id:
-                    break
-        if not report_id:
-            report_id = _extract_report_id_from_text(blob)
-
-        raw_points = None
-        for key in ("points", "performancePoints", "performance_points", "playerPoints", "player_points", "score", "performance"):
-            if key in d:
-                n = _numeric(d[key])
-                if n is not None and n >= 0:
-                    raw_points = n
-                    break
-        add_candidate(boss, raw_points, report_id)
-
-    # List-shaped rows: [Boss, Points, ..., ReportId, ...].
-    def walk_lists(obj: Any) -> Iterable[List[Any]]:
-        if isinstance(obj, list):
-            yield obj
-            for v in obj:
-                yield from walk_lists(v)
-        elif isinstance(obj, dict):
-            for v in obj.values():
-                yield from walk_lists(v)
-
-    for arr in walk_lists(payload):
-        if not (3 <= len(arr) <= 20):
+    hits: List[PewPewHit] = []
+    for player, raw in payload.items():
+        if not WOW_NAME_RE.fullmatch(str(player)) or not isinstance(raw, dict):
             continue
-        boss = ""
-        report_id = ""
-        numeric: List[float] = []
-        for v in arr:
-            if isinstance(v, str):
-                if not boss:
-                    boss = normalize_boss(v)
-                if not report_id:
-                    report_id = _extract_report_id_from_text(v)
-            elif isinstance(v, (int, float)):
-                numeric.append(float(v))
-        # The Points-like field is normally the largest positive numeric
-        # value in the row; other numerics (rank, attempt index) are smaller.
-        raw_points = max(numeric) if numeric else None
-        add_candidate(boss, raw_points, report_id)
-
-    return list(found.values())
-
-
-async def _apogeebot_character_hits(
-    player: str,
-    preferred_tree: int,
-    current_report_id: str,
-) -> Tuple[List[PewPewHit], int]:
-    order = []
-    if preferred_tree in (1, 2, 3):
-        order.append(preferred_tree)
-    order.extend(i for i in (1, 2, 3) if i not in order)
-
-    queries = 0
-    all_hits: List[PewPewHit] = []
-    for spec_idx in order:
-        payload = await _post_uwu_character_json(player, spec_idx)
-        queries += 1
-        hits = _apogeebot_hits_from_character_payload(payload, player, current_report_id)
-        if hits:
-            all_hits.extend(hits)
-            # A report's personal-best rows belong to the active spec; no need
-            # to hammer the two remaining specs once current-report hits exist.
-            break
-        await asyncio.sleep(0.08)
-    return all_hits, queries
-
-
-APOGEEBOT_JS_DEBUGGED: set = set()
-
-
-def _resolve_uwu_asset_url(page_url: str, asset: str) -> str:
-    asset = html_lib.unescape((asset or "").strip())
-    if not asset:
-        return ""
-    return urljoin(page_url, asset)
-
-
-def _js_relevant_snippets(js_text: str) -> List[str]:
-    out: List[str] = []
-    pattern = re.compile(
-        r"(?i)(add-player-rank|points-rank|points-dps|fetch\s*\(|XMLHttpRequest|"
-        r"performancePoints|performance_points|rankPercent|rank_percent|"
-        r"/rank|/ranking|/points|dpsPercent|dps_percent)"
-    )
-    for m in pattern.finditer(js_text or ""):
-        a = max(0, m.start() - 360)
-        b = min(len(js_text), m.end() + 900)
-        snippet = re.sub(r"\s+", " ", js_text[a:b])
-        if snippet not in out:
-            out.append(snippet[:1500])
-        if len(out) >= 12:
-            break
-    return out
-
-
-async def _apogeebot_debug_external_js(page_url: str, raw_html: str) -> None:
-    """DEAD CODE (conservé pour référence) : n'est plus appelé depuis que
-    build_pewpew_report n'analyse plus les fight pages HTML."""
-    report_id = _extract_report_id_from_text(page_url) or canonical_uwu_url(page_url)
-    if report_id in APOGEEBOT_JS_DEBUGGED:
-        return
-    APOGEEBOT_JS_DEBUGGED.add(report_id)
-
-    srcs: List[str] = []
-    for m in re.finditer(
-        r"(?is)<script\\b[^>]*\\bsrc\\s*=\\s*[\"']([^\"']+)[\"'][^>]*>",
-        raw_html,
-    ):
-        resolved = _resolve_uwu_asset_url(page_url, m.group(1))
-        if resolved and resolved not in srcs:
-            srcs.append(resolved)
-
-    print(f"[APOGEEBOT JS] {len(srcs)} script(s) externe(s) détecté(s)")
-    dkp_debug(
-        "APOGEEBOT JS SOURCES",
-        {"page": page_url, "scripts": srcs[:30]},
-    )
-
-    for js_url in srcs[:12]:
-        try:
-            final_url, js_text = await _fetch_uwu_with_retry(
-                js_url,
-                "ApogeeBot/6.1 (+ranking JS debug)",
+        percentile = _numeric(raw.get("percentile"))
+        if percentile is None or not 0.0 <= percentile <= 100.0:
+            continue
+        top_percent = max(0.0, min(100.0, 100.0 - float(percentile)))
+        if top_percent > 33.0001:
+            continue
+        rank = _numeric(raw.get("rank"))
+        hits.append(
+            PewPewHit(
+                player=str(player),
+                boss=boss,
+                top_percent=top_percent,
+                points=float(percentile),
+                server_best=(rank == 1 or percentile >= 99.995),
             )
-            snippets = _js_relevant_snippets(js_text)
-            if not snippets:
-                continue
-
-            print(
-                f"[APOGEEBOT JS] MATCH {final_url}: "
-                f"{len(snippets)} extrait(s)"
-            )
-            dkp_debug(
-                "APOGEEBOT JS MATCH",
-                {
-                    "url": final_url,
-                    "chars": len(js_text),
-                    "snippets": snippets,
-                },
-            )
-        except Exception as exc:
-            print(
-                f"[APOGEEBOT JS] ECHEC {js_url}: "
-                f"{type(exc).__name__}: {exc}"
-            )
-
-
-def _pewpew_candidate_fight_urls(urls: List[str]) -> List[str]:
-    unique=list(dict.fromkeys(urls))
-    concrete=[]; generic=[]
-    for url in unique:
-        q=parse_qs(urlsplit(html_lib.unescape(url)).query)
-        if 'attempt' in q and ('s' in q or 'f' in q):
-            concrete.append(url)
-        else:
-            generic.append(url)
-    concrete.sort(key=lambda u: (_pewpew_attempt_number(u),u), reverse=True)
-    generic.sort(key=_fight_url_priority)
-    return (concrete+generic)[:max(1,UWU_PEWPEW_MAX_FIGHTS_PER_BOSS)]
+        )
+    return hits
 
 
 async def build_pewpew_report(report_url: str) -> Tuple[str, Dict[str, int]]:
-    """Build ApogeeBot via l'API UwU /character (même approche que DKPARSE).
+    """Rank each player's performance in each KILL of the posted UwU report.
 
-    On ne scrape plus le HTML des fight pages pour les Points : cette donnée
-    est calculée côté client par UwU et n'existe jamais dans le HTML brut
-    renvoyé par le serveur (d'où les cellules points-rank / points-dps
-    systématiquement vides observées en debug le 16/08/2026).
+    This deliberately ignores personal-best history. For every kill page we
+    reproduce UwU's own report_main.js request to POST /rank using the Useful
+    DPS and spec visible in that kill.
     """
     report_url = canonical_uwu_url(report_url)
-    final_url, raw_html = await _fetch_uwu_with_retry(
-        report_url, 'ApogeeBot/5.0 (+Discord guild tooling)'
+    final_url, landing_html = await _fetch_uwu_with_retry(
+        report_url, "ApogeeBot/9.0 (+report rank)"
     )
     report_url = canonical_uwu_url(final_url)
-    current_report_id = _apogee_report_id(report_url)
+    report_id = _apogee_report_id(report_url)
+    server = _apogeebot_report_server(report_url)
+    kill_urls = _apogeebot_kill_urls(landing_html, report_url)
 
-    participants = extract_apogeebot_participants(raw_html, current_report_id)
-
-    stats = {
-        'participants': len(participants),
-        'queries': 0,
-        'players_ok': 0,
-        'players_failed': 0,
-        'players_with_hits': 0,
-        'hits': 0,
+    stats: Dict[str, int] = {
+        "participants": 0,
+        "queries": 0,
+        "players_ok": 0,
+        "players_failed": 0,
+        "players_with_hits": 0,
+        "hits": 0,
+        "kills_detected": len(kill_urls),
+        "kills_ranked": 0,
+        "kills_failed": 0,
     }
 
-    if not participants or not current_report_id:
-        return '', stats
+    if not report_id or not kill_urls:
+        print(f"[APOGEEBOT] Aucun kill exploitable détecté dans {report_id or report_url}")
+        return "", stats
 
-    # Récupère la casse d'affichage d'origine pour chaque joueur.
-    display_names: Dict[str, str] = {}
-    for row in re.findall(r"(?is)<tr\b[^>]*>.*?</tr>", raw_html):
-        cells = _html_cells(row)
-        if not cells:
-            continue
-        name = _extract_player_name_from_html_row(row, cells)
-        if name:
-            display_names.setdefault(name.lower(), name)
-
+    all_participants: set = set()
+    all_ranked_players: set = set()
     hits: List[PewPewHit] = []
 
-    for player_low, tree_idx in participants.items():
-        player = display_names.get(player_low, player_low.capitalize())
-        try:
-            player_hits, queries = await _apogeebot_character_hits(
-                player, tree_idx, current_report_id
-            )
-            stats['queries'] += queries
-            stats['players_ok'] += 1
-            if player_hits:
-                stats['players_with_hits'] += 1
-                hits.extend(player_hits)
-                print(
-                    f"[APOGEEBOT] {player}: {len(player_hits)} résultat(s) Top 33 "
-                    f"(report {current_report_id})"
-                )
-        except Exception as exc:
-            stats['players_failed'] += 1
-            print(f"[APOGEEBOT] ECHEC {player}: {type(exc).__name__}: {exc}")
-            dkp_debug(
-                "APOGEEBOT CHARACTER ECHEC",
-                {"player": player, "error": f"{type(exc).__name__}: {exc}"},
-            )
-        await asyncio.sleep(0.15)
+    print(f"[APOGEEBOT] {len(kill_urls)} kill(s) détecté(s) dans {report_id}")
 
-    stats['hits'] = len(hits)
+    for index, fight_url in enumerate(kill_urls, start=1):
+        boss_hint, mode_hint = _apogeebot_fight_name_mode("", fight_url)
+        try:
+            _final, fight_html = await _fetch_uwu_with_retry(
+                fight_url, "ApogeeBot/9.0 (+kill rank)"
+            )
+            boss, mode, dps, specs = _apogeebot_rank_input_from_fight(fight_html, fight_url)
+            boss = boss or boss_hint
+            mode = mode or mode_hint
+
+            if boss in APOGEEBOT_IGNORED_RANK_BOSSES:
+                print(f"[APOGEEBOT] SKIP {boss}: boss non classé par UwU /rank")
+                continue
+            if not boss or mode not in {"10N", "10H", "25N", "25H"}:
+                raise RuntimeError(f"boss/mode illisible ({boss!r}, {mode!r})")
+            if not dps or not specs:
+                raise RuntimeError("aucun Useful DPS + spec extrait de la page du kill")
+
+            all_participants.update(name.lower() for name in dps)
+            rank_payload = {
+                "server": server,
+                "boss": boss,
+                "mode": mode,
+                "dps": dps,
+                "specs": specs,
+            }
+            dkp_debug(
+                "APOGEEBOT /rank INPUT",
+                {
+                    "kill": index,
+                    "boss": boss,
+                    "mode": mode,
+                    "players": len(dps),
+                    "url": fight_url,
+                    "sample": {
+                        name: {"dps": dps[name], "spec": specs.get(name, "")}
+                        for name in list(dps)[:5]
+                    },
+                },
+            )
+
+            rank_data = await _post_uwu_rank(rank_payload)
+            stats["queries"] += 1
+            stats["kills_ranked"] += 1
+            all_ranked_players.update(
+                str(name).lower()
+                for name, value in rank_data.items()
+                if isinstance(value, dict)
+            )
+
+            kill_hits = _apogeebot_hits_from_rank_payload(rank_data, boss)
+            hits.extend(kill_hits)
+            print(
+                f"[APOGEEBOT] {boss} {mode}: {len(rank_data)} joueur(s) classé(s), "
+                f"{len(kill_hits)} résultat(s) Top 33"
+            )
+            dkp_debug(
+                "APOGEEBOT /rank OUTPUT",
+                {
+                    "boss": boss,
+                    "mode": mode,
+                    "ranked": len(rank_data),
+                    "top33": [
+                        {
+                            "player": h.player,
+                            "percentile": h.points,
+                            "top_percent": h.top_percent,
+                        }
+                        for h in kill_hits
+                    ],
+                },
+            )
+        except Exception as exc:
+            stats["kills_failed"] += 1
+            print(
+                f"[APOGEEBOT] ECHEC KILL {boss_hint or '?'} {mode_hint or '?'}: "
+                f"{type(exc).__name__}: {exc}"
+            )
+            dkp_debug(
+                "APOGEEBOT KILL ECHEC",
+                {
+                    "url": fight_url,
+                    "boss": boss_hint,
+                    "mode": mode_hint,
+                    "error": f"{type(exc).__name__}: {exc}",
+                },
+            )
+        await asyncio.sleep(0.12)
+
+    stats["participants"] = len(all_participants)
+    stats["players_ok"] = len(all_ranked_players)
+    stats["players_failed"] = max(0, len(all_participants - all_ranked_players))
+    stats["players_with_hits"] = len({h.player.lower() for h in hits})
+    stats["hits"] = len(hits)
+
+    if stats["kills_ranked"] <= 0:
+        print(f"[APOGEEBOT] Aucun kill n'a pu être classé via /rank pour {report_id}")
+        return "", stats
+
     if not hits:
-        print(f"[APOGEEBOT] Aucun Top 33 exploitable pour le rapport {current_report_id}")
+        print(f"[APOGEEBOT] Aucun Top 33 dans les kills classés du rapport {report_id}")
+        return "", stats
 
     return format_pewpew_report(hits), stats
 
@@ -3960,12 +3967,13 @@ async def handle_uwu_pewpew_message(
                     )
                     continue
 
-                if stats["players_ok"] <= 0:
+                if stats.get("kills_ranked", 0) <= 0:
                     final_status = "⚠️"
                     await message.reply(
-                        "⚠️ **ApogeeBot : rapport détecté, mais l'API UwU "
-                        "/character n'a pu être interrogée pour aucun joueur.**\n"
-                        f"Joueurs en échec : {stats['players_failed']}. "
+                        "⚠️ **ApogeeBot : rapport détecté, mais aucun kill "
+                        "n'a pu être classé via l'API UwU `/rank`.**\n"
+                        f"Kills détectés : {stats.get('kills_detected', 0)} — "
+                        f"échecs : {stats.get('kills_failed', 0)}. "
                         "Le rapport n'est pas marqué comme traité.",
                         mention_author=False,
                         allowed_mentions=discord.AllowedMentions.none(),
@@ -3988,18 +3996,10 @@ async def handle_uwu_pewpew_message(
                                 allowed_mentions=discord.AllowedMentions.none(),
                             )
                 else:
-                    final_status = "⚠️"
-                    await message.reply(
-                        "⚠️ **ApogeeBot : rapport lu, mais aucun classement Top 33 "
-                        "n'a pu être extrait avec certitude.**\n"
-                        "Le rapport **n'est pas marqué comme traité**. "
-                        "La console `[APOGEEBOT]` affiche le détail par joueur, et "
-                        "le premier payload `/character` de la session est dumpé "
-                        "en entier si DKPARSE_DEBUG=true.",
-                        mention_author=False,
-                        allowed_mentions=discord.AllowedMentions.none(),
+                    # Analyse valide : /rank a répondu, mais personne n'est Top 33.
+                    print(
+                        f"[APOGEEBOT] Rapport classé correctement, aucun Top 33: {canonical}"
                     )
-                    continue
 
                 PEWPEW_SEEN_REPORTS.add(canonical)
                 _save_pewpew_seen()
@@ -4292,7 +4292,7 @@ async def on_ready():
     print(f"#dkparse channel ID: {DKPARSE_CHANNEL_ID or 'NON CONFIGURE'}")
     print(f"DKPARSE window: {DKPARSE_MAX_DAYS} jours")
     print("DKPARSE OCR: " + ("RapidOCR OK" if (RapidOCR is not None and Image is not None and np is not None) else "INDISPONIBLE"))
-    print(f"ApogeeBot: {'ACTIVE' if UWU_PEWPEW_ENABLED else 'DESACTIVE'} (via API /character)")
+    print(f"ApogeeBot: {'ACTIVE' if UWU_PEWPEW_ENABLED else 'DESACTIVE'} (kills du rapport via API /rank)")
 
 
 @bot.event
