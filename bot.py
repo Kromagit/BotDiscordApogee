@@ -3495,32 +3495,42 @@ def extract_apogeebot_participants(raw_html: str, report_id: str = "") -> Dict[s
 
 
 async def _post_uwu_character_json(player: str, spec_idx: int) -> Any:
-    """POST /character with transient-error retry."""
-    url = "https://uwu-logs.xyz/character"
+    """Read UwU character data: GET endpoint first, POST JSON fallback."""
     timeout = aiohttp.ClientTimeout(total=30)
     headers = {
         "User-Agent": "ApogeeBot/3.0 (+Discord guild tooling)",
         "Accept": "application/json,text/plain,*/*",
     }
-    data = {"name": player, "server": UWU_SERVER, "spec": str(spec_idx)}
+    spec_value = int(spec_idx) if str(spec_idx).isdigit() else 0
+    get_url = f"https://uwu-logs.xyz/character/{UWU_SERVER}/{player}/{spec_value}"
+    post_url = "https://uwu-logs.xyz/character"
+    post_data = {
+        "server": UWU_SERVER,
+        "name": player,
+        "spec_i": spec_value,
+    }
     transient = {429, 500, 502, 503, 504}
     last_status = None
     last_error = None
+    last_detail = ""
 
     for attempt in range(5):
         try:
             async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
-                # UwU /character expects application/x-www-form-urlencoded fields.
-                # Sending the same dict as JSON returns HTTP 422.
-                async with session.post(url, data=data, allow_redirects=True) as resp:
+                # UwU exposes a native GET endpoint for character data.
+                # This avoids body-validation issues entirely.
+                async with session.get(get_url, allow_redirects=True) as resp:
                     text = await resp.text(errors="replace")
                     last_status = resp.status
                     if resp.status == 200:
                         try:
                             return json.loads(text)
                         except Exception:
-                            # Some deployments may wrap JSON in whitespace/text.
                             return json.loads(text.strip())
+
+                    last_detail = re.sub(r"\s+", " ", text).strip()[:500]
+
+                    # Retry immediately only for transient GET failures.
                     if resp.status in transient:
                         retry_raw = resp.headers.get("Retry-After", "")
                         try:
@@ -3530,11 +3540,40 @@ async def _post_uwu_character_json(player: str, spec_idx: int) -> Any:
                         if attempt < 4:
                             await asyncio.sleep(max(0.6, min(delay, 8.0)))
                             continue
-                        break
-                    detail = re.sub(r"\s+", " ", text).strip()[:500]
+
+                # Fallback: official POST endpoint with an actual JSON object.
+                # CharacterValidation's canonical field is spec_i.
+                async with session.post(
+                    post_url,
+                    json=post_data,
+                    allow_redirects=True,
+                ) as resp:
+                    text = await resp.text(errors="replace")
+                    last_status = resp.status
+                    if resp.status == 200:
+                        try:
+                            return json.loads(text)
+                        except Exception:
+                            return json.loads(text.strip())
+
+                    last_detail = re.sub(r"\s+", " ", text).strip()[:500]
+                    if resp.status in transient:
+                        retry_raw = resp.headers.get("Retry-After", "")
+                        try:
+                            delay = float(retry_raw)
+                        except Exception:
+                            delay = 0.8 * (2 ** attempt)
+                        if attempt < 4:
+                            await asyncio.sleep(max(0.6, min(delay, 8.0)))
+                            continue
+
                     raise RuntimeError(
-                        f"UwU HTTP {resp.status}" + (f": {detail}" if detail else "")
+                        f"UwU HTTP {resp.status}"
+                        + (f": {last_detail}" if last_detail else "")
                     )
+
+        except RuntimeError:
+            raise
         except (aiohttp.ClientError, asyncio.TimeoutError, json.JSONDecodeError) as exc:
             last_error = exc
             if attempt < 4:
@@ -3543,7 +3582,10 @@ async def _post_uwu_character_json(player: str, spec_idx: int) -> Any:
             break
 
     if last_status is not None:
-        raise RuntimeError(f"UwU /character HTTP {last_status} après retries")
+        raise RuntimeError(
+            f"UwU /character HTTP {last_status} après retries"
+            + (f": {last_detail}" if last_detail else "")
+        )
     if last_error is not None:
         raise RuntimeError(f"UwU /character: {type(last_error).__name__}: {last_error}")
     raise RuntimeError("UwU /character impossible")
