@@ -3998,20 +3998,30 @@ def _character_report_improvements(
 ) -> List[ParseImprovement]:
     """Detect personal bests made in the posted heroic raid.
 
-    Primary proof is UwU's character `report_id`. As a robust fallback, the
-    current kill's Useful DPS may equal the character endpoint's `dps_max`;
-    that field is UwU's best DPS row for the player/spec/boss.
+    CONFIRMÉ le 16/08/2026 contre un vrai payload `/character` (dump complet
+    en DKPARSE_DEBUG, joueur Baldursex) : le payload a bien la forme attendue
+    (`{"bosses": {BossName: {report_id, dps_max, ...}}}`). Le bug n'était pas
+    la forme du payload mais l'hypothèse de matching :
 
-    IMPORTANT (non vérifié en direct, réseau indisponible dans cet
-    environnement) : la forme exacte du payload `/character` (clé `bosses`,
-    noms de champs `report_id`/`dps_max`) n'a jamais été confirmée contre une
-    vraie réponse d'uwu-logs.xyz. Un cas concret a été observé le 16/08/2026
-    (Fireland, amélioration confirmée sur Blood-Queen Lana'thel, non détectée
-    par le bot) : ni `same_report` ni `same_best_dps` n'ont matché alors que
-    la clé (joueur, boss) existait bien dans `current_percentiles`. Les logs
-    ci-dessous existent pour capturer précisément ce cas au prochain run réel
-    avec DKPARSE_DEBUG=true, plutôt que de deviner un nouveau nom de champ à
-    l'aveugle.
+    Plusieurs membres de la guilde uploadent chacun leur propre combat log du
+    MÊME raid vers uwu-logs (ex. Fireland à 21:00, Greenks à 21:00, Belladen à
+    21:13 — même soirée). Chaque upload génère un `report_id` différent (il
+    encode le nom de l'uploader), mais c'est physiquement le même combat, donc
+    le DPS calculé diffère très légèrement d'un upload à l'autre (écarts vus
+    en pratique : jusqu'à ~30 DPS sur ~42800, soit ~0.07% — bien au-delà de
+    l'ancienne tolérance absolue de 0.25). Résultat : `same_report` échoue
+    presque toujours (report_id différent) et `same_best_dps` échouait aussi
+    (tolérance trop stricte), alors que la clé (joueur, boss) était bien celle
+    du raid posté.
+
+    Nouveau critère : la source du meilleur score du joueur est considérée
+    comme CE raid si (a) le report_id reçu date du même jour calendaire que le
+    report posté (8 premiers caractères, format YY-MM-DD) ET (b) le dps_max
+    est proche du DPS de ce soir à 1% relatif près (avec un plancher absolu
+    pour les très petits DPS). Une correspondance exacte de report_id reste
+    acceptée directement. Ce double critère reste sûr : les anciens raids
+    (mêmes joueurs, dates différentes) montrent des écarts de DPS de plusieurs
+    milliers, donc pas de faux positif observé dans le dump du 16/08/2026.
     """
     bosses = payload.get("bosses")
     if not isinstance(bosses, dict):
@@ -4051,21 +4061,31 @@ def _character_report_improvements(
             continue
 
         same_report = bool(report_id) and report_id.lower() == report_low
+
+        # Report-id date prefix, format YY-MM-DD--HH-MM--Uploader--Server.
+        recv_date = report_id[:8] if len(report_id) >= 8 else ""
+        posted_date = current_report_id[:8] if len(current_report_id) >= 8 else ""
+        same_date = bool(recv_date) and bool(posted_date) and recv_date == posted_date
+
         best_dps = _numeric(raw.get("dps_max"))
         raid_dps = current_dps.get(key)
-        # report_main.js submits displayed Useful DPS +0.1; allow a tiny rounding
-        # tolerance against /character's more precise dps_max.
-        same_best_dps = (
-            best_dps is not None
-            and raid_dps is not None
-            and abs(float(best_dps) - float(raid_dps)) <= 0.25
-        )
+        # Multiple guild members can each upload their own log of the SAME
+        # raid, producing different report_id values for the same physical
+        # combat with a slightly different computed DPS (confirmed against a
+        # real payload on 16/08/2026: ~0.07% gap, e.g. 42848.99 vs 42818.4).
+        # 1% relative tolerance (with a small absolute floor for very low
+        # DPS) absorbs this without conflating it with a genuinely different,
+        # older raid, where observed DPS gaps are in the thousands.
+        same_best_dps = False
+        if best_dps is not None and raid_dps is not None and raid_dps > 0:
+            rel_diff = abs(float(best_dps) - float(raid_dps)) / float(raid_dps)
+            same_best_dps = rel_diff <= 0.01 or abs(float(best_dps) - float(raid_dps)) <= 1.0
 
-        if not (same_report or same_best_dps):
+        same_raid = same_date and same_best_dps
+
+        if not (same_report or same_raid):
             # Clé qu'on savait pertinente (le joueur a fait ce boss ce soir),
-            # mais aucun critère ne matche : c'est précisément le cas qu'il
-            # faut pouvoir inspecter (ex. Fireland / Blood-Queen Lana'thel
-            # observé le 16/08/2026).
+            # mais aucun critère ne matche : cas à inspecter.
             dkp_debug(
                 "ANALYSE LOG AMELIORATION NON DETECTEE (clé attendue mais aucun critère matché)",
                 {
@@ -4073,6 +4093,7 @@ def _character_report_improvements(
                     "boss": boss,
                     "report_id_recu": report_id,
                     "report_id_poste": current_report_id,
+                    "meme_date": same_date,
                     "dps_max_recu": best_dps,
                     "raid_dps": raid_dps,
                     "raw_boss_entry": raw,
@@ -4080,9 +4101,9 @@ def _character_report_improvements(
             )
             continue
 
-        if same_best_dps and not same_report:
+        if same_raid and not same_report:
             dkp_debug(
-                "ANALYSE LOG AMELIORATION DPS_MAX",
+                "ANALYSE LOG AMELIORATION MEME RAID (report_id différent, même soirée)",
                 {
                     "player": player,
                     "boss": boss,
