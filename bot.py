@@ -1676,6 +1676,23 @@ def report_date_from_url(url: str) -> Optional[datetime]:
         return None
 
 
+_REPORT_ID_DATE_RE = re.compile(r"^(\d{2})-(\d{2})-(\d{2})")
+
+
+def _report_id_date(report_id: str):
+    """Parse the YY-MM-DD prefix of a report_id (not a full URL) as a real date."""
+    if not report_id:
+        return None
+    m = _REPORT_ID_DATE_RE.match(report_id)
+    if not m:
+        return None
+    yy, mm, dd = map(int, m.groups())
+    try:
+        return datetime(2000 + yy, mm, dd, tzinfo=timezone.utc).date()
+    except ValueError:
+        return None
+
+
 def extract_uwu_urls(text: str) -> List[str]:
     out, seen = [], set()
     for raw in UWU_URL_RE.findall(text or ""):
@@ -4684,9 +4701,21 @@ def _character_report_improvements(
         same_report = bool(report_id) and report_id.lower() == report_low
 
         # Report-id date prefix, format YY-MM-DD--HH-MM--Uploader--Server.
-        recv_date = report_id[:8] if len(report_id) >= 8 else ""
-        posted_date = current_report_id[:8] if len(current_report_id) >= 8 else ""
-        same_date = bool(recv_date) and bool(posted_date) and recv_date == posted_date
+        # Comparaison en VRAIES dates (pas en egalite de chaine) avec une
+        # tolerance de +/-1 jour calendaire : un raid qui traverse minuit
+        # (un uploadeur log a 23h58, un autre log le meme combat physique a
+        # 00h05 le lendemain) donnait deux prefixes YY-MM-DD differents et
+        # faisait rater same_date a tort, meme si c'est objectivement le
+        # meme soir de raid. Vu en pratique : Fireland/BPC 99.15% (Classement
+        # du raid, base sur /character sans cette verification) absent des
+        # Parses ameliorees (qui l'exigent) le 18/08/2026.
+        recv_date_obj = _report_id_date(report_id)
+        posted_date_obj = _report_id_date(current_report_id)
+        same_date = (
+            recv_date_obj is not None
+            and posted_date_obj is not None
+            and abs((recv_date_obj - posted_date_obj).days) <= 1
+        )
 
         best_dps = _numeric(raw.get("dps_max"))
         raid_dps = current_dps.get(key)
