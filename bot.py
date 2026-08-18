@@ -136,6 +136,11 @@ GRADE_ROLE_ORDER: Tuple[str, ...] = (
     "Initié",
 )
 
+DM_UNRECOGNIZED = (
+    "Message automatique Apogee :\n"
+    "Tu es inscrit pour un évent Apogee mais tu n'as pas ou mal saisi "
+    "le nom de ton main en guilde dans le #Main."
+)
 
 DM_BAD_MAIN = (
     "Message automatique Apogee :\n"
@@ -638,47 +643,47 @@ def can_use_admin(interaction: discord.Interaction) -> bool:
     )
 
 
+async def dm_unrecognized(guild: discord.Guild, signup: Signup) -> str:
+    """DEAD CODE (conservée pour référence) : Export inscrit n'envoie plus de MP
+    aux joueurs non reconnus, il se contente de les lister par tag Discord."""
+    member = guild.get_member(signup.user_id)
+    if member is None:
+        try:
+            member = await guild.fetch_member(signup.user_id)
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+            return "membre introuvable"
+    try:
+        await member.send(DM_UNRECOGNIZED)
+        return "DM envoyé"
+    except discord.Forbidden:
+        return "DM impossible"
+    except discord.HTTPException:
+        return "erreur DM"
 
 
 def split_discord_text(text: str, max_len: int = 1900) -> List[str]:
-    """Découpe sans casser les blocs ```ansi ... ``` utilisés par Analyse Log."""
     if len(text) <= max_len:
         return [text]
-
-    lines = text.splitlines()
-    blocks: List[str] = []
-    i = 0
-    while i < len(lines):
-        if lines[i].startswith("```"):
-            current = [lines[i]]
-            i += 1
-            while i < len(lines):
-                current.append(lines[i])
-                if lines[i].startswith("```"):
-                    i += 1
-                    break
-                i += 1
-            blocks.append("\n".join(current))
-        else:
-            blocks.append(lines[i])
-            i += 1
-
     chunks: List[str] = []
     current = ""
-    for block in blocks:
-        pieces = [block] if len(block) <= max_len else [
-            block[j:j + max_len] for j in range(0, len(block), max_len)
-        ]
-        for piece in pieces:
-            candidate = piece if not current else current + "\n" + piece
-            if len(candidate) <= max_len:
-                current = candidate
-            else:
-                if current:
-                    chunks.append(current)
-                current = piece
+    in_fence = False
+
+    for line in text.splitlines():
+        candidate = line if not current else current + "\n" + line
+        if len(candidate) > max_len:
+            if current:
+                if in_fence:
+                    current += "\n```"
+                chunks.append(current)
+            current = ("```ansi\n" + line) if in_fence else line
+        else:
+            current = candidate
+        if line.strip().startswith("```"):
+            in_fence = not in_fence
 
     if current:
+        if in_fence:
+            current += "\n```"
         chunks.append(current)
     return chunks
 
@@ -735,7 +740,6 @@ async def run_rh_list(interaction: discord.Interaction, message: discord.Message
                 grouped[s.status].append(main)
                 export_items.append(f"{main}:{STATUS_CODES.get(s.status, 'U')}")
             else:
-                # Non reconnu : aucun MP Discord, uniquement le tag dans le rapport.
                 unrecognized.append(s)
 
         lines = [f"**{event_title}**", ""]
@@ -3139,111 +3143,6 @@ def _analyse_log_boss_sort_key(boss: str) -> Tuple[int, str]:
     )
 
 
-# Couleurs ANSI prises en charge par Discord.
-ANSI_RESET = "\x1b[0m"
-
-ANALYSE_LOG_CLASS_ANSI = {
-    "deathknight": "1;31",
-    "druid": "33",
-    "hunter": "1;32",
-    "mage": "1;36",
-    "paladin": "1;35",
-    "priest": "1;37",
-    "rogue": "1;33",
-    "shaman": "1;34",
-    "warlock": "35",
-    "warrior": "33",
-}
-
-ANALYSE_LOG_TRACKED_SPEC_CLASS = {
-    "fwar": "warrior",
-    "combat": "rogue",
-    "ret": "paladin",
-    "uh": "deathknight",
-    "feraldps": "druid",
-    "magefeu": "mage",
-    "boomie": "druid",
-    "sp": "priest",
-    "démono": "warlock",
-    "demono": "warlock",
-    "mm": "hunter",
-}
-
-
-def _analyse_log_ansi(value: str, code: str) -> str:
-    return f"\x1b[{code}m{value}{ANSI_RESET}"
-
-
-def _analyse_log_class_from_spec(spec: str) -> str:
-    s = re.sub(r"\s+", " ", html_lib.unescape(spec or "").strip().lower())
-    compact = s.replace(" ", "")
-    if compact in ANALYSE_LOG_TRACKED_SPEC_CLASS:
-        return ANALYSE_LOG_TRACKED_SPEC_CLASS[compact]
-
-    for token, class_name in (
-        ("death knight", "deathknight"),
-        ("warrior", "warrior"),
-        ("paladin", "paladin"),
-        ("hunter", "hunter"),
-        ("priest", "priest"),
-        ("druid", "druid"),
-        ("rogue", "rogue"),
-        ("mage", "mage"),
-        ("shaman", "shaman"),
-        ("warlock", "warlock"),
-    ):
-        if token in s:
-            return class_name
-    return ""
-
-
-def _analyse_log_colored_player(name: str, spec: str) -> str:
-    class_name = _analyse_log_class_from_spec(spec)
-    return _analyse_log_ansi(name, ANALYSE_LOG_CLASS_ANSI.get(class_name, "1;37"))
-
-
-def _analyse_log_colored_parse(percentile: float, server_best: bool = False) -> str:
-    """Paliers visuels UwU : gris/vert/bleu/violet/orange/rose/or."""
-    value = float(percentile)
-    if server_best or value >= 100.0 - 1e-9:
-        code = "1;33"
-    elif value >= 99.0:
-        code = "1;35"
-    elif value >= 95.0:
-        code = "33"
-    elif value >= 75.0:
-        code = "35"
-    elif value >= 50.0:
-        code = "1;34"
-    elif value >= 25.0:
-        code = "1;32"
-    else:
-        code = "37"
-    label = "SERVER BEST!" if server_best else f"{value:.2f}%"
-    return _analyse_log_ansi(label, code)
-
-
-def _analyse_log_append_ansi_blocks(
-    lines: List[str],
-    rows: List[str],
-    max_body_len: int = 1350,
-) -> None:
-    if not rows:
-        return
-    body: List[str] = []
-    body_len = 0
-    for row in rows:
-        extra = len(row) + (1 if body else 0)
-        if body and body_len + extra > max_body_len:
-            lines.extend(["```ansi", *body, "```"])
-            body = []
-            body_len = 0
-        body.append(row)
-        body_len += len(row) + (1 if len(body) > 1 else 0)
-    if body:
-        lines.extend(["```ansi", *body, "```"])
-
-
 PEWPEW_STATE_FILE = APP_DIR / "apogeebot_seen_v11.json"
 PEWPEW_LOCK = asyncio.Lock()
 PEWPEW_IN_FLIGHT: set = set()
@@ -3546,6 +3445,68 @@ def _pewpew_page_debug_summary(raw_html: str) -> Dict[str, Any]:
     }
 
 
+
+# =============================================================================
+# Discord ANSI colors (```ansi code blocks) — noms par couleur de classe,
+# valeurs de parse par couleur de percentile façon uwu-logs/WarcraftLogs.
+#
+# Discord ne supporte que 8 couleurs ANSI de base (30-37) x gras/normal, donc
+# le mapping classe->couleur est une approximation la plus proche possible,
+# pas les couleurs Blizzard exactes.
+# =============================================================================
+
+WOW_CLASS_ANSI: Dict[str, Tuple[bool, int]] = {
+    "death knight": (True, 31),   # rouge (proche de #C41F3B)
+    "druid": (False, 33),         # jaune (pas d'orange en ANSI de base)
+    "hunter": (False, 32),        # vert
+    "mage": (True, 36),           # cyan gras (bleu clair)
+    "paladin": (True, 35),        # magenta gras (rose)
+    "priest": (True, 37),         # blanc gras
+    "rogue": (True, 33),          # jaune gras
+    "shaman": (False, 34),        # bleu
+    "warlock": (False, 35),       # magenta (violet)
+    "warrior": (False, 37),       # blanc (brun/tan non représentable)
+}
+
+
+def _ansi(text: str, color: int, bold: bool = False) -> str:
+    return f"\u001b[{1 if bold else 0};{color}m{text}\u001b[0m"
+
+
+def _wow_class_from_spec(spec: str) -> str:
+    s = re.sub(r"\s+", " ", (spec or "").strip().lower())
+    if s.endswith("death knight"):
+        return "death knight"
+    parts = s.split(" ")
+    return parts[-1] if parts else ""
+
+
+def _colored_player_name(name: str, spec: str) -> str:
+    cls = _wow_class_from_spec(spec)
+    bold, color = WOW_CLASS_ANSI.get(cls, (False, 37))
+    return _ansi(name, color, bold)
+
+
+def _percentile_ansi(value: float) -> Tuple[bool, int]:
+    """Bandes de couleur façon uwu-logs/WarcraftLogs (percentile 0-100)."""
+    if value >= 99:
+        return True, 31    # rose/rouge ("artifact")
+    if value >= 90:
+        return True, 33    # orange (jaune gras, pas d'orange en ANSI)
+    if value >= 75:
+        return False, 35   # violet
+    if value >= 50:
+        return False, 34   # bleu
+    if value >= 25:
+        return False, 32   # vert
+    return False, 30       # gris
+
+
+def _colored_percent(value: float) -> str:
+    bold, color = _percentile_ansi(value)
+    return _ansi(f"{value:.2f}%", color, bold)
+
+
 def _pewpew_tier(value: float) -> Optional[float]:
     for threshold, _label in PEWPEW_TIERS:
         if value <= threshold + 1e-9:
@@ -3560,7 +3521,15 @@ def _fmt_top_percent(value: float) -> str:
 
 
 def format_pewpew_report(hits: List[PewPewHit]) -> str:
-    """Classement Analyse Log : chaque boss ne compte que dans UNE tranche."""
+    """Format only the Top tiers for Analyse Log.
+
+    Noms colorés par couleur de classe, valeurs de parse colorées par bande de
+    percentile (façon uwu-logs), rendu via un bloc de code ```ansi``` Discord.
+    Les compteurs "aussi X top Y%" sont désormais NON cumulatifs : chaque boss
+    n'est compté que dans son propre palier, pas répété dans tous les paliers
+    supérieurs.
+    """
+    # Best result per player + boss across attempts.
     best: Dict[Tuple[str, str], PewPewHit] = {}
     display_name: Dict[str, str] = {}
     for hit in hits:
@@ -3577,7 +3546,7 @@ def format_pewpew_report(hits: List[PewPewHit]) -> str:
 
     tier_players: Dict[float, List[Tuple[str, List[PewPewHit]]]] = defaultdict(list)
     for pl, phits in by_player.items():
-        phits.sort(key=lambda h: (h.top_percent, _analyse_log_boss_sort_key(h.boss)))
+        phits.sort(key=lambda h: (h.top_percent, h.boss))
         tier = _pewpew_tier(phits[0].top_percent)
         if tier is not None:
             tier_players[tier].append((display_name[pl], phits))
@@ -3585,67 +3554,49 @@ def format_pewpew_report(hits: List[PewPewHit]) -> str:
     if not tier_players:
         return ""
 
-    lines = ["**Classement du raid**"]
-
-    for main_threshold, label in PEWPEW_TIERS:
-        players = tier_players.get(main_threshold, [])
+    sections: List[str] = ["**Classement du raid**"]
+    for threshold, label in PEWPEW_TIERS:
+        players = tier_players.get(threshold, [])
         if not players:
             continue
-
         players.sort(key=lambda item: (item[1][0].top_percent, item[0].lower()))
-        lines.append(label)
-        ansi_rows: List[str] = []
+        sections.append(label)
 
+        ansi_lines: List[str] = []
         for name, phits in players:
-            # Tranche principale exclusive.
-            prev = 0.0
-            for threshold, _label in PEWPEW_TIERS:
-                if threshold == main_threshold:
-                    break
-                prev = threshold
+            lead = [h for h in phits if h.top_percent <= threshold + 1e-9]
+            colored_name = _colored_player_name(name, lead[0].spec if lead else "")
+            lead_parts = []
+            for h in lead:
+                # `h.points` is UwU /rank's percentile: the actual parse value.
+                # The Top category still uses 100 - percentile via h.top_percent.
+                value = "SERVER BEST!" if h.server_best else _colored_percent(h.points)
+                lead_parts.append(f"{value} sur {_analyse_log_boss_label(h.boss)}")
 
-            if main_threshold == PEWPEW_TIERS[0][0]:
-                lead = [h for h in phits if h.top_percent <= main_threshold + 1e-9]
-            else:
-                lead = [
-                    h for h in phits
-                    if h.top_percent > prev + 1e-9
-                    and h.top_percent <= main_threshold + 1e-9
-                ]
+            # Comptage NON cumulatif : chaque boss restant est classé dans son
+            # propre palier exact, sans être re-compté dans les paliers au-dessus.
+            remaining = [h for h in phits if h.top_percent > threshold + 1e-9]
+            bucket_counts: Dict[float, int] = defaultdict(int)
+            for h in remaining:
+                bucket = _pewpew_tier(h.top_percent)
+                if bucket is not None:
+                    bucket_counts[bucket] += 1
 
-            lead.sort(key=lambda h: _analyse_log_boss_sort_key(h.boss))
-            lead_parts = [
-                f"{_analyse_log_colored_parse(h.points, h.server_best)} sur "
-                f"{_analyse_log_boss_label(h.boss)}"
-                for h in lead
-            ]
-
-            # Extras exclusifs : un boss Top 2 n'est pas recompté en Top 5, etc.
-            extras: List[str] = []
-            low = main_threshold
-            for high, _tier_label in PEWPEW_TIERS:
-                if high <= main_threshold:
+            extras = []
+            for t, _lbl in PEWPEW_TIERS:
+                if t <= threshold:
                     continue
-                count = sum(
-                    1 for h in phits
-                    if h.top_percent > low + 1e-9
-                    and h.top_percent <= high + 1e-9
-                )
+                count = bucket_counts.get(t, 0)
                 if count:
-                    label_num = "0.2" if high == 0.2 else str(int(high))
+                    label_num = "0.2" if t == 0.2 else str(int(t))
                     extras.append(f"{count} top {label_num}%")
-                low = high
 
             suffix = (", aussi " + ", ".join(extras)) if extras else ""
-            spec = next((h.spec for h in phits if h.spec), "")
-            colored_name = _analyse_log_colored_player(name, spec)
-            ansi_rows.append(
-                f"🔸 {colored_name}: " + ", ".join(lead_parts) + suffix
-            )
+            ansi_lines.append(f"  \u25B8 {colored_name}: " + ", ".join(lead_parts) + suffix)
 
-        _analyse_log_append_ansi_blocks(lines, ansi_rows)
+        sections.append("```ansi\n" + "\n".join(ansi_lines) + "\n```")
 
-    return "\n".join(lines)
+    return "\n".join(sections)
 
 
 def format_analysis_log(
@@ -3653,7 +3604,7 @@ def format_analysis_log(
     improvements: List[ParseImprovement],
     improvement_failures: int = 0,
 ) -> str:
-    """Un rapport Discord : classement du raid puis parses améliorées."""
+    """One Discord message: current-raid rankings, then personal improvements."""
     lines = ["**Analyse Log**"]
 
     ranking = format_pewpew_report(hits)
@@ -3685,8 +3636,7 @@ def format_analysis_log(
     if not by_player:
         if improvement_failures:
             lines.append(
-                f"Aucune amélioration confirmée ; ⚠️ {improvement_failures} "
-                "vérification(s) /character ont échoué."
+                f"Aucune amélioration confirmée ; ⚠️ {improvement_failures} vérification(s) /character ont échoué."
             )
         else:
             lines.append("Aucune amélioration de parse détectée sur ce raid.")
@@ -3694,40 +3644,32 @@ def format_analysis_log(
 
     def player_sort(item):
         pl, rows = item
-        best_pct = max(
-            (r.percentile for r in rows if r.percentile is not None),
-            default=-1.0,
-        )
+        best_pct = max((r.percentile for r in rows if r.percentile is not None), default=-1.0)
         return (-len(rows), -best_pct, display_names.get(pl, pl).lower())
 
-    ansi_rows: List[str] = []
+    ansi_lines: List[str] = []
     for pl, rows in sorted(by_player.items(), key=player_sort):
+        # Ordre de boss fixe demandé pour les parses améliorées.
         rows.sort(key=lambda r: _analyse_log_boss_sort_key(r.boss))
-        parts: List[str] = []
+        colored_name = _colored_player_name(display_names.get(pl, pl), rows[0].spec)
+        parts = []
         for row in rows:
             boss_label = _analyse_log_boss_label(row.boss)
             if row.percentile is None:
                 parts.append(boss_label)
             else:
-                parts.append(
-                    f"{boss_label} {_analyse_log_colored_parse(row.percentile)}"
-                )
+                parts.append(f"{boss_label} {_colored_percent(row.percentile)}")
+        ansi_lines.append(f"\u2022 {colored_name} \u2014 " + ", ".join(parts))
 
-        spec = next((row.spec for row in rows if row.spec), "")
-        colored_name = _analyse_log_colored_player(display_names.get(pl, pl), spec)
-        ansi_rows.append(f"• {colored_name} — " + ", ".join(parts))
-
-    _analyse_log_append_ansi_blocks(lines, ansi_rows)
+    lines.append("```ansi\n" + "\n".join(ansi_lines) + "\n```")
 
     if improvement_failures:
         lines += [
             "",
-            f"⚠️ {improvement_failures} vérification(s) d'amélioration ont échoué ; "
-            "la liste peut être incomplète.",
+            f"⚠️ {improvement_failures} vérification(s) d'amélioration ont échoué ; la liste peut être incomplète.",
         ]
 
     return "\n".join(lines)
-
 def _pewpew_attempt_number(url: str) -> int:
     try:
         q = parse_qs(urlsplit(html_lib.unescape(url)).query)
@@ -4097,10 +4039,8 @@ def _apogeebot_hits_from_rank_payload(
     boss: str,
     specs: Optional[Dict[str, str]] = None,
 ) -> List[PewPewHit]:
-    hits: List[PewPewHit] = []
     specs = specs or {}
-    specs_lower = {str(name).lower(): str(spec) for name, spec in specs.items()}
-
+    hits: List[PewPewHit] = []
     for player, raw in payload.items():
         if not WOW_NAME_RE.fullmatch(str(player)) or not isinstance(raw, dict):
             continue
@@ -4111,15 +4051,14 @@ def _apogeebot_hits_from_rank_payload(
         if top_percent > 33.0001:
             continue
         rank = _numeric(raw.get("rank"))
-        player_name = str(player)
         hits.append(
             PewPewHit(
-                player=player_name,
+                player=str(player),
                 boss=boss,
                 top_percent=top_percent,
                 points=float(percentile),
                 server_best=(rank == 1 or percentile >= 99.995),
-                spec=specs.get(player_name, specs_lower.get(player_name.lower(), "")),
+                spec=specs.get(str(player), ""),
             )
         )
     return hits
