@@ -3071,6 +3071,19 @@ PEWPEW_TIERS: Tuple[Tuple[float, str], ...] = (
     (25.0, "⚪ Top 25% ⚪"),
     (33.0, "⚫ Top 33% ⚫"),
 )
+
+# Analyse Log V2 : le classement du raid se base désormais sur les points UwU
+# (comme la fiche personnage) et sur les mêmes seuils que KAparse.
+ANALYSE_LOG_POINT_TIERS: Tuple[Tuple[str, Optional[float], str], ...] = (
+    ("top1", None, "🏆 Top 1 🏆"),
+    ("99", 99.0, "🟣 Top 99% 🟣"),
+    ("95", 95.0, "🟠 Top 95% 🟠"),
+    ("90", 90.0, "🟡 Top 90% 🟡"),
+    ("85", 85.0, "🔵 Top 85% 🔵"),
+    ("80", 80.0, "🟢 Top 80% 🟢"),
+    ("70", 70.0, "⚪ Top 70% ⚪"),
+)
+ANALYSE_LOG_POINT_TIER_INDEX = {tier_key: idx for idx, (tier_key, _threshold, _label) in enumerate(ANALYSE_LOG_POINT_TIERS)}
 ANALYSE_LOG_BOSS_ORDER: Tuple[str, ...] = (
     "Lord Marrowgar",
     "Lady Deathwhisper",
@@ -3285,46 +3298,47 @@ def _ranking_sections(hits: List[PewPewHit]):
         display_name.setdefault(pl, hit.player)
         key = (pl, hit.boss)
         old = best.get(key)
-        if old is None or hit.top_percent < old.top_percent:
+        if old is None or hit.points > old.points or (hit.points == old.points and hit.server_best and not old.server_best):
             best[key] = hit
 
     by_player: Dict[str, List[PewPewHit]] = defaultdict(list)
     for (pl, _boss), hit in best.items():
         by_player[pl].append(hit)
 
-    tier_players: Dict[float, List[Tuple[str, List[PewPewHit]]]] = defaultdict(list)
+    bucket_players: Dict[str, List[Tuple[str, List[PewPewHit]]]] = defaultdict(list)
     for pl, phits in by_player.items():
-        phits.sort(key=lambda h: (h.top_percent, _analyse_log_boss_sort_key(h.boss)))
-        tier = _pewpew_tier(phits[0].top_percent)
-        if tier is not None:
-            tier_players[tier].append((display_name[pl], phits))
+        phits.sort(key=lambda h: (-h.points, _analyse_log_boss_sort_key(h.boss)))
+        buckets = [(_analyse_log_hit_bucket(h), h) for h in phits]
+        buckets = [(b, h) for b, h in buckets if b is not None]
+        if not buckets:
+            continue
+        main_bucket = min((b for b, _h in buckets), key=lambda b: ANALYSE_LOG_POINT_TIER_INDEX[b])
+        bucket_players[main_bucket].append((display_name[pl], phits))
 
     sections = []
-    for threshold, label in PEWPEW_TIERS:
-        players = tier_players.get(threshold, [])
+    for bucket_key, threshold, label in ANALYSE_LOG_POINT_TIERS:
+        players = bucket_players.get(bucket_key, [])
         if not players:
             continue
-        players.sort(key=lambda item: (item[1][0].top_percent, item[0].lower()))
+        players.sort(key=lambda item: (-max(h.points for h in item[1]), item[0].lower()))
         rows = []
         for name, phits in players:
-            lead = [h for h in phits if h.top_percent <= threshold + 1e-9]
-            lead.sort(key=lambda h: _analyse_log_boss_sort_key(h.boss))
-            extras = []
-            lower_bound = threshold
-            for upper_bound, _tier_label in PEWPEW_TIERS:
-                if upper_bound <= threshold:
+            lead = [h for h in phits if _analyse_log_hit_bucket(h) == bucket_key]
+            lead.sort(key=lambda h: (-h.points, _analyse_log_boss_sort_key(h.boss)))
+            extras: List[Tuple[str, int]] = []
+            for other_key, _other_threshold, _other_label in ANALYSE_LOG_POINT_TIERS:
+                if other_key == bucket_key:
                     continue
-                count = sum(1 for h in phits if h.top_percent > lower_bound + 1e-9 and h.top_percent <= upper_bound + 1e-9)
+                count = sum(1 for h in phits if _analyse_log_hit_bucket(h) == other_key)
                 if count:
-                    extras.append((upper_bound, count))
-                lower_bound = upper_bound
+                    extras.append((other_key, count))
             rows.append({
                 "name": name,
                 "spec": next((h.spec for h in phits if h.spec), ""),
                 "lead": lead,
                 "extras": extras,
             })
-        sections.append((threshold, label, rows))
+        sections.append((bucket_key, label, rows))
     return sections
 
 
@@ -3433,25 +3447,34 @@ def render_pewpew_ranking_image(hits: List[PewPewHit]) -> bytes:
         return _render_report_image(
             "Analyse Log",
             "Classement du raid",
-            [("message", "Classement du raid", [("Aucun joueur Top 33 sur ce raid.", REPORT_TEXT, _report_font(24, False))])],
+            [("message", "Classement du raid", [("Aucun joueur n'atteint 70+ points sur ce raid.", REPORT_TEXT, _report_font(24, False))])],
         )
     section_items = []
-    for _threshold, label, rows in sections:
+    for _bucket_key, label, rows in sections:
         rendered_rows = []
         for row in rows:
-            segs = [("• ", REPORT_TEXT, _report_font(24, False)), (row["name"], _analyse_log_class_color(row.get("spec", "")), _report_font(24, True)), (" — ", REPORT_MUTED, _report_font(24, False))]
+            segs = [
+                ("• ", REPORT_TEXT, _report_font(24, False)),
+                (row["name"], _analyse_log_class_color(row.get("spec", "")), _report_font(24, True)),
+                (" — ", REPORT_MUTED, _report_font(24, False)),
+            ]
             for idx, hit in enumerate(row["lead"]):
-                label_text = "SERVER BEST!" if hit.server_best else f"{hit.points:.2f}%"
-                segs.append((label_text, _analyse_log_parse_color(hit.points, hit.server_best), _report_font(24, True)))
+                segs.append((f"{hit.points:.2f}%", _analyse_log_parse_color(hit.points, hit.server_best), _report_font(24, True)))
                 segs.append((f" sur {_analyse_log_boss_label(hit.boss)}", REPORT_TEXT, _report_font(24, False)))
+                if hit.server_best:
+                    segs.append((" (Top 1)", REPORT_ACCENT, _report_font(24, True)))
                 if idx < len(row["lead"]) - 1 or row["extras"]:
                     segs.append((", ", REPORT_MUTED, _report_font(24, False)))
             if row["extras"]:
                 segs.append(("aussi ", REPORT_MUTED, _report_font(24, False)))
-                for idx, (threshold, count) in enumerate(row["extras"]):
-                    label_num = "0.2" if abs(threshold - 0.2) < 1e-9 else str(int(threshold))
+                for idx, (bucket_key, count) in enumerate(row["extras"]):
                     segs.append((str(count), REPORT_TEXT, _report_font(24, True)))
-                    segs.append((f" top {label_num}%", REPORT_MUTED, _report_font(24, False)))
+                    clean = _analyse_log_bucket_label(bucket_key)
+                    clean = clean.replace("🏆 ", "").replace(" 🏆", "").replace("🟣 ", "").replace(" 🟣", "")
+                    clean = clean.replace("🟠 ", "").replace(" 🟠", "").replace("🟡 ", "").replace(" 🟡", "")
+                    clean = clean.replace("🔵 ", "").replace(" 🔵", "").replace("🟢 ", "").replace(" 🟢", "")
+                    clean = clean.replace("⚪ ", "").replace(" ⚪", "")
+                    segs.append((f" {clean.lower()}", REPORT_MUTED, _report_font(24, False)))
                     if idx < len(row["extras"]) - 1:
                         segs.append((", ", REPORT_MUTED, _report_font(24, False)))
             rendered_rows.append(segs)
@@ -4290,6 +4313,116 @@ async def _post_uwu_rank(payload: Dict[str, Any]) -> Dict[str, Any]:
     raise RuntimeError("UwU /rank impossible")
 
 
+def _uwu_rank_points(raw: Dict[str, Any]) -> Optional[float]:
+    """Return the UwU points value shown on the character page.
+    Several transports used by UwU expose the same metric under slightly
+    different names; fallback to percentile only if nothing better is exposed.
+    """
+    if not isinstance(raw, dict):
+        return None
+    for key in ("points", "point", "score", "parse", "value"):
+        value = _numeric(raw.get(key))
+        if value is not None and 0.0 <= value <= 100.0:
+            return float(value)
+    value = _numeric(raw.get("percentile"))
+    if value is not None and 0.0 <= value <= 100.0:
+        return float(value)
+    return None
+
+
+def _uwu_rank_rank(raw: Dict[str, Any]) -> Optional[int]:
+    value = _numeric((raw or {}).get("rank")) if isinstance(raw, dict) else None
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except Exception:
+        return None
+
+
+def _analyse_log_hit_bucket(hit: PewPewHit) -> Optional[str]:
+    if hit.server_best:
+        return "top1"
+    for tier_key, threshold, _label in ANALYSE_LOG_POINT_TIERS:
+        if threshold is None:
+            continue
+        if hit.points >= float(threshold) - 1e-9:
+            return tier_key
+    return None
+
+
+def _analyse_log_bucket_label(bucket: str) -> str:
+    for tier_key, _threshold, label in ANALYSE_LOG_POINT_TIERS:
+        if tier_key == bucket:
+            return label
+    return bucket
+
+
+def _extract_character_boss_table_rows(html: str) -> Dict[str, Dict[str, Optional[float]]]:
+    """Parse the public UwU character page table to recover Points and Kills.
+    This is more reliable for display than guessing hidden JSON key names.
+    """
+    out: Dict[str, Dict[str, Optional[float]]] = {}
+    for row in re.findall(r"(?is)<tr[^>]*>.*?</tr>", html or ""):
+        cells = _html_cells(row)
+        if len(cells) < 4:
+            continue
+        texts = [html_to_text(cell).replace(" ", " ").strip() for cell in cells]
+        if not texts:
+            continue
+        raw_boss = texts[0]
+        boss = normalize_boss(raw_boss) or raw_boss.strip()
+        if boss not in ANALYSE_LOG_BOSS_ORDER and boss not in APOGEEBOT_IGNORED_RANK_BOSSES:
+            continue
+
+        date_idx = next((i for i, t in enumerate(texts) if re.fullmatch(r"\d{2}-\d{2}-\d{2}", t)), None)
+        dur_idx = next((i for i, t in enumerate(texts) if re.fullmatch(r"\d{1,2}:\d{2}", t)), None)
+
+        points = None
+        kills = None
+
+        # Typical row layout: Boss | Rank | Points | Best Dps | Dur | Kills | Date
+        if len(texts) >= 6:
+            p = _apogeebot_parse_number(texts[2])
+            if p is not None and 0 <= p <= 100:
+                points = float(p)
+        if date_idx is not None and date_idx >= 1:
+            k = _numeric(texts[date_idx - 1])
+            if k is not None and k >= 0:
+                kills = int(k)
+        if kills is None and dur_idx is not None and dur_idx + 1 < len(texts):
+            k = _numeric(texts[dur_idx + 1])
+            if k is not None and k >= 0:
+                kills = int(k)
+        if kills is None:
+            # Conservative fallback: last plain integer in the tail of the row.
+            for candidate in reversed(texts[1:]):
+                if re.fullmatch(r"\d+", candidate or ""):
+                    kills = int(candidate)
+                    break
+
+        if points is not None or kills is not None:
+            out[boss.lower()] = {"points": points, "kills": kills}
+    return out
+
+
+async def _get_uwu_character_table_summary(
+    player: str,
+    spec_idx: int,
+    server: str,
+) -> Dict[str, Dict[str, Optional[float]]]:
+    url = (
+        "https://uwu-logs.xyz/character?name="
+        + quote(player)
+        + "&server="
+        + quote(server)
+        + "&spec="
+        + str(int(spec_idx))
+    )
+    _final, html = await _fetch_uwu_with_retry(url, "ApogeeBot/11.2 (+Analyse Log table)")
+    return _extract_character_boss_table_rows(html)
+
+
 def _apogeebot_hits_from_rank_payload(
     payload: Dict[str, Any],
     boss: str,
@@ -4301,21 +4434,23 @@ def _apogeebot_hits_from_rank_payload(
     for player, raw in payload.items():
         if not WOW_NAME_RE.fullmatch(str(player)) or not isinstance(raw, dict):
             continue
-        percentile = _numeric(raw.get("percentile"))
-        if percentile is None or not 0.0 <= percentile <= 100.0:
+        points = _uwu_rank_points(raw)
+        if points is None or not 0.0 <= points <= 100.0:
             continue
-        top_percent = max(0.0, min(100.0, 100.0 - float(percentile)))
-        if top_percent > 33.0001:
+        rank_value = _uwu_rank_rank(raw)
+        server_best = rank_value == 1
+        # Analyse Log V2 : le classement ne garde que les joueurs qui atteignent
+        # au moins le plus petit seuil KAparse (70 points), ou un Top 1 explicite.
+        if not server_best and points < 70.0 - 1e-9:
             continue
-        rank = _numeric(raw.get("rank"))
         player_name = str(player)
         hits.append(
             PewPewHit(
                 player=player_name,
                 boss=boss,
-                top_percent=top_percent,
-                points=float(percentile),
-                server_best=(rank == 1 or percentile >= 99.995),
+                top_percent=max(0.0, 100.0 - float(points)),
+                points=float(points),
+                server_best=server_best,
                 spec=specs.get(player_name, specs_by_lower.get(player_name.lower(), "")),
             )
         )
@@ -4443,6 +4578,7 @@ def _character_report_improvements(
     current_percentiles: Dict[Tuple[str, str], float],
     current_specs: Dict[Tuple[str, str], str],
     current_dps: Dict[Tuple[str, str], float],
+    character_table: Optional[Dict[str, Dict[str, Optional[float]]]] = None,
 ) -> List[ParseImprovement]:
     """Detect personal bests made in the posted heroic raid.
     CONFIRMÉ le 16/08/2026 contre un vrai payload `/character` (dump complet
@@ -4561,13 +4697,24 @@ def _character_report_improvements(
                 },
             )
 
+        kills_value = _extract_improvement_kills(raw)
+        if kills_value is None and isinstance(character_table, dict):
+            table_row = character_table.get(boss.lower()) or {}
+            if isinstance(table_row, dict):
+                k = table_row.get("kills")
+                if k is not None:
+                    try:
+                        kills_value = int(k)
+                    except Exception:
+                        kills_value = None
+
         out.append(
             ParseImprovement(
                 player=player,
                 boss=boss,
                 percentile=current_percentiles.get(key),
                 spec=current_specs.get(key, ""),
-                kills=_extract_improvement_kills(raw),
+                kills=kills_value,
             )
         )
 
@@ -4623,6 +4770,14 @@ async def _detect_report_improvements(
             try:
                 payload = await _get_uwu_character_for_improvements(player, spec_idx, server)
                 queries += 1
+                character_table: Dict[str, Dict[str, Optional[float]]] = {}
+                try:
+                    character_table = await _get_uwu_character_table_summary(player, spec_idx, server)
+                except Exception as table_exc:
+                    dkp_debug(
+                        "ANALYSE LOG /character TABLE ECHEC",
+                        {"player": player, "spec_idx": spec_idx, "error": f"{type(table_exc).__name__}: {table_exc}"},
+                    )
 
                 global _ANALYSE_LOG_CHARACTER_SAMPLE_LOGGED
                 if not _ANALYSE_LOG_CHARACTER_SAMPLE_LOGGED:
@@ -4639,6 +4794,7 @@ async def _detect_report_improvements(
                     current_percentiles,
                     current_specs,
                     current_dps,
+                    character_table,
                 )
                 for row in rows:
                     key = (row.player.lower(), row.boss.lower())
@@ -4701,14 +4857,14 @@ async def build_pewpew_report(report_url: str) -> Tuple[bytes, bytes, Dict[str, 
 
     if not report_id or not kill_urls:
         print(f"[ANALYSE LOG] Aucun kill exploitable détecté dans {report_id or report_url}")
-        return "", stats
+        return b"", b"", stats
 
     all_participants: set = set()
     all_ranked_players: set = set()
     hits: List[PewPewHit] = []
 
     # For improvement detection we remember only specs actually seen in this raid
-    # and the percentile produced by /rank for the current boss kill.
+    # and the UwU points produced for the current boss kill.
     player_specs: Dict[str, set] = defaultdict(set)
     display_names: Dict[str, str] = {}
     current_percentiles: Dict[Tuple[str, str], float] = {}
@@ -4785,18 +4941,18 @@ async def build_pewpew_report(report_url: str) -> Tuple[bytes, bytes, Dict[str, 
                 if isinstance(value, dict)
             )
 
-            # Keep every current-raid percentile, not only Top 33: the improvement
-            # section may contain a personal best at e.g. 55%.
+            # Keep every current-raid UwU points value, not only 70+.
+            # The improvement section must display the same metric as UwU.
             for player, raw in rank_data.items():
                 if not isinstance(raw, dict):
                     continue
-                percentile = _numeric(raw.get("percentile"))
-                if percentile is None or not 0.0 <= percentile <= 100.0:
+                points = _uwu_rank_points(raw)
+                if points is None or not 0.0 <= points <= 100.0:
                     continue
                 key = (str(player).lower(), boss.lower())
                 old = current_percentiles.get(key)
-                if old is None or float(percentile) > old:
-                    current_percentiles[key] = float(percentile)
+                if old is None or float(points) > old:
+                    current_percentiles[key] = float(points)
 
             kill_hits = _apogeebot_hits_from_rank_payload(rank_data, boss, specs)
             hits.extend(kill_hits)
@@ -4813,7 +4969,7 @@ async def build_pewpew_report(report_url: str) -> Tuple[bytes, bytes, Dict[str, 
                     "top33": [
                         {
                             "player": h.player,
-                            "percentile": h.points,
+                            "points": h.points,
                             "top_percent": h.top_percent,
                         }
                         for h in kill_hits
