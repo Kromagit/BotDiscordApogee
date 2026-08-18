@@ -125,6 +125,17 @@ STATUS_CODES = {
     "unknown": "U",
 }
 
+# Seuls ces rôles Discord sont exportés par /export-grade.
+GRADE_ROLE_ORDER: Tuple[str, ...] = (
+    "Officier",
+    "R1",
+    "R2",
+    "R3",
+    "Veteran",
+    "Membre",
+    "Initié",
+)
+
 DM_UNRECOGNIZED = (
     "Message automatique Apogee :\n"
     "Tu es inscrit pour un évent Apogee mais tu n'as pas ou mal saisi "
@@ -584,6 +595,40 @@ async def build_main_map(guild: discord.Guild) -> Tuple[Dict[int, str], List[str
         name_owner[folded] = msg.author.id
 
     return {uid: value[0] for uid, value in by_user.items()}, problems
+
+
+async def build_grade_export(guild: discord.Guild) -> Tuple[str, List[str], int]:
+    # Exporte chaque main valide de #Main avec uniquement les grades retenus.
+    main_map, main_problems = await build_main_map(guild)
+    warnings = list(main_problems)
+    lines: List[str] = []
+
+    for user_id, main in sorted(main_map.items(), key=lambda item: item[1].lower()):
+        member = guild.get_member(user_id)
+        if member is None:
+            try:
+                member = await guild.fetch_member(user_id)
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                member = None
+
+        if member is None:
+            warnings.append(f"{main} : membre Discord introuvable")
+            lines.append(f"{main}: Aucun")
+            continue
+
+        member_roles = {role.name.casefold() for role in member.roles}
+        grades = [
+            role_name
+            for role_name in GRADE_ROLE_ORDER
+            if role_name.casefold() in member_roles
+        ]
+
+        if not grades:
+            warnings.append(f"{main} : aucun rôle de grade suivi")
+
+        lines.append(f"{main}: {', '.join(grades) if grades else 'Aucun'}")
+
+    return "\n".join(lines), warnings, len(main_map)
 
 
 def can_use_admin(interaction: discord.Interaction) -> bool:
@@ -2800,7 +2845,6 @@ async def handle_kaparse_auto_message(message: discord.Message) -> None:
 
 
 
-
 # =============================================================================
 # DKPARSE weekly closure
 # =============================================================================
@@ -3044,6 +3088,48 @@ PEWPEW_TIERS: Tuple[Tuple[float, str], ...] = (
     (25.0, "⚪ Top 25% ⚪"),
     (33.0, "⚫ Top 33% ⚫"),
 )
+ANALYSE_LOG_BOSS_ORDER: Tuple[str, ...] = (
+    "Lord Marrowgar",
+    "Lady Deathwhisper",
+    "Deathbringer Saurfang",
+    "Rotface",
+    "Festergut",
+    "Professor Putricide",
+    "Blood Prince Council",
+    "Blood-Queen Lana'thel",
+    "Sindragosa",
+    "The Lich King",
+)
+
+ANALYSE_LOG_BOSS_SHORT = {
+    "Lord Marrowgar": "Garga",
+    "Lady Deathwhisper": "Lady",
+    "Deathbringer Saurfang": "DBS",
+    "Rotface": "Trogne",
+    "Festergut": "Pull",
+    "Professor Putricide": "PP",
+    "Blood Prince Council": "BPC",
+    "Blood-Queen Lana'thel": "BQL",
+    "Sindragosa": "Sindra",
+    "The Lich King": "LK",
+}
+
+ANALYSE_LOG_BOSS_ORDER_INDEX = {
+    boss: index for index, boss in enumerate(ANALYSE_LOG_BOSS_ORDER)
+}
+
+
+def _analyse_log_boss_label(boss: str) -> str:
+    return ANALYSE_LOG_BOSS_SHORT.get(boss, boss)
+
+
+def _analyse_log_boss_sort_key(boss: str) -> Tuple[int, str]:
+    return (
+        ANALYSE_LOG_BOSS_ORDER_INDEX.get(boss, len(ANALYSE_LOG_BOSS_ORDER)),
+        boss.lower(),
+    )
+
+
 PEWPEW_STATE_FILE = APP_DIR / "apogeebot_seen_v11.json"
 PEWPEW_LOCK = asyncio.Lock()
 PEWPEW_IN_FLIGHT: set = set()
@@ -3401,7 +3487,7 @@ def format_pewpew_report(hits: List[PewPewHit]) -> str:
                 # `h.points` is UwU /rank's percentile: the actual parse value.
                 # The Top category still uses 100 - percentile via h.top_percent.
                 value = "SERVER BEST!" if h.server_best else f"{h.points:.2f}%"
-                lead_parts.append(f"**{value}** sur {h.boss}")
+                lead_parts.append(f"**{value}** sur {_analyse_log_boss_label(h.boss)}")
 
             extras = []
             thresholds = [t for t, _ in PEWPEW_TIERS if t > threshold]
@@ -3466,13 +3552,15 @@ def format_analysis_log(
         return (-len(rows), -best_pct, display_names.get(pl, pl).lower())
 
     for pl, rows in sorted(by_player.items(), key=player_sort):
-        rows.sort(key=lambda r: (-(r.percentile if r.percentile is not None else -1.0), r.boss))
+        # Ordre de boss fixe demandé pour les parses améliorées.
+        rows.sort(key=lambda r: _analyse_log_boss_sort_key(r.boss))
         parts = []
         for row in rows:
+            boss_label = _analyse_log_boss_label(row.boss)
             if row.percentile is None:
-                parts.append(f"**{row.boss}**")
+                parts.append(f"**{boss_label}**")
             else:
-                parts.append(f"**{row.boss} {row.percentile:.2f}%**")
+                parts.append(f"**{boss_label} {row.percentile:.2f}%**")
         lines.append(f"• **{display_names.get(pl, pl)}** — " + ", ".join(parts))
 
     if improvement_failures:
@@ -3482,7 +3570,6 @@ def format_analysis_log(
         ]
 
     return "\n".join(lines)
-
 def _pewpew_attempt_number(url: str) -> int:
     try:
         q = parse_qs(urlsplit(html_lib.unescape(url)).query)
@@ -3997,7 +4084,6 @@ def _character_report_improvements(
     current_dps: Dict[Tuple[str, str], float],
 ) -> List[ParseImprovement]:
     """Detect personal bests made in the posted heroic raid.
-
     CONFIRMÉ le 16/08/2026 contre un vrai payload `/character` (dump complet
     en DKPARSE_DEBUG, joueur Baldursex) : le payload a bien la forme attendue
     (`{"bosses": {BossName: {report_id, dps_max, ...}}}`). Le bug n'était pas
@@ -4420,7 +4506,6 @@ async def build_pewpew_report(report_url: str) -> Tuple[str, Dict[str, int]]:
     )
 
     return format_analysis_log(hits, improvements, imp_failures), stats
-
 def _message_uwu_urls(message: discord.Message) -> List[str]:
     parts = [message.content or ""]
     for embed in message.embeds:
@@ -4520,35 +4605,11 @@ async def handle_uwu_pewpew_message(
                     continue
 
                 if report:
-                    # The user explicitly wants rankings + improvements in ONE Discord message.
-                    # Plain content is used while it fits; otherwise one embed keeps all chunks
-                    # inside the same reply instead of sending follow-up messages.
-                    if len(report) <= 1900:
+                    # Texte Discord normal = pleine largeur. On coupe seulement
+                    # si la limite de taille Discord l'exige.
+                    for chunk in split_discord_text(report, max_len=1900):
                         await message.reply(
-                            report,
-                            mention_author=False,
-                            allowed_mentions=discord.AllowedMentions.none(),
-                        )
-                    else:
-                        embed = discord.Embed(title="Analyse Log")
-                        report_body = report
-                        if report_body.startswith("**Analyse Log**"):
-                            report_body = report_body[len("**Analyse Log**"):].lstrip("\n")
-                        chunks = split_discord_text(report_body, max_len=950)
-                        for i, chunk in enumerate(chunks[:6]):
-                            embed.add_field(
-                                name="\u200b" if i else "Résultats",
-                                value=chunk,
-                                inline=False,
-                            )
-                        if len(chunks) > 6:
-                            embed.add_field(
-                                name="⚠️ Sortie trop longue",
-                                value=f"{len(chunks)-6} bloc(s) supplémentaire(s) non affiché(s).",
-                                inline=False,
-                            )
-                        await message.reply(
-                            embed=embed,
+                            chunk,
                             mention_author=False,
                             allowed_mentions=discord.AllowedMentions.none(),
                         )
@@ -4605,6 +4666,53 @@ async def dkparse_context(
     interaction: discord.Interaction, message: discord.Message
 ):
     await run_dkparse_check(interaction, message)
+
+
+@bot.tree.command(
+    name="export-grade",
+    description="Exporte les mains de #Main et leurs rôles Discord de grade.",
+)
+async def export_grade(interaction: discord.Interaction):
+    if not can_use_admin(interaction):
+        await interaction.response.send_message("Permission refusée.", ephemeral=True)
+        return
+    if not interaction.guild:
+        await interaction.response.send_message("Serveur requis.", ephemeral=True)
+        return
+
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    try:
+        export_text, warnings, total = await build_grade_export(interaction.guild)
+
+        if not export_text:
+            await interaction.followup.send(
+                "Aucun main valide trouvé dans #Main.",
+                ephemeral=True,
+            )
+            return
+
+        file = discord.File(
+            io.BytesIO(export_text.encode("utf-8")),
+            filename="Apogee_Export_Grade.txt",
+        )
+
+        summary = f"✅ **Export grade prêt** — {total} main(s) de #Main."
+        if warnings:
+            preview = "\n".join(f"• {warning}" for warning in warnings[:10])
+            if len(warnings) > 10:
+                preview += f"\n• ... et {len(warnings) - 10} autre(s)"
+            summary += f"\n⚠️ {len(warnings)} anomalie(s) :\n{preview}"
+
+        await interaction.followup.send(
+            summary,
+            file=file,
+            ephemeral=True,
+        )
+    except Exception as exc:
+        await interaction.followup.send(
+            f"❌ Export grade : {exc}",
+            ephemeral=True,
+        )
 
 
 @bot.tree.command(name="main-audit", description="Vérifie le salon #Main.")
@@ -4856,7 +4964,7 @@ async def on_message_edit(before: discord.Message, after: discord.Message):
 
 @bot.event
 async def on_ready():
-    print("ApogeeBot — Export inscrit + KAparse + Analyse Log")
+    print("ApogeeBot — Export inscrit + Export grade + KAparse + Analyse Log")
     print(f"Connecté en tant que {bot.user} ({bot.user.id})")
     print(f"#Main channel ID: {MAIN_CHANNEL_ID}")
     print(f"#logs-raid channel ID: {LOGS_RAID_CHANNEL_ID or 'NON CONFIGURE'}")
