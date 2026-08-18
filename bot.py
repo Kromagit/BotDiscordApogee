@@ -28,9 +28,11 @@ except Exception:
     RapidOCR = None
 
 try:
-    from PIL import Image
+    from PIL import Image, ImageDraw, ImageFont
 except Exception:
     Image = None
+    ImageDraw = None
+    ImageFont = None
 
 try:
     import numpy as np
@@ -136,11 +138,6 @@ GRADE_ROLE_ORDER: Tuple[str, ...] = (
     "Initié",
 )
 
-DM_UNRECOGNIZED = (
-    "Message automatique Apogee :\n"
-    "Tu es inscrit pour un évent Apogee mais tu n'as pas ou mal saisi "
-    "le nom de ton main en guilde dans le #Main."
-)
 
 DM_BAD_MAIN = (
     "Message automatique Apogee :\n"
@@ -306,6 +303,7 @@ class ParseImprovement:
     boss: str
     percentile: Optional[float] = None
     spec: str = ""
+    kills: Optional[int] = None
 
 
 def rh_debug(title: str, value: Any = None) -> None:
@@ -643,47 +641,19 @@ def can_use_admin(interaction: discord.Interaction) -> bool:
     )
 
 
-async def dm_unrecognized(guild: discord.Guild, signup: Signup) -> str:
-    """DEAD CODE (conservée pour référence) : Export inscrit n'envoie plus de MP
-    aux joueurs non reconnus, il se contente de les lister par tag Discord."""
-    member = guild.get_member(signup.user_id)
-    if member is None:
-        try:
-            member = await guild.fetch_member(signup.user_id)
-        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
-            return "membre introuvable"
-    try:
-        await member.send(DM_UNRECOGNIZED)
-        return "DM envoyé"
-    except discord.Forbidden:
-        return "DM impossible"
-    except discord.HTTPException:
-        return "erreur DM"
-
-
 def split_discord_text(text: str, max_len: int = 1900) -> List[str]:
     if len(text) <= max_len:
         return [text]
-    chunks: List[str] = []
-    current = ""
-    in_fence = False
-
+    chunks, current = [], ""
     for line in text.splitlines():
         candidate = line if not current else current + "\n" + line
         if len(candidate) > max_len:
             if current:
-                if in_fence:
-                    current += "\n```"
                 chunks.append(current)
-            current = ("```ansi\n" + line) if in_fence else line
+            current = line
         else:
             current = candidate
-        if line.strip().startswith("```"):
-            in_fence = not in_fence
-
     if current:
-        if in_fence:
-            current += "\n```"
         chunks.append(current)
     return chunks
 
@@ -3143,6 +3113,379 @@ def _analyse_log_boss_sort_key(boss: str) -> Tuple[int, str]:
     )
 
 
+WOW_CLASS_COLORS: Dict[str, Tuple[int, int, int]] = {
+    "deathknight": (196, 30, 59),
+    "druid": (255, 125, 10),
+    "hunter": (171, 212, 115),
+    "mage": (64, 199, 235),
+    "paladin": (245, 140, 186),
+    "priest": (255, 255, 255),
+    "rogue": (255, 245, 105),
+    "shaman": (0, 112, 222),
+    "warlock": (135, 136, 238),
+    "warrior": (198, 155, 109),
+}
+
+UWU_PARSE_COLOR_TIERS: Tuple[Tuple[float, Tuple[int, int, int]], ...] = (
+    (99.995, (229, 204, 127)),
+    (99.0, (229, 104, 255)),
+    (95.0, (255, 128, 0)),
+    (75.0, (163, 53, 238)),
+    (50.0, (0, 112, 221)),
+    (25.0, (30, 255, 0)),
+    (0.0, (128, 128, 128)),
+)
+
+REPORT_BG = (18, 20, 24)
+REPORT_PANEL = (29, 32, 38)
+REPORT_PANEL_2 = (36, 40, 47)
+REPORT_TEXT = (235, 237, 240)
+REPORT_MUTED = (165, 170, 180)
+REPORT_DIVIDER = (60, 66, 75)
+REPORT_ACCENT = (114, 137, 218)
+
+ANALYSE_LOG_TRACKED_SPEC_CLASS = {
+    "fwar": "warrior",
+    "combat": "rogue",
+    "ret": "paladin",
+    "uh": "deathknight",
+    "feraldps": "druid",
+    "magefeu": "mage",
+    "boomie": "druid",
+    "sp": "priest",
+    "démono": "warlock",
+    "demono": "warlock",
+    "mm": "hunter",
+}
+
+
+def _analyse_log_class_from_spec(spec: str) -> str:
+    s = re.sub(r"\s+", " ", html_lib.unescape(spec or "").strip().lower())
+    if s in ANALYSE_LOG_TRACKED_SPEC_CLASS:
+        return ANALYSE_LOG_TRACKED_SPEC_CLASS[s]
+    checks = (
+        ("death knight", "deathknight"),
+        ("warrior", "warrior"),
+        ("paladin", "paladin"),
+        ("hunter", "hunter"),
+        ("priest", "priest"),
+        ("warlock", "warlock"),
+        ("shaman", "shaman"),
+        ("rogue", "rogue"),
+        ("druid", "druid"),
+        ("mage", "mage"),
+    )
+    for token, cls in checks:
+        if token in s:
+            return cls
+    return ""
+
+
+def _analyse_log_class_color(spec: str) -> Tuple[int, int, int]:
+    return WOW_CLASS_COLORS.get(_analyse_log_class_from_spec(spec), REPORT_TEXT)
+
+
+def _analyse_log_parse_color(value: Optional[float], server_best: bool = False) -> Tuple[int, int, int]:
+    if server_best:
+        return UWU_PARSE_COLOR_TIERS[0][1]
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return REPORT_TEXT
+    for threshold, color in UWU_PARSE_COLOR_TIERS:
+        if v >= threshold - 1e-9:
+            return color
+    return REPORT_TEXT
+
+
+def _report_font(size: int, bold: bool = False):
+    if ImageFont is None:
+        raise RuntimeError("Pillow (ImageFont) indisponible pour le rendu image Analyse Log.")
+    paths = []
+    if os.name == "nt":
+        win = os.environ.get("WINDIR", r"C:\\Windows")
+        names = [
+            "arialbd.ttf" if bold else "arial.ttf",
+            "segoeuib.ttf" if bold else "segoeui.ttf",
+            "tahomabd.ttf" if bold else "tahoma.ttf",
+        ]
+        paths.extend(str(Path(win) / "Fonts" / n) for n in names)
+    paths.extend([
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf" if bold else "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/liberation2/LiberationSans-Bold.ttf" if bold else "/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf",
+    ])
+    for path in paths:
+        try:
+            return ImageFont.truetype(path, size=size)
+        except Exception:
+            pass
+    return ImageFont.load_default()
+
+
+def _text_width(draw, text_value: str, font) -> int:
+    if not text_value:
+        return 0
+    try:
+        left, top, right, bottom = draw.textbbox((0, 0), text_value, font=font)
+        return max(0, right - left)
+    except Exception:
+        return int(draw.textlength(text_value, font=font))
+
+
+def _wrap_segments(draw, segments, max_width: int):
+    lines = []
+    current = []
+    cur_w = 0
+    for seg_text, seg_color, seg_font in segments:
+        if not seg_text:
+            continue
+        seg_w = _text_width(draw, seg_text, seg_font)
+        if current and cur_w + seg_w > max_width:
+            lines.append(current)
+            current = []
+            cur_w = 0
+        current.append((seg_text, seg_color, seg_font))
+        cur_w += seg_w
+    if current:
+        lines.append(current)
+    return lines or [[("", REPORT_TEXT, _report_font(24, False))]]
+
+
+def _render_segment_lines(draw, x: int, y: int, lines, line_height: int):
+    for line in lines:
+        cx = x
+        for seg_text, seg_color, seg_font in line:
+            draw.text((cx, y), seg_text, fill=seg_color, font=seg_font)
+            cx += _text_width(draw, seg_text, seg_font)
+        y += line_height
+    return y
+
+
+def _extract_improvement_kills(raw: Dict[str, Any]) -> Optional[int]:
+    candidate_keys = ("kills", "kill_count", "killCount", "kills_count", "boss_kills", "count")
+    for key in candidate_keys:
+        value = _numeric(raw.get(key))
+        if value is not None and value >= 0:
+            return int(value)
+    for parent in ("stats", "meta", "boss"):
+        nested = raw.get(parent)
+        if isinstance(nested, dict):
+            for key in candidate_keys:
+                value = _numeric(nested.get(key))
+                if value is not None and value >= 0:
+                    return int(value)
+    return None
+
+
+def _ranking_sections(hits: List[PewPewHit]):
+    best: Dict[Tuple[str, str], PewPewHit] = {}
+    display_name: Dict[str, str] = {}
+    for hit in hits:
+        pl = hit.player.lower()
+        display_name.setdefault(pl, hit.player)
+        key = (pl, hit.boss)
+        old = best.get(key)
+        if old is None or hit.top_percent < old.top_percent:
+            best[key] = hit
+
+    by_player: Dict[str, List[PewPewHit]] = defaultdict(list)
+    for (pl, _boss), hit in best.items():
+        by_player[pl].append(hit)
+
+    tier_players: Dict[float, List[Tuple[str, List[PewPewHit]]]] = defaultdict(list)
+    for pl, phits in by_player.items():
+        phits.sort(key=lambda h: (h.top_percent, _analyse_log_boss_sort_key(h.boss)))
+        tier = _pewpew_tier(phits[0].top_percent)
+        if tier is not None:
+            tier_players[tier].append((display_name[pl], phits))
+
+    sections = []
+    for threshold, label in PEWPEW_TIERS:
+        players = tier_players.get(threshold, [])
+        if not players:
+            continue
+        players.sort(key=lambda item: (item[1][0].top_percent, item[0].lower()))
+        rows = []
+        for name, phits in players:
+            lead = [h for h in phits if h.top_percent <= threshold + 1e-9]
+            lead.sort(key=lambda h: _analyse_log_boss_sort_key(h.boss))
+            extras = []
+            lower_bound = threshold
+            for upper_bound, _tier_label in PEWPEW_TIERS:
+                if upper_bound <= threshold:
+                    continue
+                count = sum(1 for h in phits if h.top_percent > lower_bound + 1e-9 and h.top_percent <= upper_bound + 1e-9)
+                if count:
+                    extras.append((upper_bound, count))
+                lower_bound = upper_bound
+            rows.append({
+                "name": name,
+                "spec": next((h.spec for h in phits if h.spec), ""),
+                "lead": lead,
+                "extras": extras,
+            })
+        sections.append((threshold, label, rows))
+    return sections
+
+
+def _improvement_rows(improvements: List[ParseImprovement]):
+    best_improvements: Dict[Tuple[str, str], ParseImprovement] = {}
+    display_names: Dict[str, str] = {}
+    for imp in improvements:
+        pl = imp.player.lower()
+        display_names.setdefault(pl, imp.player)
+        key = (pl, imp.boss)
+        old = best_improvements.get(key)
+        if old is None or (imp.percentile is not None and (old.percentile is None or imp.percentile > old.percentile)):
+            best_improvements[key] = imp
+
+    by_player: Dict[str, List[ParseImprovement]] = defaultdict(list)
+    for (pl, _boss), imp in best_improvements.items():
+        by_player[pl].append(imp)
+
+    def player_sort(item):
+        pl, rows = item
+        best_pct = max((r.percentile for r in rows if r.percentile is not None), default=-1.0)
+        return (-len(rows), -best_pct, display_names.get(pl, pl).lower())
+
+    ordered = []
+    for pl, rows in sorted(by_player.items(), key=player_sort):
+        rows.sort(key=lambda r: _analyse_log_boss_sort_key(r.boss))
+        ordered.append((display_names.get(pl, pl), rows))
+    return ordered
+
+
+def _render_report_image(title: str, subtitle: str, section_items) -> bytes:
+    if Image is None or ImageDraw is None or ImageFont is None:
+        raise RuntimeError("Pillow indisponible pour générer l'image Analyse Log.")
+    width = 1600
+    margin = 56
+    inner_w = width - margin * 2
+    pad = 24
+
+    title_font = _report_font(42, True)
+    subtitle_font = _report_font(26, True)
+    section_font = _report_font(28, True)
+
+    dummy = Image.new("RGB", (width, 10), REPORT_BG)
+    measure = ImageDraw.Draw(dummy)
+
+    blocks = []
+    total_h = margin
+    header_h = 122
+    blocks.append(("header", header_h, title, subtitle))
+    total_h += header_h + 16
+
+    for item in section_items:
+        if item[0] == "section":
+            _, heading, rows = item
+            row_lines = []
+            content_h = pad + 34
+            for segments in rows:
+                wrapped = _wrap_segments(measure, segments, inner_w - pad * 2)
+                lh = 34
+                row_lines.append((wrapped, lh))
+                content_h += lh * len(wrapped) + 10
+            content_h += pad - 10
+            blocks.append(("section", content_h, heading, row_lines))
+            total_h += content_h + 16
+        elif item[0] == "message":
+            _, heading, segments = item
+            wrapped = _wrap_segments(measure, segments, inner_w - pad * 2)
+            content_h = pad + 34 + len(wrapped) * 34 + pad
+            blocks.append(("message", content_h, heading, wrapped))
+            total_h += content_h + 16
+
+    total_h += margin
+    img = Image.new("RGB", (width, max(total_h, 300)), REPORT_BG)
+    draw = ImageDraw.Draw(img)
+    y = margin
+    for block in blocks:
+        kind, h = block[0], block[1]
+        draw.rounded_rectangle((margin, y, width - margin, y + h), radius=24, fill=REPORT_PANEL if kind == "header" else REPORT_PANEL_2)
+        if kind == "header":
+            _, _, block_title, block_subtitle = block
+            draw.text((margin + pad, y + 20), block_title, fill=REPORT_TEXT, font=title_font)
+            draw.text((margin + pad, y + 72), block_subtitle, fill=REPORT_ACCENT, font=subtitle_font)
+        elif kind == "section":
+            _, _, heading, row_lines = block
+            draw.text((margin + pad, y + 18), heading, fill=REPORT_TEXT, font=section_font)
+            draw.line((margin + pad, y + 58, width - margin - pad, y + 58), fill=REPORT_DIVIDER, width=2)
+            cy = y + 74
+            for wrapped, lh in row_lines:
+                cy = _render_segment_lines(draw, margin + pad, cy, wrapped, lh)
+                cy += 10
+        elif kind == "message":
+            _, _, heading, wrapped = block
+            draw.text((margin + pad, y + 18), heading, fill=REPORT_TEXT, font=section_font)
+            draw.line((margin + pad, y + 58, width - margin - pad, y + 58), fill=REPORT_DIVIDER, width=2)
+            _render_segment_lines(draw, margin + pad, y + 74, wrapped, 34)
+        y += h + 16
+
+    buf = io.BytesIO()
+    img.save(buf, format="PNG", optimize=True)
+    return buf.getvalue()
+
+
+def render_pewpew_ranking_image(hits: List[PewPewHit]) -> bytes:
+    sections = _ranking_sections(hits)
+    if not sections:
+        return _render_report_image(
+            "Analyse Log",
+            "Classement du raid",
+            [("message", "Classement du raid", [("Aucun joueur Top 33 sur ce raid.", REPORT_TEXT, _report_font(24, False))])],
+        )
+    section_items = []
+    for _threshold, label, rows in sections:
+        rendered_rows = []
+        for row in rows:
+            segs = [("• ", REPORT_TEXT, _report_font(24, False)), (row["name"], _analyse_log_class_color(row.get("spec", "")), _report_font(24, True)), (" — ", REPORT_MUTED, _report_font(24, False))]
+            for idx, hit in enumerate(row["lead"]):
+                label_text = "SERVER BEST!" if hit.server_best else f"{hit.points:.2f}%"
+                segs.append((label_text, _analyse_log_parse_color(hit.points, hit.server_best), _report_font(24, True)))
+                segs.append((f" sur {_analyse_log_boss_label(hit.boss)}", REPORT_TEXT, _report_font(24, False)))
+                if idx < len(row["lead"]) - 1 or row["extras"]:
+                    segs.append((", ", REPORT_MUTED, _report_font(24, False)))
+            if row["extras"]:
+                segs.append(("aussi ", REPORT_MUTED, _report_font(24, False)))
+                for idx, (threshold, count) in enumerate(row["extras"]):
+                    label_num = "0.2" if abs(threshold - 0.2) < 1e-9 else str(int(threshold))
+                    segs.append((str(count), REPORT_TEXT, _report_font(24, True)))
+                    segs.append((f" top {label_num}%", REPORT_MUTED, _report_font(24, False)))
+                    if idx < len(row["extras"]) - 1:
+                        segs.append((", ", REPORT_MUTED, _report_font(24, False)))
+            rendered_rows.append(segs)
+        section_items.append(("section", label, rendered_rows))
+    return _render_report_image("Analyse Log", "Classement du raid", section_items)
+
+
+def render_analysis_improvements_image(improvements: List[ParseImprovement], improvement_failures: int = 0) -> bytes:
+    rows = _improvement_rows(improvements)
+    if not rows:
+        msg = f"Aucune amélioration confirmée ; {improvement_failures} vérification(s) /character ont échoué." if improvement_failures else "Aucune amélioration de parse détectée sur ce raid."
+        return _render_report_image(
+            "Analyse Log",
+            "Parses améliorées sur ce raid",
+            [("message", "Parses améliorées sur ce raid", [(msg, REPORT_TEXT, _report_font(24, False))])],
+        )
+    rendered_rows = []
+    for player_name, player_rows in rows:
+        segs = [("• ", REPORT_TEXT, _report_font(24, False)), (player_name, _analyse_log_class_color(next((r.spec for r in player_rows if r.spec), "")), _report_font(24, True)), (" — ", REPORT_MUTED, _report_font(24, False))]
+        for idx, row in enumerate(player_rows):
+            boss_label = _analyse_log_boss_label(row.boss)
+            kills_label = str(row.kills) if row.kills is not None else "?"
+            segs.append((boss_label, REPORT_TEXT, _report_font(24, True)))
+            segs.append((f" ({kills_label}) ", REPORT_MUTED, _report_font(24, False)))
+            segs.append(((f"{row.percentile:.2f}%" if row.percentile is not None else "?"), _analyse_log_parse_color(row.percentile), _report_font(24, True)))
+            if idx < len(player_rows) - 1:
+                segs.append((", ", REPORT_MUTED, _report_font(24, False)))
+        rendered_rows.append(segs)
+    section_items = [("section", "Parses améliorées sur ce raid", rendered_rows)]
+    if improvement_failures:
+        section_items.append(("message", "Note", [(f"⚠️ {improvement_failures} vérification(s) d'amélioration ont échoué ; la liste peut être incomplète.", REPORT_MUTED, _report_font(22, False))]))
+    return _render_report_image("Analyse Log", "Parses améliorées sur ce raid", section_items)
+
+
 PEWPEW_STATE_FILE = APP_DIR / "apogeebot_seen_v11.json"
 PEWPEW_LOCK = asyncio.Lock()
 PEWPEW_IN_FLIGHT: set = set()
@@ -3445,68 +3788,6 @@ def _pewpew_page_debug_summary(raw_html: str) -> Dict[str, Any]:
     }
 
 
-
-# =============================================================================
-# Discord ANSI colors (```ansi code blocks) — noms par couleur de classe,
-# valeurs de parse par couleur de percentile façon uwu-logs/WarcraftLogs.
-#
-# Discord ne supporte que 8 couleurs ANSI de base (30-37) x gras/normal, donc
-# le mapping classe->couleur est une approximation la plus proche possible,
-# pas les couleurs Blizzard exactes.
-# =============================================================================
-
-WOW_CLASS_ANSI: Dict[str, Tuple[bool, int]] = {
-    "death knight": (True, 31),   # rouge (proche de #C41F3B)
-    "druid": (False, 33),         # jaune (pas d'orange en ANSI de base)
-    "hunter": (False, 32),        # vert
-    "mage": (True, 36),           # cyan gras (bleu clair)
-    "paladin": (True, 35),        # magenta gras (rose)
-    "priest": (True, 37),         # blanc gras
-    "rogue": (True, 33),          # jaune gras
-    "shaman": (False, 34),        # bleu
-    "warlock": (False, 35),       # magenta (violet)
-    "warrior": (False, 37),       # blanc (brun/tan non représentable)
-}
-
-
-def _ansi(text: str, color: int, bold: bool = False) -> str:
-    return f"\u001b[{1 if bold else 0};{color}m{text}\u001b[0m"
-
-
-def _wow_class_from_spec(spec: str) -> str:
-    s = re.sub(r"\s+", " ", (spec or "").strip().lower())
-    if s.endswith("death knight"):
-        return "death knight"
-    parts = s.split(" ")
-    return parts[-1] if parts else ""
-
-
-def _colored_player_name(name: str, spec: str) -> str:
-    cls = _wow_class_from_spec(spec)
-    bold, color = WOW_CLASS_ANSI.get(cls, (False, 37))
-    return _ansi(name, color, bold)
-
-
-def _percentile_ansi(value: float) -> Tuple[bool, int]:
-    """Bandes de couleur façon uwu-logs/WarcraftLogs (percentile 0-100)."""
-    if value >= 99:
-        return True, 31    # rose/rouge ("artifact")
-    if value >= 90:
-        return True, 33    # orange (jaune gras, pas d'orange en ANSI)
-    if value >= 75:
-        return False, 35   # violet
-    if value >= 50:
-        return False, 34   # bleu
-    if value >= 25:
-        return False, 32   # vert
-    return False, 30       # gris
-
-
-def _colored_percent(value: float) -> str:
-    bold, color = _percentile_ansi(value)
-    return _ansi(f"{value:.2f}%", color, bold)
-
-
 def _pewpew_tier(value: float) -> Optional[float]:
     for threshold, _label in PEWPEW_TIERS:
         if value <= threshold + 1e-9:
@@ -3521,14 +3802,7 @@ def _fmt_top_percent(value: float) -> str:
 
 
 def format_pewpew_report(hits: List[PewPewHit]) -> str:
-    """Format only the Top tiers for Analyse Log.
-
-    Noms colorés par couleur de classe, valeurs de parse colorées par bande de
-    percentile (façon uwu-logs), rendu via un bloc de code ```ansi``` Discord.
-    Les compteurs "aussi X top Y%" sont désormais NON cumulatifs : chaque boss
-    n'est compté que dans son propre palier, pas répété dans tous les paliers
-    supérieurs.
-    """
+    """Format only the Top tiers for Analyse Log."""
     # Best result per player + boss across attempts.
     best: Dict[Tuple[str, str], PewPewHit] = {}
     display_name: Dict[str, str] = {}
@@ -3554,49 +3828,35 @@ def format_pewpew_report(hits: List[PewPewHit]) -> str:
     if not tier_players:
         return ""
 
-    sections: List[str] = ["**Classement du raid**"]
+    lines = ["**Classement du raid**"]
     for threshold, label in PEWPEW_TIERS:
         players = tier_players.get(threshold, [])
         if not players:
             continue
         players.sort(key=lambda item: (item[1][0].top_percent, item[0].lower()))
-        sections.append(label)
+        lines.append(label)
 
-        ansi_lines: List[str] = []
         for name, phits in players:
             lead = [h for h in phits if h.top_percent <= threshold + 1e-9]
-            colored_name = _colored_player_name(name, lead[0].spec if lead else "")
             lead_parts = []
             for h in lead:
                 # `h.points` is UwU /rank's percentile: the actual parse value.
                 # The Top category still uses 100 - percentile via h.top_percent.
-                value = "SERVER BEST!" if h.server_best else _colored_percent(h.points)
-                lead_parts.append(f"{value} sur {_analyse_log_boss_label(h.boss)}")
-
-            # Comptage NON cumulatif : chaque boss restant est classé dans son
-            # propre palier exact, sans être re-compté dans les paliers au-dessus.
-            remaining = [h for h in phits if h.top_percent > threshold + 1e-9]
-            bucket_counts: Dict[float, int] = defaultdict(int)
-            for h in remaining:
-                bucket = _pewpew_tier(h.top_percent)
-                if bucket is not None:
-                    bucket_counts[bucket] += 1
+                value = "SERVER BEST!" if h.server_best else f"{h.points:.2f}%"
+                lead_parts.append(f"**{value}** sur {_analyse_log_boss_label(h.boss)}")
 
             extras = []
-            for t, _lbl in PEWPEW_TIERS:
-                if t <= threshold:
-                    continue
-                count = bucket_counts.get(t, 0)
+            thresholds = [t for t, _ in PEWPEW_TIERS if t > threshold]
+            for t in thresholds:
+                count = sum(1 for h in phits if h.top_percent <= t + 1e-9)
                 if count:
                     label_num = "0.2" if t == 0.2 else str(int(t))
-                    extras.append(f"{count} top {label_num}%")
+                    extras.append(f"**{count}** top {label_num}%")
 
             suffix = (", aussi " + ", ".join(extras)) if extras else ""
-            ansi_lines.append(f"  \u25B8 {colored_name}: " + ", ".join(lead_parts) + suffix)
+            lines.append(f"  🔸  *{name}*: " + ", ".join(lead_parts) + suffix)
 
-        sections.append("```ansi\n" + "\n".join(ansi_lines) + "\n```")
-
-    return "\n".join(sections)
+    return "\n".join(lines)
 
 
 def format_analysis_log(
@@ -3647,21 +3907,17 @@ def format_analysis_log(
         best_pct = max((r.percentile for r in rows if r.percentile is not None), default=-1.0)
         return (-len(rows), -best_pct, display_names.get(pl, pl).lower())
 
-    ansi_lines: List[str] = []
     for pl, rows in sorted(by_player.items(), key=player_sort):
         # Ordre de boss fixe demandé pour les parses améliorées.
         rows.sort(key=lambda r: _analyse_log_boss_sort_key(r.boss))
-        colored_name = _colored_player_name(display_names.get(pl, pl), rows[0].spec)
         parts = []
         for row in rows:
             boss_label = _analyse_log_boss_label(row.boss)
             if row.percentile is None:
-                parts.append(boss_label)
+                parts.append(f"**{boss_label}**")
             else:
-                parts.append(f"{boss_label} {_colored_percent(row.percentile)}")
-        ansi_lines.append(f"\u2022 {colored_name} \u2014 " + ", ".join(parts))
-
-    lines.append("```ansi\n" + "\n".join(ansi_lines) + "\n```")
+                parts.append(f"**{boss_label} {row.percentile:.2f}%**")
+        lines.append(f"• **{display_names.get(pl, pl)}** — " + ", ".join(parts))
 
     if improvement_failures:
         lines += [
@@ -4039,8 +4295,9 @@ def _apogeebot_hits_from_rank_payload(
     boss: str,
     specs: Optional[Dict[str, str]] = None,
 ) -> List[PewPewHit]:
-    specs = specs or {}
     hits: List[PewPewHit] = []
+    specs = specs or {}
+    specs_by_lower = {str(k).lower(): str(v) for k, v in specs.items()}
     for player, raw in payload.items():
         if not WOW_NAME_RE.fullmatch(str(player)) or not isinstance(raw, dict):
             continue
@@ -4051,14 +4308,15 @@ def _apogeebot_hits_from_rank_payload(
         if top_percent > 33.0001:
             continue
         rank = _numeric(raw.get("rank"))
+        player_name = str(player)
         hits.append(
             PewPewHit(
-                player=str(player),
+                player=player_name,
                 boss=boss,
                 top_percent=top_percent,
                 points=float(percentile),
                 server_best=(rank == 1 or percentile >= 99.995),
-                spec=specs.get(str(player), ""),
+                spec=specs.get(player_name, specs_by_lower.get(player_name.lower(), "")),
             )
         )
     return hits
@@ -4309,6 +4567,7 @@ def _character_report_improvements(
                 boss=boss,
                 percentile=current_percentiles.get(key),
                 spec=current_specs.get(key, ""),
+                kills=_extract_improvement_kills(raw),
             )
         )
 
@@ -4408,7 +4667,7 @@ async def _detect_report_improvements(
     return list(found.values()), queries, failures
 
 
-async def build_pewpew_report(report_url: str) -> Tuple[str, Dict[str, int]]:
+async def build_pewpew_report(report_url: str) -> Tuple[bytes, bytes, Dict[str, int]]:
     """Analyse Log: current-kill /rank + personal improvements from this report.
 
     Ranking is ALWAYS based on each kill's Useful DPS/spec submitted to /rank.
@@ -4586,7 +4845,7 @@ async def build_pewpew_report(report_url: str) -> Tuple[str, Dict[str, int]]:
 
     if stats["kills_ranked"] <= 0:
         print(f"[ANALYSE LOG] Aucun kill n'a pu être classé via /rank pour {report_id}")
-        return "", stats
+        return b"", b"", stats
 
     improvements, imp_queries, imp_failures = await _detect_report_improvements(
         report_id,
@@ -4608,7 +4867,9 @@ async def build_pewpew_report(report_url: str) -> Tuple[str, Dict[str, int]]:
         f"{imp_failures} échec(s)"
     )
 
-    return format_analysis_log(hits, improvements, imp_failures), stats
+    ranking_png = render_pewpew_ranking_image(hits)
+    improvements_png = render_analysis_improvements_image(improvements, imp_failures)
+    return ranking_png, improvements_png, stats
 def _message_uwu_urls(message: discord.Message) -> List[str]:
     parts = [message.content or ""]
     for embed in message.embeds:
@@ -4679,7 +4940,7 @@ async def handle_uwu_pewpew_message(
             PEWPEW_IN_FLIGHT.add(canonical)
 
             try:
-                report, stats = await build_pewpew_report(canonical)
+                ranking_png, improvements_png, stats = await build_pewpew_report(canonical)
                 print(f"[ANALYSE LOG] Résultat {canonical}: {stats}")
 
                 if stats["participants"] <= 0:
@@ -4707,19 +4968,25 @@ async def handle_uwu_pewpew_message(
                     )
                     continue
 
-                if report:
-                    # Texte Discord normal = pleine largeur. On coupe seulement
-                    # si la limite de taille Discord l'exige.
-                    for chunk in split_discord_text(report, max_len=1900):
-                        await message.reply(
-                            chunk,
-                            mention_author=False,
-                            allowed_mentions=discord.AllowedMentions.none(),
-                        )
-                else:
-                    print(
-                        f"[ANALYSE LOG] Rapport classé mais aucun texte de sortie: {canonical}"
+                if ranking_png:
+                    await message.reply(
+                        "**Classement du raid**",
+                        file=discord.File(io.BytesIO(ranking_png), filename="AnalyseLog_ClassementRaid.png"),
+                        mention_author=False,
+                        allowed_mentions=discord.AllowedMentions.none(),
                     )
+                else:
+                    print(f"[ANALYSE LOG] Image classement vide: {canonical}")
+
+                if improvements_png:
+                    await message.reply(
+                        "**Parses améliorées sur ce raid**",
+                        file=discord.File(io.BytesIO(improvements_png), filename="AnalyseLog_ParsesAmeliorees.png"),
+                        mention_author=False,
+                        allowed_mentions=discord.AllowedMentions.none(),
+                    )
+                else:
+                    print(f"[ANALYSE LOG] Image améliorations vide: {canonical}")
 
                 PEWPEW_SEEN_REPORTS.add(canonical)
                 _save_pewpew_seen()
