@@ -3981,6 +3981,13 @@ async def _get_uwu_character_for_improvements(
     raise RuntimeError("UwU /character amélioration impossible")
 
 
+# Payload sample dump: only the first successful /character response of the
+# process is logged in full, so Kroma can eyeball the real shape once and
+# confirm/adjust the parsing assumptions below without spamming the console
+# on every subsequent call.
+_ANALYSE_LOG_CHARACTER_SAMPLE_LOGGED = False
+
+
 def _character_report_improvements(
     payload: Dict[str, Any],
     player: str,
@@ -3994,13 +4001,34 @@ def _character_report_improvements(
     Primary proof is UwU's character `report_id`. As a robust fallback, the
     current kill's Useful DPS may equal the character endpoint's `dps_max`;
     that field is UwU's best DPS row for the player/spec/boss.
+
+    IMPORTANT (non vérifié en direct, réseau indisponible dans cet
+    environnement) : la forme exacte du payload `/character` (clé `bosses`,
+    noms de champs `report_id`/`dps_max`) n'a jamais été confirmée contre une
+    vraie réponse d'uwu-logs.xyz. Un cas concret a été observé le 16/08/2026
+    (Fireland, amélioration confirmée sur Blood-Queen Lana'thel, non détectée
+    par le bot) : ni `same_report` ni `same_best_dps` n'ont matché alors que
+    la clé (joueur, boss) existait bien dans `current_percentiles`. Les logs
+    ci-dessous existent pour capturer précisément ce cas au prochain run réel
+    avec DKPARSE_DEBUG=true, plutôt que de deviner un nouveau nom de champ à
+    l'aveugle.
     """
     bosses = payload.get("bosses")
     if not isinstance(bosses, dict):
+        dkp_debug(
+            "ANALYSE LOG /character FORME INATTENDUE (pas de clé 'bosses' dict)",
+            {
+                "player": player,
+                "payload_keys": list(payload.keys()) if isinstance(payload, dict) else type(payload).__name__,
+            },
+        )
         return []
 
     report_low = current_report_id.lower()
     out: List[ParseImprovement] = []
+    own_keys = {k for k in current_percentiles if k[0] == player.lower()}
+    seen_keys: set = set()
+
     for raw_boss, raw in bosses.items():
         if not isinstance(raw, dict) or not raw:
             continue
@@ -4015,6 +4043,7 @@ def _character_report_improvements(
         if not boss:
             continue
         key = (player.lower(), boss.lower())
+        seen_keys.add(key)
 
         # Only bosses actually processed from a HEROIC kill in this report can
         # count as an improvement. This also guarantees NM parses never leak in.
@@ -4031,7 +4060,24 @@ def _character_report_improvements(
             and raid_dps is not None
             and abs(float(best_dps) - float(raid_dps)) <= 0.25
         )
+
         if not (same_report or same_best_dps):
+            # Clé qu'on savait pertinente (le joueur a fait ce boss ce soir),
+            # mais aucun critère ne matche : c'est précisément le cas qu'il
+            # faut pouvoir inspecter (ex. Fireland / Blood-Queen Lana'thel
+            # observé le 16/08/2026).
+            dkp_debug(
+                "ANALYSE LOG AMELIORATION NON DETECTEE (clé attendue mais aucun critère matché)",
+                {
+                    "player": player,
+                    "boss": boss,
+                    "report_id_recu": report_id,
+                    "report_id_poste": current_report_id,
+                    "dps_max_recu": best_dps,
+                    "raid_dps": raid_dps,
+                    "raw_boss_entry": raw,
+                },
+            )
             continue
 
         if same_best_dps and not same_report:
@@ -4055,6 +4101,22 @@ def _character_report_improvements(
                 spec=current_specs.get(key, ""),
             )
         )
+
+    # Clés qu'on attendait absolument (le joueur a joué ce boss ce soir selon
+    # /rank) mais qui n'apparaissent même pas dans payload["bosses"] — signe
+    # que le nom de boss côté /character ne matche pas normalize_boss(), ou
+    # que la structure du payload diffère de ce qui est supposé ici.
+    missing = own_keys - seen_keys
+    if missing:
+        dkp_debug(
+            "ANALYSE LOG BOSS ABSENT DU PAYLOAD /character",
+            {
+                "player": player,
+                "missing_boss_keys": sorted(missing),
+                "bosses_recus": sorted(bosses.keys()),
+            },
+        )
+
     return out
 
 
@@ -4092,6 +4154,15 @@ async def _detect_report_improvements(
             try:
                 payload = await _get_uwu_character_for_improvements(player, spec_idx, server)
                 queries += 1
+
+                global _ANALYSE_LOG_CHARACTER_SAMPLE_LOGGED
+                if not _ANALYSE_LOG_CHARACTER_SAMPLE_LOGGED:
+                    dkp_debug(
+                        "ANALYSE LOG /character PAYLOAD ECHANTILLON (premier appel du process)",
+                        {"player": player, "spec_idx": spec_idx, "payload": payload},
+                    )
+                    _ANALYSE_LOG_CHARACTER_SAMPLE_LOGGED = True
+
                 rows = _character_report_improvements(
                     payload,
                     player,
