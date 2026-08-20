@@ -708,7 +708,7 @@ async def run_rh_list(interaction: discord.Interaction, message: discord.Message
             main = main_map.get(s.user_id)
             if main:
                 grouped[s.status].append(main)
-                export_items.append(f"{main}:{STATUS_CODES.get(s.status, 'U')}")
+                export_items.append(f"{main}:{STATUS_CODES.get(s.status, 'U')}:{s.user_id}")
             else:
                 unrecognized.append(s)
 
