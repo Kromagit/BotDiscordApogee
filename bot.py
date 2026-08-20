@@ -4369,19 +4369,26 @@ async def _post_uwu_rank(payload: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _uwu_rank_points(raw: Dict[str, Any]) -> Optional[float]:
-    """Return the UwU points value shown on the character page.
-    Several transports used by UwU expose the same metric under slightly
-    different names; fallback to percentile only if nothing better is exposed.
+    """Return the percentile calculated by UwU for this exact fight.
+
+    ``/rank`` returns an ordinal ``rank`` and the current fight's
+    ``percentile``.  The ``points`` shown by ``/character`` are personal-best
+    values and must never replace this percentile in the raid ranking.
     """
     if not isinstance(raw, dict):
         return None
+
+    # This is the value used by report_main.js in the "Better than X%" label.
+    value = _numeric(raw.get("percentile"))
+    if value is not None and 0.0 <= value <= 100.0:
+        return float(value)
+
+    # Compatibility fallback for a future/alternate /rank transport.  These
+    # keys are accepted only from the /rank response passed to this helper.
     for key in ("points", "point", "score", "parse", "value"):
         value = _numeric(raw.get(key))
         if value is not None and 0.0 <= value <= 100.0:
             return float(value)
-    value = _numeric(raw.get("percentile"))
-    if value is not None and 0.0 <= value <= 100.0:
-        return float(value)
     return None
 
 
@@ -4804,104 +4811,6 @@ def _character_report_improvements(
     return out
 
 
-async def _build_character_points_hits(
-    server: str,
-    player_specs: Dict[str, set],
-    display_names: Dict[str, str],
-    current_specs: Dict[Tuple[str, str], str],
-    current_dps: Dict[Tuple[str, str], float],
-    character_payload_cache: Dict[Tuple[str, int], Dict[str, Any]],
-) -> Tuple[List[PewPewHit], int, int]:
-    """Build Analyse Log ranking from the exact Points shown by UwU /character.
-
-    /rank is still used to validate/rank the raid participants, but its
-    `percentile` is NOT a Performance Points value and must never be displayed
-    as if it were one.
-    """
-    hits_by_key: Dict[Tuple[str, str], PewPewHit] = {}
-    queries = 0
-    failures = 0
-
-    for player_low in sorted(player_specs):
-        player = display_names.get(player_low, player_low.capitalize())
-
-        tree_indices: List[int] = []
-        for spec_name in sorted(player_specs[player_low]):
-            idx = _apogeebot_tree_index_from_spec(spec_name)
-            if idx and idx not in tree_indices:
-                tree_indices.append(idx)
-
-        for spec_idx in tree_indices:
-            try:
-                cache_key = (player_low, int(spec_idx))
-                payload = character_payload_cache.get(cache_key)
-                if payload is None:
-                    payload = await _get_uwu_character_for_improvements(player, spec_idx, server)
-                    character_payload_cache[cache_key] = payload
-                    queries += 1
-
-                bosses = payload.get("bosses")
-                if not isinstance(bosses, dict):
-                    continue
-
-                for raw_boss, raw in bosses.items():
-                    if not isinstance(raw, dict) or not raw:
-                        continue
-
-                    boss = normalize_boss(str(raw_boss)) or str(raw_boss).strip()
-                    key = (player_low, boss.lower())
-
-                    # Only bosses the player actually did in THIS posted report.
-                    if key not in current_dps:
-                        continue
-
-                    # If the player changed spec during the raid, use the
-                    # /character payload corresponding to the spec used on this boss.
-                    boss_spec = current_specs.get(key, "")
-                    boss_spec_idx = _apogeebot_tree_index_from_spec(boss_spec)
-                    if boss_spec_idx and boss_spec_idx != spec_idx:
-                        continue
-
-                    points = _character_points_value(raw)
-                    if points is None:
-                        continue
-
-                    rank_players = _character_rank_players(raw)
-                    top1 = rank_players == 1
-
-                    if not top1 and points < 70.0 - 1e-9:
-                        continue
-
-                    hit = PewPewHit(
-                        player=player,
-                        boss=boss,
-                        top_percent=max(0.0, 100.0 - points),
-                        points=points,
-                        server_best=top1,
-                        spec=boss_spec,
-                    )
-
-                    old = hits_by_key.get(key)
-                    if old is None or hit.points > old.points or (
-                        hit.points == old.points and hit.server_best and not old.server_best
-                    ):
-                        hits_by_key[key] = hit
-
-            except Exception as exc:
-                failures += 1
-                dkp_debug(
-                    "ANALYSE LOG POINTS /character ECHEC",
-                    {
-                        "player": player,
-                        "spec_idx": spec_idx,
-                        "error": f"{type(exc).__name__}: {exc}",
-                    },
-                )
-            await asyncio.sleep(0.05)
-
-    return list(hits_by_key.values()), queries, failures
-
-
 async def _detect_report_improvements(
     report_id: str,
     server: str,
@@ -5013,8 +4922,6 @@ async def build_pewpew_report(report_url: str) -> Tuple[bytes, bytes, Dict[str, 
         "kills_detected": len(kill_urls),
         "kills_ranked": 0,
         "kills_failed": 0,
-        "character_points_queries": 0,
-        "character_points_failures": 0,
         "improvement_queries": 0,      # /character, improvement-only
         "improvement_query_failures": 0,
         "improved_players": 0,
@@ -5120,8 +5027,11 @@ async def build_pewpew_report(report_url: str) -> Tuple[bytes, bytes, Dict[str, 
                 if old is None or float(points) > old:
                     current_percentiles[key] = float(points)
 
-            # /rank sert au classement relatif et à la validation du kill,
-            # mais son `percentile` n'est PAS le champ Points d'UwU.
+            # Le classement du raid doit refléter CE kill. /character contient
+            # au contraire les meilleurs historiques et n'est utilisé qu'après,
+            # pour déterminer si ce kill est devenu un nouveau record personnel.
+            hits.extend(_apogeebot_hits_from_rank_payload(rank_data, boss, specs))
+
             print(
                 f"[ANALYSE LOG] {boss} {mode}: {len(rank_data)} joueur(s) classé(s)"
             )
@@ -5131,7 +5041,7 @@ async def build_pewpew_report(report_url: str) -> Tuple[bytes, bytes, Dict[str, 
                     "boss": boss,
                     "mode": mode,
                     "ranked": len(rank_data),
-                    "note": "Points affichés ensuite depuis /character, pas depuis /rank.percentile",
+                    "note": "Classement affiché depuis /rank.percentile pour ce kill",
                 },
             )
         except Exception as exc:
@@ -5159,21 +5069,11 @@ async def build_pewpew_report(report_url: str) -> Tuple[bytes, bytes, Dict[str, 
         print(f"[ANALYSE LOG] Aucun kill n'a pu être classé via /rank pour {report_id}")
         return b"", b"", stats
 
-    # Source de vérité pour les valeurs affichées : /character.
-    # C'est ce qui fait notamment Enesis DBS = 84.91 quand UwU affiche points=8491.
+    # /character est réservé aux records personnels. Le classement ci-dessus
+    # reste fondé sur /rank.percentile, donc uniquement sur le raid posté.
     character_payload_cache: Dict[Tuple[str, int], Dict[str, Any]] = {}
-    hits, points_queries, points_failures = await _build_character_points_hits(
-        server,
-        player_specs,
-        display_names,
-        current_specs,
-        current_dps,
-        character_payload_cache,
-    )
     stats["players_with_hits"] = len({h.player.lower() for h in hits})
     stats["hits"] = len(hits)
-    stats["character_points_queries"] = points_queries
-    stats["character_points_failures"] = points_failures
 
     improvements, imp_queries, imp_failures = await _detect_report_improvements(
         report_id,
