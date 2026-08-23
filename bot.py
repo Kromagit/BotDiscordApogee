@@ -98,6 +98,9 @@ UWU_PEWPEW_ENABLED = os.getenv("UWU_PEWPEW_ENABLED", "true").strip().lower() in 
     "1", "true", "yes", "on"
 }
 UWU_PEWPEW_MAX_FIGHTS_PER_BOSS = int(os.getenv("UWU_PEWPEW_MAX_FIGHTS_PER_BOSS", "2") or 2)
+KROMADDON_SAVED_VARIABLES_FILE = os.path.expandvars(
+    os.path.expanduser(os.getenv("KROMADDON_SAVED_VARIABLES", "").strip())
+)
 
 RAID_HELPER_API = "https://raid-helper.dev/api/v4/events/{event_id}"
 WOW_NAME_RE = re.compile(r"^[A-Za-z]{2,12}$")
@@ -142,8 +145,9 @@ GRADE_ROLE_ORDER: Tuple[str, ...] = (
 DM_BAD_MAIN = (
     "Message automatique Apogee :\n"
     "Ton message dans #Main n'est pas valide. "
-    "Écris uniquement le nom exact de ton main en guilde, sans texte autour.\n"
-    "Exemple : Kromatisme"
+    "Écris le nom exact de ton main sur la première ligne, puis éventuellement "
+    "un reroll par ligne, sans texte autour.\n"
+    "Exemple :\nKromatisme\nKromamage\nKromadruide"
 )
 
 # Specs DKPARSE retenues.
@@ -567,33 +571,185 @@ async def get_main_channel(guild: discord.Guild) -> discord.TextChannel:
     return await get_text_channel(guild, MAIN_CHANNEL_ID, "MAIN_CHANNEL_ID")
 
 
-async def build_main_map(guild: discord.Guild) -> Tuple[Dict[int, str], List[str]]:
+def _parse_main_declaration(content: str) -> Optional[List[str]]:
+    """Parse one #main message: main first, then zero or more rerolls."""
+    characters = [line.strip() for line in (content or "").splitlines() if line.strip()]
+    if not characters or any(not WOW_NAME_RE.fullmatch(name) for name in characters):
+        return None
+    folded = [name.casefold() for name in characters]
+    if len(folded) != len(set(folded)):
+        return None
+    return characters
+
+
+async def build_main_registry(
+    guild: discord.Guild,
+) -> Tuple[Dict[int, List[str]], List[str]]:
+    """Return each Discord user's main followed by every declared reroll."""
     channel = await get_main_channel(guild)
-    by_user: Dict[int, Tuple[str, int]] = {}
+    by_user: Dict[int, Tuple[List[str], int]] = {}
     name_owner: Dict[str, int] = {}
     problems: List[str] = []
 
     async for msg in channel.history(limit=None, oldest_first=True):
         if msg.author.bot:
             continue
-        name = msg.content.strip()
-        if not WOW_NAME_RE.fullmatch(name):
-            problems.append(f"<@{msg.author.id}> : message invalide (`{name[:40]}`)")
+        characters = _parse_main_declaration(msg.content)
+        if not characters:
+            preview = re.sub(r"\s+", " ", msg.content or "").strip()[:60]
+            problems.append(f"<@{msg.author.id}> : message invalide (`{preview}`)")
             continue
-        folded = name.lower()
-        if folded in name_owner and name_owner[folded] != msg.author.id:
+
+        conflicts = [
+            name
+            for name in characters
+            if name.casefold() in name_owner
+            and name_owner[name.casefold()] != msg.author.id
+        ]
+        if conflicts:
             problems.append(
-                f"<@{msg.author.id}> : `{name}` déjà déclaré par <@{name_owner[folded]}>"
+                f"<@{msg.author.id}> : "
+                + ", ".join(
+                    f"`{name}` déjà déclaré par <@{name_owner[name.casefold()]}>"
+                    for name in conflicts
+                )
             )
             continue
+
         if msg.author.id in by_user:
-            old_name, _ = by_user[msg.author.id]
-            name_owner.pop(old_name.lower(), None)
+            old_characters, _ = by_user[msg.author.id]
+            for old_name in old_characters:
+                if name_owner.get(old_name.casefold()) == msg.author.id:
+                    name_owner.pop(old_name.casefold(), None)
             problems.append(f"<@{msg.author.id}> : plusieurs messages valides dans #Main")
-        by_user[msg.author.id] = (name, msg.id)
-        name_owner[folded] = msg.author.id
+        by_user[msg.author.id] = (characters, msg.id)
+        for name in characters:
+            name_owner[name.casefold()] = msg.author.id
 
     return {uid: value[0] for uid, value in by_user.items()}, problems
+
+
+async def build_main_map(guild: discord.Guild) -> Tuple[Dict[int, str], List[str]]:
+    registry, problems = await build_main_registry(guild)
+    return {
+        user_id: characters[0]
+        for user_id, characters in registry.items()
+        if characters
+    }, problems
+
+
+def _lua_table_body(raw: str, opening_brace: int) -> Optional[str]:
+    """Return a Lua table body without executing the SavedVariables file."""
+    if opening_brace < 0 or opening_brace >= len(raw) or raw[opening_brace] != "{":
+        return None
+    depth = 0
+    quote = ""
+    escaped = False
+    index = opening_brace
+    while index < len(raw):
+        char = raw[index]
+        if quote:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == quote:
+                quote = ""
+        elif char in {'"', "'"}:
+            quote = char
+        elif raw.startswith("--", index):
+            newline = raw.find("\n", index + 2)
+            if newline < 0:
+                break
+            index = newline
+        elif char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                return raw[opening_brace + 1:index]
+        index += 1
+    return None
+
+
+def _extract_kromaddon_alt_to_main(raw: str) -> Dict[str, str]:
+    """Extract RaidPresenceDB.altToMain pairs from Kromaddon.lua safely."""
+    key_match = re.search(
+        r"(?:\[\s*[\"']altToMain[\"']\s*\]|\baltToMain\b)\s*=\s*\{",
+        raw or "",
+    )
+    if not key_match:
+        return {}
+    opening_brace = (raw or "").find("{", key_match.start())
+    body = _lua_table_body(raw or "", opening_brace)
+    if body is None:
+        return {}
+
+    mapping: Dict[str, str] = {}
+    pair_re = re.compile(
+        r"\[\s*([\"'])([A-Za-z]{2,12})\1\s*\]\s*=\s*"
+        r"([\"'])([A-Za-z]{2,12})\3"
+    )
+    for match in pair_re.finditer(body):
+        alt, main = match.group(2), match.group(4)
+        if alt.casefold() != main.casefold():
+            mapping[alt.casefold()] = main
+    return mapping
+
+
+_KROMADDON_ALT_CACHE_PATH = ""
+_KROMADDON_ALT_CACHE_MTIME_NS = -1
+_KROMADDON_ALT_CACHE: Dict[str, str] = {}
+
+
+def _load_kromaddon_alt_to_main() -> Dict[str, str]:
+    """Load and mtime-cache the configured Kromaddon SavedVariables mapping."""
+    global _KROMADDON_ALT_CACHE_PATH
+    global _KROMADDON_ALT_CACHE_MTIME_NS
+    global _KROMADDON_ALT_CACHE
+
+    if not KROMADDON_SAVED_VARIABLES_FILE:
+        return {}
+    path = Path(KROMADDON_SAVED_VARIABLES_FILE)
+    try:
+        stat = path.stat()
+        resolved = str(path.resolve())
+        if (
+            resolved == _KROMADDON_ALT_CACHE_PATH
+            and stat.st_mtime_ns == _KROMADDON_ALT_CACHE_MTIME_NS
+        ):
+            return dict(_KROMADDON_ALT_CACHE)
+        raw = path.read_text(encoding="utf-8", errors="replace")
+        mapping = _extract_kromaddon_alt_to_main(raw)
+        _KROMADDON_ALT_CACHE_PATH = resolved
+        _KROMADDON_ALT_CACHE_MTIME_NS = stat.st_mtime_ns
+        _KROMADDON_ALT_CACHE = mapping
+        return dict(mapping)
+    except (OSError, UnicodeError) as exc:
+        dkp_debug(
+            "ANALYSE LOG LECTURE KROMADDON.LUA ECHEC",
+            {
+                "path": str(path),
+                "error": f"{type(exc).__name__}: {exc}",
+            },
+        )
+        return {}
+
+
+def _resolve_kromaddon_main(character: str, alt_to_main: Dict[str, str]) -> str:
+    """Resolve an alt chain defensively, stopping on missing links or cycles."""
+    current = character
+    seen: set = set()
+    for _ in range(20):
+        folded = current.casefold()
+        if folded in seen:
+            break
+        seen.add(folded)
+        parent = alt_to_main.get(folded)
+        if not parent or parent.casefold() == folded:
+            break
+        current = parent
+    return current
 
 
 async def build_grade_export(guild: discord.Guild) -> Tuple[str, List[str], int]:
@@ -5154,18 +5310,23 @@ async def _analyse_log_improvement_user_ids(
     guild: discord.Guild,
     improvements: List[ParseImprovement],
 ) -> Tuple[List[int], List[str]]:
-    """Resolve improved character names to Discord users declared in #main."""
-    main_map, main_problems = await build_main_map(guild)
+    """Resolve improved mains/rerolls to their Discord users via #main."""
+    registry, main_problems = await build_main_registry(guild)
     user_by_character = {
         character.casefold(): user_id
-        for user_id, character in main_map.items()
+        for user_id, characters in registry.items()
+        for character in characters
     }
+    alt_to_main = _load_kromaddon_alt_to_main()
 
     user_ids: List[int] = []
     missing: List[str] = []
     seen_ids: set = set()
     for player_name, _rows in _improvement_rows(improvements):
         user_id = user_by_character.get(player_name.casefold())
+        if user_id is None and alt_to_main:
+            main_name = _resolve_kromaddon_main(player_name, alt_to_main)
+            user_id = user_by_character.get(main_name.casefold())
         if user_id is None:
             missing.append(player_name)
             continue
@@ -5590,8 +5751,8 @@ async def enforce_main_message(message: discord.Message):
     ):
         return
 
-    content = message.content.strip()
-    if not WOW_NAME_RE.fullmatch(content):
+    characters = _parse_main_declaration(message.content)
+    if not characters:
         try:
             await message.delete()
         except discord.HTTPException:
@@ -5602,20 +5763,24 @@ async def enforce_main_message(message: discord.Message):
             pass
         return
 
-    owner_of_name: Optional[int] = None
+    conflicting_names: Dict[str, int] = {}
     previous_messages: List[discord.Message] = []
 
     async for other in message.channel.history(limit=None):
         if other.id == message.id or other.author.bot:
             continue
-        other_name = other.content.strip()
-        if WOW_NAME_RE.fullmatch(other_name):
-            if other_name.lower() == content.lower():
-                owner_of_name = other.author.id
-            if other.author.id == message.author.id:
-                previous_messages.append(other)
+        other_characters = _parse_main_declaration(other.content)
+        if not other_characters:
+            continue
+        if other.author.id == message.author.id:
+            previous_messages.append(other)
+            continue
+        other_names = {name.casefold(): name for name in other_characters}
+        for name in characters:
+            if name.casefold() in other_names:
+                conflicting_names[name] = other.author.id
 
-    if owner_of_name is not None and owner_of_name != message.author.id:
+    if conflicting_names:
         try:
             await message.delete()
         except discord.HTTPException:
@@ -5623,8 +5788,11 @@ async def enforce_main_message(message: discord.Message):
         try:
             await message.author.send(
                 "Message automatique Apogee :\n"
-                f"`{content}` est déjà déclaré comme main par un autre membre. "
-                "Ton message dans #Main a été supprimé."
+                + ", ".join(
+                    f"`{name}` est déjà déclaré par <@{owner_id}>"
+                    for name, owner_id in conflicting_names.items()
+                )
+                + ". Ton message dans #Main a été supprimé."
             )
         except discord.HTTPException:
             pass
@@ -5691,6 +5859,10 @@ async def on_ready():
     print(f"#Main channel ID: {MAIN_CHANNEL_ID}")
     print(f"#logs-raid channel ID: {LOGS_RAID_CHANNEL_ID or 'NON CONFIGURE'}")
     print(f"#KAparse channel ID: {DKPARSE_CHANNEL_ID or 'NON CONFIGURE'}")
+    print(
+        "Kromaddon SavedVariables: "
+        + ("CONFIGURE" if KROMADDON_SAVED_VARIABLES_FILE else "NON CONFIGURE")
+    )
     print(f"KAparse window: {DKPARSE_MAX_DAYS} jours")
     print("KAparse OCR: " + ("RapidOCR OK" if (RapidOCR is not None and Image is not None and np is not None) else "INDISPONIBLE"))
     print(f"Analyse Log: {'ACTIVE' if UWU_PEWPEW_ENABLED else 'DESACTIVE'} (/rank HEROIC + détection PB /character+dps_max)")
