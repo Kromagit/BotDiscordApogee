@@ -3089,8 +3089,8 @@ PEWPEW_TIERS: Tuple[Tuple[float, str], ...] = (
     (33.0, "⚫ Top 33% ⚫"),
 )
 
-# Analyse Log V2 : le classement du raid se base désormais sur les points UwU
-# (comme la fiche personnage) et sur les mêmes seuils que KAparse.
+# Analyse Log V2 : le classement du raid se base sur le percentile /rank de
+# chaque combat posté et sur les mêmes seuils que KAparse.
 ANALYSE_LOG_POINT_TIERS: Tuple[Tuple[str, Optional[float], str], ...] = (
     ("top1", None, "🏆 Top 1 🏆"),
     ("99", 99.0, "🟣 Top 99% 🟣"),
@@ -3187,6 +3187,41 @@ ANALYSE_LOG_TRACKED_SPEC_CLASS = {
     "demono": "warlock",
     "mm": "hunter",
 }
+
+
+# AnalyseLog est un classement DPS. Les arbres de talents qui identifient sans
+# ambiguïté un tank ou un soigneur ne doivent entrer ni dans le classement, ni
+# dans la recherche de records personnels. Feral Combat et Frost DK restent
+# inclus : sur WotLK, le seul nom de leur arbre ne permet pas de distinguer de
+# façon fiable un DPS d'un tank.
+ANALYSE_LOG_NON_DPS_SPECS = frozenset({
+    "blood death knight",
+    "protection paladin",
+    "protection warrior",
+    "restoration druid",
+    "holy paladin",
+    "discipline priest",
+    "holy priest",
+    "restoration shaman",
+    # Libellés raccourcis rencontrés selon les pages/transports UwU.
+    "blood",
+    "protection",
+    "restoration",
+    "resto",
+    "discipline",
+    "holy",
+    "feral tank",
+    "guardian druid",
+})
+
+
+def _analyse_log_is_non_dps_spec(spec: str) -> bool:
+    normalized = re.sub(
+        r"\s+",
+        " ",
+        html_lib.unescape(spec or "").strip().lower(),
+    )
+    return normalized in ANALYSE_LOG_NON_DPS_SPECS
 
 
 def _analyse_log_class_from_spec(spec: str) -> str:
@@ -4310,6 +4345,8 @@ def _apogeebot_rank_input_from_fight(
 
         if not player or useful_dps is None or not spec:
             continue
+        if _analyse_log_is_non_dps_spec(spec):
+            continue
         dps[player] = float(useful_dps) + 0.1
         specs[player] = spec
 
@@ -4496,6 +4533,13 @@ def _apogeebot_hits_from_rank_payload(
     for player, raw in payload.items():
         if not WOW_NAME_RE.fullmatch(str(player)) or not isinstance(raw, dict):
             continue
+        player_name = str(player)
+        player_spec = specs.get(
+            player_name,
+            specs_by_lower.get(player_name.lower(), ""),
+        )
+        if _analyse_log_is_non_dps_spec(player_spec):
+            continue
         points = _uwu_rank_points(raw)
         if points is None or not 0.0 <= points <= 100.0:
             continue
@@ -4505,7 +4549,6 @@ def _apogeebot_hits_from_rank_payload(
         # au moins le plus petit seuil KAparse (70 points), ou un Top 1 explicite.
         if not server_best and points < 70.0 - 1e-9:
             continue
-        player_name = str(player)
         hits.append(
             PewPewHit(
                 player=player_name,
@@ -4513,7 +4556,7 @@ def _apogeebot_hits_from_rank_payload(
                 top_percent=max(0.0, 100.0 - float(points)),
                 points=float(points),
                 server_best=server_best,
-                spec=specs.get(player_name, specs_by_lower.get(player_name.lower(), "")),
+                spec=player_spec,
             )
         )
     return hits
@@ -4704,6 +4747,8 @@ def _character_report_improvements(
         # count as an improvement. This also guarantees NM parses never leak in.
         if key not in current_percentiles:
             continue
+        if _analyse_log_is_non_dps_spec(current_specs.get(key, "")):
+            continue
 
         same_report = bool(report_id) and report_id.lower() == report_low
 
@@ -4832,6 +4877,8 @@ async def _detect_report_improvements(
         spec_names = sorted(player_specs[player_low])
         tree_indices = []
         for spec_name in spec_names:
+            if _analyse_log_is_non_dps_spec(spec_name):
+                continue
             idx = _apogeebot_tree_index_from_spec(spec_name)
             if idx and idx not in tree_indices:
                 tree_indices.append(idx)
@@ -4896,7 +4943,9 @@ async def _detect_report_improvements(
     return list(found.values()), queries, failures
 
 
-async def build_pewpew_report(report_url: str) -> Tuple[bytes, bytes, Dict[str, int]]:
+async def build_pewpew_report(
+    report_url: str,
+) -> Tuple[bytes, bytes, Dict[str, int], List[ParseImprovement]]:
     """Analyse Log: current-kill /rank + personal improvements from this report.
 
     Ranking is ALWAYS based on each kill's Useful DPS/spec submitted to /rank.
@@ -4930,7 +4979,7 @@ async def build_pewpew_report(report_url: str) -> Tuple[bytes, bytes, Dict[str, 
 
     if not report_id or not kill_urls:
         print(f"[ANALYSE LOG] Aucun kill exploitable détecté dans {report_id or report_url}")
-        return b"", b"", stats
+        return b"", b"", stats, []
 
     all_participants: set = set()
     all_ranked_players: set = set()
@@ -4971,7 +5020,7 @@ async def build_pewpew_report(report_url: str) -> Tuple[bytes, bytes, Dict[str, 
             if not boss or mode not in {"10N", "10H", "25N", "25H"}:
                 raise RuntimeError(f"boss/mode illisible ({boss!r}, {mode!r})")
             if not dps or not specs:
-                raise RuntimeError("aucun Useful DPS + spec extrait de la page du kill")
+                raise RuntimeError("aucun DPS avec spécialisation éligible extrait de la page du kill")
 
             for name in dps:
                 low = name.lower()
@@ -5067,7 +5116,7 @@ async def build_pewpew_report(report_url: str) -> Tuple[bytes, bytes, Dict[str, 
 
     if stats["kills_ranked"] <= 0:
         print(f"[ANALYSE LOG] Aucun kill n'a pu être classé via /rank pour {report_id}")
-        return b"", b"", stats
+        return b"", b"", stats, []
 
     # /character est réservé aux records personnels. Le classement ci-dessus
     # reste fondé sur /rank.percentile, donc uniquement sur le raid posté.
@@ -5098,7 +5147,40 @@ async def build_pewpew_report(report_url: str) -> Tuple[bytes, bytes, Dict[str, 
 
     ranking_png = render_pewpew_ranking_image(hits)
     improvements_png = render_analysis_improvements_image(improvements, imp_failures)
-    return ranking_png, improvements_png, stats
+    return ranking_png, improvements_png, stats, improvements
+
+
+async def _analyse_log_improvement_user_ids(
+    guild: discord.Guild,
+    improvements: List[ParseImprovement],
+) -> Tuple[List[int], List[str]]:
+    """Resolve improved character names to Discord users declared in #main."""
+    main_map, main_problems = await build_main_map(guild)
+    user_by_character = {
+        character.casefold(): user_id
+        for user_id, character in main_map.items()
+    }
+
+    user_ids: List[int] = []
+    missing: List[str] = []
+    seen_ids: set = set()
+    for player_name, _rows in _improvement_rows(improvements):
+        user_id = user_by_character.get(player_name.casefold())
+        if user_id is None:
+            missing.append(player_name)
+            continue
+        if user_id not in seen_ids:
+            seen_ids.add(user_id)
+            user_ids.append(user_id)
+
+    if main_problems:
+        dkp_debug(
+            "ANALYSE LOG ANOMALIES #MAIN PENDANT LES MENTIONS",
+            main_problems,
+        )
+    return user_ids, missing
+
+
 def _message_uwu_urls(message: discord.Message) -> List[str]:
     parts = [message.content or ""]
     for embed in message.embeds:
@@ -5169,7 +5251,7 @@ async def handle_uwu_pewpew_message(
             PEWPEW_IN_FLIGHT.add(canonical)
 
             try:
-                ranking_png, improvements_png, stats = await build_pewpew_report(canonical)
+                ranking_png, improvements_png, stats, improvements = await build_pewpew_report(canonical)
                 print(f"[ANALYSE LOG] Résultat {canonical}: {stats}")
 
                 if stats["participants"] <= 0:
@@ -5208,11 +5290,52 @@ async def handle_uwu_pewpew_message(
                     print(f"[ANALYSE LOG] Image classement vide: {canonical}")
 
                 if improvements_png:
+                    improvement_user_ids: List[int] = []
+                    missing_improvement_players: List[str] = []
+                    if improvements:
+                        try:
+                            improvement_user_ids, missing_improvement_players = (
+                                await _analyse_log_improvement_user_ids(
+                                    message.guild,
+                                    improvements,
+                                )
+                            )
+                        except Exception as exc:
+                            print(
+                                "[ANALYSE LOG] Mentions #Main impossibles: "
+                                f"{type(exc).__name__}: {exc}"
+                            )
+                            dkp_debug(
+                                "ANALYSE LOG MENTIONS #MAIN ECHEC",
+                                {"error": f"{type(exc).__name__}: {exc}"},
+                            )
+
+                    improvement_message = "**Parses améliorées sur ce raid**"
+                    if improvement_user_ids:
+                        improvement_message += "\nJoueurs concernés : " + " ".join(
+                            f"<@{user_id}>" for user_id in improvement_user_ids
+                        )
+
+                    allowed_improvement_mentions = discord.AllowedMentions.none()
+                    if improvement_user_ids:
+                        allowed_improvement_mentions = discord.AllowedMentions(
+                            everyone=False,
+                            roles=False,
+                            users=[discord.Object(id=user_id) for user_id in improvement_user_ids],
+                            replied_user=False,
+                        )
+
+                    if missing_improvement_players:
+                        print(
+                            "[ANALYSE LOG] Joueurs améliorés absents de #Main: "
+                            + ", ".join(missing_improvement_players)
+                        )
+
                     await message.reply(
-                        "**Parses améliorées sur ce raid**",
+                        improvement_message,
                         file=discord.File(io.BytesIO(improvements_png), filename="AnalyseLog_ParsesAmeliorees.png"),
                         mention_author=False,
-                        allowed_mentions=discord.AllowedMentions.none(),
+                        allowed_mentions=allowed_improvement_mentions,
                     )
                 else:
                     print(f"[ANALYSE LOG] Image améliorations vide: {canonical}")
