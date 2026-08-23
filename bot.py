@@ -914,7 +914,7 @@ async def run_rh_list(interaction: discord.Interaction, message: discord.Message
                 lines.append("")
 
         if unrecognized:
-            lines.append("**⚠️ NON RECONNUS Merci de remplir le chan #main.**")
+            lines.append("**⚠️ NON RECONNUS Merci de remplir le chan 1538023542799474838.**")
             for s in unrecognized:
                 lines.append(f"<@{s.user_id}>")
             lines.append("")
