@@ -914,7 +914,7 @@ async def run_rh_list(interaction: discord.Interaction, message: discord.Message
                 lines.append("")
 
         if unrecognized:
-            lines.append("**⚠️ NON RECONNUS**")
+            lines.append("**⚠️ NON RECONNUS Merci de remplir le chan #main.**")
             for s in unrecognized:
                 lines.append(f"<@{s.user_id}>")
             lines.append("")
@@ -5528,6 +5528,12 @@ async def handle_uwu_pewpew_message(
                     if improvement_user_ids:
                         improvement_message += "\nJoueurs concernés : " + " ".join(
                             f"<@{user_id}>" for user_id in improvement_user_ids
+                        )
+                    if missing_improvement_players:
+                        improvement_message += (
+                            "\nPersonnages concernés Inconnus : "
+                            + ", ".join(missing_improvement_players)
+                            + "\nMerci de remplir le chan #main."
                         )
 
                     allowed_improvement_mentions = discord.AllowedMentions.none()
