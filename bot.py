@@ -685,31 +685,51 @@ def _lua_named_table_body(raw: str, key: str) -> Optional[str]:
     return _lua_table_body(raw or "", opening_brace)
 
 
-def _extract_kromaddon_alt_to_main(raw: str) -> Dict[str, str]:
-    """Extract reroll -> main links from RaidPresenceDB.altToMain.
+def _lua_direct_named_tables(raw: str) -> List[Tuple[str, str]]:
+    """Read direct ["name"] = {...} children from one Lua table body."""
+    entry_re = re.compile(
+        r"\[\s*([\"'])([A-Za-z0-9_-]{1,80})\1\s*\]\s*=\s*\{"
+    )
+    entries: List[Tuple[str, str]] = []
+    depth = 0
+    quote = ""
+    escaped = False
+    index = 0
+    while index < len(raw):
+        char = raw[index]
+        if quote:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == quote:
+                quote = ""
+        elif char in {'"', "'"}:
+            quote = char
+        elif raw.startswith("--", index):
+            newline = raw.find("\n", index + 2)
+            if newline < 0:
+                break
+            index = newline
+        elif char == "{":
+            depth += 1
+        elif char == "}":
+            depth = max(0, depth - 1)
+        elif depth == 0:
+            match = entry_re.match(raw, index)
+            if match:
+                opening_brace = raw.find("{", match.start(), match.end())
+                body = _lua_table_body(raw, opening_brace)
+                if body is not None:
+                    entries.append((match.group(2), body))
+                    index = opening_brace + len(body) + 2
+                    continue
+        index += 1
+    return entries
 
-    Kromaddon 3 (MainDatabase.lua) is now the sole authority on these links:
-    on every login it already migrates raid-attendance history, QDKP2 links
-    and officer notes into this very table (with a source-priority system),
-    and it durably remembers an explicit unlink ("Délier" in KromaCoin) so
-    automatic sources never silently recreate a link an officer removed.
-    An older version of this bot used to ALSO re-derive links on its own
-    from raids[...].players[...].characters and only let an explicit
-    altToMain entry override that guess. That duplicated what the addon
-    already does, and it broke the moment a link was deliberately removed
-    in-game: RemoveMain() just deletes the altToMain entry (there is
-    nothing left in raids[] to say "and don't re-infer this one"), so the
-    bot's own raid-history guess would quietly resurface the very link the
-    officer had just corrected, out of sync with what players actually see
-    in the addon.
-    Trusting altToMain alone here mirrors exactly what
-    RaidPresence.MainDatabase:GetMain() resolves in the addon itself. The
-    only downside is a short transitional window right after installing
-    Kromaddon 3 on a character who never logged in with it yet and whose
-    only main/reroll signal was old raid attendance grouping - that entry
-    simply isn't migrated into altToMain until that character's next login,
-    at which point MainDatabase.lua writes it in for good.
-    """
+
+def _extract_kromaddon_alt_to_main(raw: str) -> Dict[str, str]:
+    """Extract explicit and raid-history reroll links without executing Lua."""
     raw = raw or ""
     db_match = re.search(r"\bRaidPresenceDB\s*=\s*\{", raw)
     if not db_match:
@@ -719,14 +739,60 @@ def _extract_kromaddon_alt_to_main(raw: str) -> Dict[str, str]:
     if db_body is None:
         return {}
 
+    # Each attendance raid stores the resolved owner as:
+    # players[main] = { main = "Main", characters = { ["Alt"] = true } }.
+    # This contains the useful links even when the manually maintained
+    # altToMain table has not been populated for those characters. In case a
+    # character changed main, the newest raid snapshot wins.
+    inferred: Dict[str, Tuple[int, str]] = {}
+    raids_body = _lua_named_table_body(db_body, "raids")
+    if raids_body is not None:
+        for raid_id, raid_body in _lua_direct_named_tables(raids_body):
+            date_match = re.search(r"\[\s*[\"']date[\"']\s*\]\s*=\s*(\d+)", raid_body)
+            if date_match:
+                raid_date = int(date_match.group(1))
+            else:
+                timestamp_match = re.match(r"(\d+)", raid_id)
+                raid_date = int(timestamp_match.group(1)) if timestamp_match else 0
+
+            players_body = _lua_named_table_body(raid_body, "players")
+            if players_body is None:
+                continue
+            for _owner_key, player_body in _lua_direct_named_tables(players_body):
+                main_match = re.search(
+                    r"\[\s*([\"'])main\1\s*\]\s*=\s*([\"'])([A-Za-z]{2,12})\2",
+                    player_body,
+                )
+                characters_body = _lua_named_table_body(player_body, "characters")
+                if not main_match or characters_body is None:
+                    continue
+                main = main_match.group(3)
+                for character_match in re.finditer(
+                    r"\[\s*([\"'])([A-Za-z]{2,12})\1\s*\]\s*=\s*true\b",
+                    characters_body,
+                ):
+                    character = character_match.group(2)
+                    folded = character.casefold()
+                    previous = inferred.get(folded)
+                    if (
+                        character.casefold() != main.casefold()
+                        and (previous is None or raid_date >= previous[0])
+                    ):
+                        inferred[folded] = (raid_date, main)
+
+    mapping: Dict[str, str] = {
+        character: dated_main[1]
+        for character, dated_main in inferred.items()
+    }
+
+    # An explicit link is authoritative and therefore overrides raid history.
     explicit_body = _lua_named_table_body(db_body, "altToMain")
     if explicit_body is None:
-        return {}
+        return mapping
     pair_re = re.compile(
         r"\[\s*([\"'])([A-Za-z]{2,12})\1\s*\]\s*=\s*"
         r"([\"'])([A-Za-z]{2,12})\3"
     )
-    mapping: Dict[str, str] = {}
     for match in pair_re.finditer(explicit_body):
         alt, main = match.group(2), match.group(4)
         if alt.casefold() != main.casefold():
@@ -914,7 +980,7 @@ async def run_rh_list(interaction: discord.Interaction, message: discord.Message
                 lines.append("")
 
         if unrecognized:
-            lines.append("**⚠️ NON RECONNUS Merci de remplir le chan 1538023542799474838.**")
+            lines.append("**⚠️ NON RECONNUS**")
             for s in unrecognized:
                 lines.append(f"<@{s.user_id}>")
             lines.append("")
@@ -3282,8 +3348,9 @@ PEWPEW_TIERS: Tuple[Tuple[float, str], ...] = (
     (33.0, "⚫ Top 33% ⚫"),
 )
 
-# Analyse Log V2 : le classement du raid se base sur le percentile /rank de
-# chaque combat posté et sur les mêmes seuils que KAparse.
+# Analyse Log V2 : le classement du raid se base sur le Dps% (`points`) renvoyé
+# par /rank pour chaque combat posté, soit la valeur affichée dans la colonne
+# Dps% d'UwU, et sur les mêmes seuils que KAparse.
 ANALYSE_LOG_POINT_TIERS: Tuple[Tuple[str, Optional[float], str], ...] = (
     ("top1", None, "🏆 Top 1 🏆"),
     ("99", 99.0, "🟣 Top 99% 🟣"),
@@ -4146,8 +4213,7 @@ def format_pewpew_report(hits: List[PewPewHit]) -> str:
             lead = [h for h in phits if h.top_percent <= threshold + 1e-9]
             lead_parts = []
             for h in lead:
-                # `h.points` is UwU /rank's percentile: the actual parse value.
-                # The Top category still uses 100 - percentile via h.top_percent.
+                # `h.points` est le Dps% affiché par UwU pour ce combat.
                 value = "SERVER BEST!" if h.server_best else f"{h.points:.2f}%"
                 lead_parts.append(f"**{value}** sur {_analyse_log_boss_label(h.boss)}")
 
@@ -4599,22 +4665,18 @@ async def _post_uwu_rank(payload: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _uwu_rank_points(raw: Dict[str, Any]) -> Optional[float]:
-    """Return the percentile calculated by UwU for this exact fight.
+    """Return UwU's Dps% (`points`) for this exact fight.
 
-    ``/rank`` returns an ordinal ``rank`` and the current fight's
-    ``percentile``.  The ``points`` shown by ``/character`` are personal-best
-    values and must never replace this percentile in the raid ranking.
+    ``/rank`` returns three distinct values: the ordinal ``rank``, the
+    population-position ``percentile`` used by the "Better than X%" tooltip,
+    and ``points``, rendered by UwU in its Dps% column. Analyse Log and
+    KAparse use the latter.
     """
     if not isinstance(raw, dict):
         return None
 
-    # This is the value used by report_main.js in the "Better than X%" label.
-    value = _numeric(raw.get("percentile"))
-    if value is not None and 0.0 <= value <= 100.0:
-        return float(value)
-
-    # Compatibility fallback for a future/alternate /rank transport.  These
-    # keys are accepted only from the /rank response passed to this helper.
+    # Do not fall back to `percentile`: it is a different metric and can turn,
+    # for example, UwU's 76.20 Dps% into a misleading 99.39% parse.
     for key in ("points", "point", "score", "parse", "value"):
         value = _numeric(raw.get(key))
         if value is not None and 0.0 <= value <= 100.0:
@@ -5283,7 +5345,7 @@ async def build_pewpew_report(
                     "boss": boss,
                     "mode": mode,
                     "ranked": len(rank_data),
-                    "note": "Classement affiché depuis /rank.percentile pour ce kill",
+                    "note": "Classement affiché depuis /rank.points (Dps%) pour ce kill",
                 },
             )
         except Exception as exc:
@@ -5312,7 +5374,7 @@ async def build_pewpew_report(
         return b"", b"", stats, []
 
     # /character est réservé aux records personnels. Le classement ci-dessus
-    # reste fondé sur /rank.percentile, donc uniquement sur le raid posté.
+    # reste fondé sur /rank.points, donc uniquement sur le raid posté.
     character_payload_cache: Dict[Tuple[str, int], Dict[str, Any]] = {}
     stats["players_with_hits"] = len({h.player.lower() for h in hits})
     stats["hits"] = len(hits)
@@ -5528,12 +5590,6 @@ async def handle_uwu_pewpew_message(
                     if improvement_user_ids:
                         improvement_message += "\nJoueurs concernés : " + " ".join(
                             f"<@{user_id}>" for user_id in improvement_user_ids
-                        )
-                    if missing_improvement_players:
-                        improvement_message += (
-                            "\nPersonnages concernés Inconnus : "
-                            + ", ".join(missing_improvement_players)
-                            + " Merci de remplir le chan #main."
                         )
 
                     allowed_improvement_mentions = discord.AllowedMentions.none()
