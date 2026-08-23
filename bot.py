@@ -685,51 +685,31 @@ def _lua_named_table_body(raw: str, key: str) -> Optional[str]:
     return _lua_table_body(raw or "", opening_brace)
 
 
-def _lua_direct_named_tables(raw: str) -> List[Tuple[str, str]]:
-    """Read direct ["name"] = {...} children from one Lua table body."""
-    entry_re = re.compile(
-        r"\[\s*([\"'])([A-Za-z0-9_-]{1,80})\1\s*\]\s*=\s*\{"
-    )
-    entries: List[Tuple[str, str]] = []
-    depth = 0
-    quote = ""
-    escaped = False
-    index = 0
-    while index < len(raw):
-        char = raw[index]
-        if quote:
-            if escaped:
-                escaped = False
-            elif char == "\\":
-                escaped = True
-            elif char == quote:
-                quote = ""
-        elif char in {'"', "'"}:
-            quote = char
-        elif raw.startswith("--", index):
-            newline = raw.find("\n", index + 2)
-            if newline < 0:
-                break
-            index = newline
-        elif char == "{":
-            depth += 1
-        elif char == "}":
-            depth = max(0, depth - 1)
-        elif depth == 0:
-            match = entry_re.match(raw, index)
-            if match:
-                opening_brace = raw.find("{", match.start(), match.end())
-                body = _lua_table_body(raw, opening_brace)
-                if body is not None:
-                    entries.append((match.group(2), body))
-                    index = opening_brace + len(body) + 2
-                    continue
-        index += 1
-    return entries
-
-
 def _extract_kromaddon_alt_to_main(raw: str) -> Dict[str, str]:
-    """Extract explicit and raid-history reroll links without executing Lua."""
+    """Extract reroll -> main links from RaidPresenceDB.altToMain.
+
+    Kromaddon 3 (MainDatabase.lua) is now the sole authority on these links:
+    on every login it already migrates raid-attendance history, QDKP2 links
+    and officer notes into this very table (with a source-priority system),
+    and it durably remembers an explicit unlink ("Délier" in KromaCoin) so
+    automatic sources never silently recreate a link an officer removed.
+    An older version of this bot used to ALSO re-derive links on its own
+    from raids[...].players[...].characters and only let an explicit
+    altToMain entry override that guess. That duplicated what the addon
+    already does, and it broke the moment a link was deliberately removed
+    in-game: RemoveMain() just deletes the altToMain entry (there is
+    nothing left in raids[] to say "and don't re-infer this one"), so the
+    bot's own raid-history guess would quietly resurface the very link the
+    officer had just corrected, out of sync with what players actually see
+    in the addon.
+    Trusting altToMain alone here mirrors exactly what
+    RaidPresence.MainDatabase:GetMain() resolves in the addon itself. The
+    only downside is a short transitional window right after installing
+    Kromaddon 3 on a character who never logged in with it yet and whose
+    only main/reroll signal was old raid attendance grouping - that entry
+    simply isn't migrated into altToMain until that character's next login,
+    at which point MainDatabase.lua writes it in for good.
+    """
     raw = raw or ""
     db_match = re.search(r"\bRaidPresenceDB\s*=\s*\{", raw)
     if not db_match:
@@ -739,60 +719,14 @@ def _extract_kromaddon_alt_to_main(raw: str) -> Dict[str, str]:
     if db_body is None:
         return {}
 
-    # Each attendance raid stores the resolved owner as:
-    # players[main] = { main = "Main", characters = { ["Alt"] = true } }.
-    # This contains the useful links even when the manually maintained
-    # altToMain table has not been populated for those characters. In case a
-    # character changed main, the newest raid snapshot wins.
-    inferred: Dict[str, Tuple[int, str]] = {}
-    raids_body = _lua_named_table_body(db_body, "raids")
-    if raids_body is not None:
-        for raid_id, raid_body in _lua_direct_named_tables(raids_body):
-            date_match = re.search(r"\[\s*[\"']date[\"']\s*\]\s*=\s*(\d+)", raid_body)
-            if date_match:
-                raid_date = int(date_match.group(1))
-            else:
-                timestamp_match = re.match(r"(\d+)", raid_id)
-                raid_date = int(timestamp_match.group(1)) if timestamp_match else 0
-
-            players_body = _lua_named_table_body(raid_body, "players")
-            if players_body is None:
-                continue
-            for _owner_key, player_body in _lua_direct_named_tables(players_body):
-                main_match = re.search(
-                    r"\[\s*([\"'])main\1\s*\]\s*=\s*([\"'])([A-Za-z]{2,12})\2",
-                    player_body,
-                )
-                characters_body = _lua_named_table_body(player_body, "characters")
-                if not main_match or characters_body is None:
-                    continue
-                main = main_match.group(3)
-                for character_match in re.finditer(
-                    r"\[\s*([\"'])([A-Za-z]{2,12})\1\s*\]\s*=\s*true\b",
-                    characters_body,
-                ):
-                    character = character_match.group(2)
-                    folded = character.casefold()
-                    previous = inferred.get(folded)
-                    if (
-                        character.casefold() != main.casefold()
-                        and (previous is None or raid_date >= previous[0])
-                    ):
-                        inferred[folded] = (raid_date, main)
-
-    mapping: Dict[str, str] = {
-        character: dated_main[1]
-        for character, dated_main in inferred.items()
-    }
-
-    # An explicit link is authoritative and therefore overrides raid history.
     explicit_body = _lua_named_table_body(db_body, "altToMain")
     if explicit_body is None:
-        return mapping
+        return {}
     pair_re = re.compile(
         r"\[\s*([\"'])([A-Za-z]{2,12})\1\s*\]\s*=\s*"
         r"([\"'])([A-Za-z]{2,12})\3"
     )
+    mapping: Dict[str, str] = {}
     for match in pair_re.finditer(explicit_body):
         alt, main = match.group(2), match.group(4)
         if alt.casefold() != main.casefold():
