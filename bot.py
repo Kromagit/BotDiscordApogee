@@ -672,25 +672,128 @@ def _lua_table_body(raw: str, opening_brace: int) -> Optional[str]:
     return None
 
 
-def _extract_kromaddon_alt_to_main(raw: str) -> Dict[str, str]:
-    """Extract RaidPresenceDB.altToMain pairs from Kromaddon.lua safely."""
-    key_match = re.search(
-        r"(?:\[\s*[\"']altToMain[\"']\s*\]|\baltToMain\b)\s*=\s*\{",
+def _lua_named_table_body(raw: str, key: str) -> Optional[str]:
+    """Return the first table assigned to an exact Lua identifier/string key."""
+    escaped_key = re.escape(key)
+    match = re.search(
+        rf"(?:\[\s*[\"']{escaped_key}[\"']\s*\]|\b{escaped_key}\b)\s*=\s*\{{",
         raw or "",
     )
-    if not key_match:
+    if not match:
+        return None
+    opening_brace = (raw or "").find("{", match.start(), match.end())
+    return _lua_table_body(raw or "", opening_brace)
+
+
+def _lua_direct_named_tables(raw: str) -> List[Tuple[str, str]]:
+    """Read direct ["name"] = {...} children from one Lua table body."""
+    entry_re = re.compile(
+        r"\[\s*([\"'])([A-Za-z0-9_-]{1,80})\1\s*\]\s*=\s*\{"
+    )
+    entries: List[Tuple[str, str]] = []
+    depth = 0
+    quote = ""
+    escaped = False
+    index = 0
+    while index < len(raw):
+        char = raw[index]
+        if quote:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == quote:
+                quote = ""
+        elif char in {'"', "'"}:
+            quote = char
+        elif raw.startswith("--", index):
+            newline = raw.find("\n", index + 2)
+            if newline < 0:
+                break
+            index = newline
+        elif char == "{":
+            depth += 1
+        elif char == "}":
+            depth = max(0, depth - 1)
+        elif depth == 0:
+            match = entry_re.match(raw, index)
+            if match:
+                opening_brace = raw.find("{", match.start(), match.end())
+                body = _lua_table_body(raw, opening_brace)
+                if body is not None:
+                    entries.append((match.group(2), body))
+                    index = opening_brace + len(body) + 2
+                    continue
+        index += 1
+    return entries
+
+
+def _extract_kromaddon_alt_to_main(raw: str) -> Dict[str, str]:
+    """Extract explicit and raid-history reroll links without executing Lua."""
+    raw = raw or ""
+    db_match = re.search(r"\bRaidPresenceDB\s*=\s*\{", raw)
+    if not db_match:
         return {}
-    opening_brace = (raw or "").find("{", key_match.start())
-    body = _lua_table_body(raw or "", opening_brace)
-    if body is None:
+    db_opening_brace = raw.find("{", db_match.start(), db_match.end())
+    db_body = _lua_table_body(raw, db_opening_brace)
+    if db_body is None:
         return {}
 
-    mapping: Dict[str, str] = {}
+    # Each attendance raid stores the resolved owner as:
+    # players[main] = { main = "Main", characters = { ["Alt"] = true } }.
+    # This contains the useful links even when the manually maintained
+    # altToMain table has not been populated for those characters. In case a
+    # character changed main, the newest raid snapshot wins.
+    inferred: Dict[str, Tuple[int, str]] = {}
+    raids_body = _lua_named_table_body(db_body, "raids")
+    if raids_body is not None:
+        for raid_id, raid_body in _lua_direct_named_tables(raids_body):
+            date_match = re.search(r"\[\s*[\"']date[\"']\s*\]\s*=\s*(\d+)", raid_body)
+            if date_match:
+                raid_date = int(date_match.group(1))
+            else:
+                timestamp_match = re.match(r"(\d+)", raid_id)
+                raid_date = int(timestamp_match.group(1)) if timestamp_match else 0
+
+            players_body = _lua_named_table_body(raid_body, "players")
+            if players_body is None:
+                continue
+            for _owner_key, player_body in _lua_direct_named_tables(players_body):
+                main_match = re.search(
+                    r"\[\s*([\"'])main\1\s*\]\s*=\s*([\"'])([A-Za-z]{2,12})\2",
+                    player_body,
+                )
+                characters_body = _lua_named_table_body(player_body, "characters")
+                if not main_match or characters_body is None:
+                    continue
+                main = main_match.group(3)
+                for character_match in re.finditer(
+                    r"\[\s*([\"'])([A-Za-z]{2,12})\1\s*\]\s*=\s*true\b",
+                    characters_body,
+                ):
+                    character = character_match.group(2)
+                    folded = character.casefold()
+                    previous = inferred.get(folded)
+                    if (
+                        character.casefold() != main.casefold()
+                        and (previous is None or raid_date >= previous[0])
+                    ):
+                        inferred[folded] = (raid_date, main)
+
+    mapping: Dict[str, str] = {
+        character: dated_main[1]
+        for character, dated_main in inferred.items()
+    }
+
+    # An explicit link is authoritative and therefore overrides raid history.
+    explicit_body = _lua_named_table_body(db_body, "altToMain")
+    if explicit_body is None:
+        return mapping
     pair_re = re.compile(
         r"\[\s*([\"'])([A-Za-z]{2,12})\1\s*\]\s*=\s*"
         r"([\"'])([A-Za-z]{2,12})\3"
     )
-    for match in pair_re.finditer(body):
+    for match in pair_re.finditer(explicit_body):
         alt, main = match.group(2), match.group(4)
         if alt.casefold() != main.casefold():
             mapping[alt.casefold()] = main
@@ -5318,15 +5421,26 @@ async def _analyse_log_improvement_user_ids(
         for character in characters
     }
     alt_to_main = _load_kromaddon_alt_to_main()
+    users_by_main: Dict[str, set] = defaultdict(set)
+    if alt_to_main:
+        for user_id, characters in registry.items():
+            for character in characters:
+                resolved = _resolve_kromaddon_main(character, alt_to_main)
+                users_by_main[resolved.casefold()].add(user_id)
 
     user_ids: List[int] = []
     missing: List[str] = []
+    ambiguous: Dict[str, List[int]] = {}
     seen_ids: set = set()
     for player_name, _rows in _improvement_rows(improvements):
         user_id = user_by_character.get(player_name.casefold())
         if user_id is None and alt_to_main:
             main_name = _resolve_kromaddon_main(player_name, alt_to_main)
-            user_id = user_by_character.get(main_name.casefold())
+            owners = users_by_main.get(main_name.casefold(), set())
+            if len(owners) == 1:
+                user_id = next(iter(owners))
+            elif len(owners) > 1:
+                ambiguous[player_name] = sorted(owners)
         if user_id is None:
             missing.append(player_name)
             continue
@@ -5338,6 +5452,11 @@ async def _analyse_log_improvement_user_ids(
         dkp_debug(
             "ANALYSE LOG ANOMALIES #MAIN PENDANT LES MENTIONS",
             main_problems,
+        )
+    if ambiguous:
+        dkp_debug(
+            "ANALYSE LOG MAINS KROMADDON AMBIGUS",
+            ambiguous,
         )
     return user_ids, missing
 
@@ -5859,10 +5978,14 @@ async def on_ready():
     print(f"#Main channel ID: {MAIN_CHANNEL_ID}")
     print(f"#logs-raid channel ID: {LOGS_RAID_CHANNEL_ID or 'NON CONFIGURE'}")
     print(f"#KAparse channel ID: {DKPARSE_CHANNEL_ID or 'NON CONFIGURE'}")
-    print(
-        "Kromaddon SavedVariables: "
-        + ("CONFIGURE" if KROMADDON_SAVED_VARIABLES_FILE else "NON CONFIGURE")
-    )
+    if KROMADDON_SAVED_VARIABLES_FILE:
+        kromaddon_links = len(_load_kromaddon_alt_to_main())
+        print(
+            "Kromaddon SavedVariables: CONFIGURE "
+            f"({kromaddon_links} association(s) reroll-main)"
+        )
+    else:
+        print("Kromaddon SavedVariables: NON CONFIGURE")
     print(f"KAparse window: {DKPARSE_MAX_DAYS} jours")
     print("KAparse OCR: " + ("RapidOCR OK" if (RapidOCR is not None and Image is not None and np is not None) else "INDISPONIBLE"))
     print(f"Analyse Log: {'ACTIVE' if UWU_PEWPEW_ENABLED else 'DESACTIVE'} (/rank HEROIC + détection PB /character+dps_max)")
