@@ -5533,7 +5533,7 @@ async def handle_uwu_pewpew_message(
                         improvement_message += (
                             "\nPersonnages concernés Inconnus : "
                             + ", ".join(missing_improvement_players)
-                            + "\nMerci de remplir le chan #main."
+                            + " Merci de remplir le chan #main."
                         )
 
                     allowed_improvement_mentions = discord.AllowedMentions.none()
