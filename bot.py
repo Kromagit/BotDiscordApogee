@@ -85,6 +85,12 @@ DKPARSE_DEBUG = os.getenv("DKPARSE_DEBUG", "false").strip().lower() in {
 UWU_PEWPEW_ENABLED = os.getenv("UWU_PEWPEW_ENABLED", "true").strip().lower() in {
     "1", "true", "yes", "on"
 }
+# Discord-visible per-kill /rank debug for Analyse Log. Off by default now
+# that the `points` -> `from_spec_top1` API rename has been fixed; flip via
+# env var ANALYSE_LOG_DEBUG_VERBOSE=true if it needs troubleshooting again.
+ANALYSE_LOG_DEBUG_VERBOSE = os.getenv("ANALYSE_LOG_DEBUG_VERBOSE", "false").strip().lower() in {
+    "1", "true", "yes", "on"
+}
 UWU_PEWPEW_MAX_FIGHTS_PER_BOSS = int(os.getenv("UWU_PEWPEW_MAX_FIGHTS_PER_BOSS", "2") or 2)
 KROMADDON_SAVED_VARIABLES_FILE = os.path.expandvars(
     os.path.expanduser(os.getenv("KROMADDON_SAVED_VARIABLES", "").strip())
@@ -4185,16 +4191,21 @@ async def _post_uwu_rank(payload: Dict[str, Any]) -> Dict[str, Any]:
     raise RuntimeError("UwU /rank impossible")
 def _uwu_rank_points(raw: Dict[str, Any]) -> Optional[float]:
     """Return UwU's Dps% (`points`) for this exact fight.
-    ``/rank`` returns three distinct values: the ordinal ``rank``, the
+    ``/rank`` returns several distinct values: the ordinal ``rank``, the
     population-position ``percentile`` used by the "Better than X%" tooltip,
-    and ``points``, rendered by UwU in its Dps% column. Analyse Log and
-    KAparse use the latter.
+    and the Dps% rendered by UwU in its Dps% column. Analyse Log and
+    KAparse use the latter — as of the current UwU API this is exposed as
+    ``from_spec_top1`` (this DPS as a % of the #1 log for the same spec on
+    this boss); older/legacy payloads used ``points``. Confirmed via a live
+    Discord debug dump: a sample entry had percentile=99.39 but
+    from_spec_top1=76.2, matching the "76.20 Dps% vs misleading 99.39%"
+    case this function has always warned about below.
     """
     if not isinstance(raw, dict):
         return None
     # Do not fall back to `percentile`: it is a different metric and can turn,
     # for example, UwU's 76.20 Dps% into a misleading 99.39% parse.
-    for key in ("points", "point", "score", "parse", "value"):
+    for key in ("from_spec_top1", "points", "point", "score", "parse", "value"):
         value = _numeric(raw.get(key))
         if value is not None and 0.0 <= value <= 100.0:
             return float(value)
@@ -5023,7 +5034,7 @@ async def handle_uwu_pewpew_message(
                 ranking_png, improvements_png, stats, improvements = await build_pewpew_report(canonical)
                 print(f"[ANALYSE LOG] Résultat {canonical}: {stats}")
                 debug_lines = stats.get("debug_lines") or []
-                if debug_lines:
+                if ANALYSE_LOG_DEBUG_VERBOSE and debug_lines:
                     debug_text = (
                         "🔧 **[debug] Analyse Log — détail /rank par kill**\n"
                         + "\n".join(f"- {line}" for line in debug_lines)
