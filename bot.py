@@ -2608,6 +2608,25 @@ async def evaluate_dkparse_screen_message(
             total=0,
             ocr_detail=ocr_detail,
         )
+    if not spec:
+        # Spec is required (it selects which uwu-logs.xyz table is fetched),
+        # so an undetected spec blocks the parse outright instead of falling
+        # through to the generic "no date" message below.
+        issues.append(
+            ocr_detail
+            or "La spécialisation active n'a pas pu être détectée sur ce screenshot."
+        )
+        return DKParseScreenResult(
+            message_id=message.id,
+            character=character,
+            spec=spec,
+            raid_date=None,
+            rows=rows,
+            valid_hits=[],
+            issues=issues,
+            total=0,
+            ocr_detail=ocr_detail,
+        )
     dated_rows = [r for r in rows if r.best_date is not None]
     if not dated_rows:
         issues.append("Aucune date Best Log lisible sur le screenshot.")
@@ -2750,7 +2769,7 @@ async def analyze_dkparse_message(
     if result.spec:
         lines.append(f"Spec lue sur le screen : **{result.spec}**")
     else:
-        lines.append("Spec : non lisible sur ce screen (non bloquant)")
+        lines.append("Spec : non lisible sur ce screen — **bloquant**")
     if result.valid_hits:
         lines += [""]
         for hit in result.valid_hits:
@@ -2768,13 +2787,24 @@ async def analyze_dkparse_message(
         not result.valid_hits
         and bool(result.rows)
         and any(r.best_date is not None for r in result.rows)
+    ) or (
+        not result.valid_hits
+        and result.character is not None
+        and not result.spec
     )
     if result.issues:
         icon = "❌" if deterministic_reject else "⚠️"
         lines += ["", f"**{icon} Vérifications / remarques :**"]
         lines.extend(f"• {issue}" for issue in result.issues)
     if not result.valid_hits:
-        if deterministic_reject:
+        if deterministic_reject and not result.spec and result.character is not None and not any(r.best_date is not None for r in result.rows):
+            lines += [
+                "",
+                "❌ **KAPARSE REFUSÉ**",
+                "La spécialisation n'a pas pu être lue sur ce screenshot — repostez un screenshot "
+                "complet montrant les 3 icônes de spécialisation en haut à droite de la page.",
+            ]
+        elif deterministic_reject:
             lines += [
                 "",
                 "❌ **KAPARSE REFUSÉ**",
