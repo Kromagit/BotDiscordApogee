@@ -10,7 +10,7 @@ from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 from pathlib import Path
-from urllib.parse import urlsplit, urlunsplit, urljoin, parse_qs
+from urllib.parse import urlsplit, urlunsplit, urljoin, parse_qs, quote
 import sys
 import aiohttp
 import discord
