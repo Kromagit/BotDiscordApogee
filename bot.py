@@ -11,6 +11,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit, urljoin, parse_qs, quote
+from zoneinfo import ZoneInfo
 import sys
 import aiohttp
 import discord
@@ -5272,6 +5273,128 @@ async def handle_uwu_pewpew_message(
     await _pewpew_remove_own_reaction(message, "🔎")
     await _pewpew_set_reaction(message, final_status)
 # =============================================================================
+# Suivi d'activité des membres (/inactive)
+# =============================================================================
+# Enregistre, pour chaque membre, la date de sa dernière interaction sur le
+# serveur : message posté, réaction ajoutée, ou connexion/changement de salon
+# vocal. Persisté sur disque comme PEWPEW_STATE_FILE ci-dessus, pour survivre
+# aux redémarrages du bot.
+ACTIVITY_STATE_FILE = APP_DIR / "apogeebot_activity.json"
+DISPLAY_TZ = ZoneInfo("Europe/Paris")
+ACTIVITY_TYPE_LABELS = {
+    "message": "Message",
+    "reaction": "Réaction",
+    "vocal": "Vocal",
+}
+def _load_activity() -> Dict[int, Dict[str, str]]:
+    try:
+        data = json.loads(ACTIVITY_STATE_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    out: Dict[int, Dict[str, str]] = {}
+    if isinstance(data, dict):
+        for uid, entry in data.items():
+            if not isinstance(entry, dict) or not entry.get("ts"):
+                continue
+            try:
+                out[int(uid)] = {"ts": str(entry["ts"]), "type": str(entry.get("type") or "?")}
+            except (TypeError, ValueError):
+                continue
+    return out
+ACTIVITY: Dict[int, Dict[str, str]] = _load_activity()
+def _save_activity() -> None:
+    try:
+        serializable = {str(uid): entry for uid, entry in ACTIVITY.items()}
+        ACTIVITY_STATE_FILE.write_text(
+            json.dumps(serializable, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+    except Exception as exc:
+        dkp_debug("ACTIVITY STATE SAVE ECHEC", repr(exc))
+def record_activity(user_id: Optional[int], kind: str, when: Optional[datetime] = None) -> None:
+    if not user_id:
+        return
+    ts = when or datetime.now(timezone.utc)
+    ACTIVITY[int(user_id)] = {"ts": ts.isoformat(), "type": kind}
+    _save_activity()
+def _format_activity_ts(ts: datetime, now: datetime) -> str:
+    local = ts.astimezone(DISPLAY_TZ)
+    now_local = now.astimezone(DISPLAY_TZ)
+    if local.date() == now_local.date():
+        return f"Aujourd'hui {local.strftime('%H:%M')}"
+    if local.date() == now_local.date() - timedelta(days=1):
+        return f"Hier {local.strftime('%H:%M')}"
+    if local.year == now_local.year:
+        return local.strftime("%d/%m %H:%M")
+    return local.strftime("%d/%m/%Y %H:%M")
+@bot.tree.command(
+    name="inactive",
+    description="Classe les membres selon leur dernière interaction (message, réaction, vocal).",
+)
+@app_commands.describe(
+    days="N'afficher que les membres sans interaction depuis au moins N jours (optionnel)"
+)
+async def inactive_cmd(interaction: discord.Interaction, days: Optional[int] = None):
+    if not can_use_admin(interaction):
+        await interaction.response.send_message("Permission refusée.", ephemeral=True)
+        return
+    if not interaction.guild:
+        await interaction.response.send_message("Serveur requis.", ephemeral=True)
+        return
+    if days is not None and days < 0:
+        await interaction.response.send_message("`days` doit être positif.", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    try:
+        now = datetime.now(timezone.utc)
+        rows: List[Tuple[discord.Member, Optional[datetime], Optional[str]]] = []
+        for member in interaction.guild.members:
+            if member.bot:
+                continue
+            entry = ACTIVITY.get(member.id)
+            ts: Optional[datetime] = None
+            kind: Optional[str] = None
+            if entry:
+                try:
+                    ts = datetime.fromisoformat(entry["ts"])
+                except (KeyError, ValueError):
+                    ts = None
+                else:
+                    kind = entry.get("type")
+            rows.append((member, ts, kind))
+        # Jamais vu en premier (plus inactif), puis du plus ancien au plus récent.
+        rows.sort(key=lambda r: (r[1] is not None, r[1] or datetime.min.replace(tzinfo=timezone.utc)))
+        if days is not None:
+            cutoff = now - timedelta(days=days)
+            rows = [r for r in rows if r[1] is None or r[1] < cutoff]
+        if not rows:
+            await interaction.followup.send(
+                f"Aucun membre inactif depuis {days} jour(s)." if days is not None else "Aucun membre trouvé.",
+                ephemeral=True,
+            )
+            return
+        name_width = 22
+        table_lines = [f"{'Membre':<{name_width}} {'Dernière interaction':<20} Type"]
+        table_lines.append("-" * len(table_lines[0]))
+        for member, ts, kind in rows[:200]:
+            when_txt = _format_activity_ts(ts, now) if ts else "Jamais"
+            type_txt = ACTIVITY_TYPE_LABELS.get(kind or "", "—")
+            name = member.display_name
+            if len(name) > name_width:
+                name = name[: name_width - 1] + "…"
+            table_lines.append(f"{name:<{name_width}} {when_txt:<20} {type_txt}")
+        title = "📊 **Activité des membres**"
+        if days is not None:
+            title += f" — inactifs depuis ≥ {days} jour(s)"
+        title += f" ({len(rows)} membre(s))"
+        if len(rows) > 200:
+            title += f" — 200 premiers affichés sur {len(rows)}"
+        for index, chunk in enumerate(split_discord_text("\n".join(table_lines), max_len=1800)):
+            body = f"{title}\n```\n{chunk}\n```" if index == 0 else f"```\n{chunk}\n```"
+            await interaction.followup.send(body, ephemeral=True)
+    except Exception as exc:
+        await interaction.followup.send(f"❌ /inactive : {exc}", ephemeral=True)
+# =============================================================================
 # Discord commands / events
 # =============================================================================
 @app_commands.context_menu(name="Export inscrit")
@@ -5507,6 +5630,8 @@ async def enforce_main_message(message: discord.Message):
             pass
 @bot.event
 async def on_message(message: discord.Message):
+    if not message.author.bot and message.guild:
+        record_activity(message.author.id, "message", message.created_at)
     await enforce_main_message(message)
     # KAparse: any user image in the configured channel is analysed automatically.
     if (
@@ -5547,6 +5672,23 @@ async def on_message_edit(before: discord.Message, after: discord.Message):
     ):
         asyncio.create_task(handle_uwu_pewpew_message(after))
 @bot.event
+async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
+    if not payload.guild_id or not payload.user_id:
+        return
+    if payload.user_id == bot.user.id if bot.user else False:
+        return
+    if payload.member is not None and payload.member.bot:
+        return
+    record_activity(payload.user_id, "reaction")
+@bot.event
+async def on_voice_state_update(
+    member: discord.Member, before: discord.VoiceState, after: discord.VoiceState
+):
+    if member.bot:
+        return
+    if after.channel is not None and before.channel != after.channel:
+        record_activity(member.id, "vocal")
+@bot.event
 async def on_ready():
     print("ApogeeBot — Export inscrit + Export grade + KAparse + Analyse Log")
     print(f"Connecté en tant que {bot.user} ({bot.user.id})")
@@ -5564,6 +5706,7 @@ async def on_ready():
     print(f"KAparse window: {DKPARSE_MAX_DAYS} jours")
     print("KAparse OCR: " + ("RapidOCR OK" if (RapidOCR is not None and Image is not None and np is not None) else "INDISPONIBLE"))
     print(f"Analyse Log: {'ACTIVE' if UWU_PEWPEW_ENABLED else 'DESACTIVE'} (/rank HEROIC + détection PB /character+dps_max)")
+    print(f"Suivi activité (/inactive): {len(ACTIVITY)} membre(s) suivi(s)")
 @bot.event
 async def setup_hook():
     for command in (rh_list_context, dkparse_context):
