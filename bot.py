@@ -1785,14 +1785,18 @@ async def extract_dkparse_screen_only(
             {"character": character, "spec_index": spec_index, **table_debug},
         )
         debug_suffix = ""
-        if table_debug.get("sample_rows"):
-            debug_suffix = " — 🔧 [debug] lignes brutes <tr> : " + "; ".join(
-                str(r) for r in table_debug["sample_rows"][:4]
-            )
-        elif table_debug.get("tr_count") == 0:
+        if table_debug.get("boss_count"):
             debug_suffix = (
-                f" — 🔧 [debug] page récupérée ({table_debug.get('html_len', 0)} car., "
-                f"url={table_debug.get('final_url')}) mais 0 balise <tr> trouvée."
+                " — 🔧 [debug] JSON /character: "
+                f"{table_debug.get('boss_count')} boss(es) reçu(s), "
+                f"{table_debug.get('skipped_no_points', 0)} sans points lisibles, "
+                f"{table_debug.get('skipped_no_date', 0)} sans report_id/date lisible — "
+                f"échantillon brut : {table_debug.get('sample_raw_boss')!r}"
+            )
+        else:
+            debug_suffix = (
+                " — 🔧 [debug] JSON /character sans clé 'bosses' exploitable — "
+                f"clés reçues : {table_debug.get('payload_keys')!r}"
             )
         return (
             character,
@@ -1806,10 +1810,11 @@ async def extract_dkparse_screen_only(
     rows: List[ScreenParseRow] = []
     for boss_lower, info in table.items():
         points = info.get("points")
-        date_raw = info.get("date") or ""
-        if points is None or not date_raw:
+        date_obj = info.get("date_obj")
+        report_id = info.get("date") or ""
+        if points is None or date_obj is None:
             continue
-        best_date = _ocr_date_value(date_raw)
+        best_date = datetime(date_obj.year, date_obj.month, date_obj.day, tzinfo=timezone.utc)
         boss = normalize_boss(boss_lower) or boss_lower
         rows.append(
             ScreenParseRow(
@@ -1817,7 +1822,7 @@ async def extract_dkparse_screen_only(
                 parse=float(points),
                 spec=f"spec{spec_index}",
                 best_date=best_date,
-                date_raw=date_raw,
+                date_raw=report_id,
                 attachment=image_attachments[0].filename,
             )
         )
@@ -4313,35 +4318,59 @@ async def _get_uwu_character_table_summary(
     spec_idx: int,
     server: str,
 ) -> Tuple[Dict[str, Dict[str, Optional[float]]], Dict[str, Any]]:
-    url = (
-        "https://uwu-logs.xyz/character?name="
-        + quote(player)
-        + "&server="
-        + quote(server)
-        + "&spec="
-        + str(int(spec_idx))
-    )
-    final_url, html = await _fetch_uwu_with_retry(url, "ApogeeBot/11.2 (+Analyse Log table)")
-    table = _extract_character_boss_table_rows(html)
+    """Per-boss Points/Kills/Date for this character+spec, for KAparse V3.
+    Confirmed live (23/08/2026, Koracore) that the character page's HTML
+    table is populated by client-side JavaScript: the raw server response
+    has the correct number of <tr> row skeletons but every cell is empty
+    text. So this reuses the SAME JSON API already validated for the
+    improvement-detection feature (_get_uwu_character_for_improvements,
+    payload shape confirmed 16/08/2026: {"bosses": {BossName: {report_id,
+    dps_max, points, raids, ...}}}) instead of scraping HTML. The report_id
+    prefix (YY-MM-DD--...) is the Best Log date, parsed via the existing
+    _report_id_date helper — there is no separate date field.
+    """
+    payload = await _get_uwu_character_for_improvements(player, spec_idx, server)
+    bosses = payload.get("bosses") if isinstance(payload, dict) else None
     debug_info: Dict[str, Any] = {
-        "url": url,
-        "final_url": final_url,
-        "html_len": len(html or ""),
-        "tr_count": len(re.findall(r"(?is)<tr[^>]*>.*?</tr>", html or "")),
+        "payload_keys": (
+            list(payload.keys()) if isinstance(payload, dict) else type(payload).__name__
+        ),
+        "boss_count": len(bosses) if isinstance(bosses, dict) else 0,
     }
-    if not table:
-        # Dump raw cell text for the first few <tr> rows, bypassing the
-        # boss-name/column filters, so the real table structure returned by
-        # uwu-logs.xyz can be seen directly instead of guessed at.
-        samples = []
-        for row in re.findall(r"(?is)<tr[^>]*>.*?</tr>", html or "")[:6]:
-            cells = _html_cells(row)
-            texts = [html_to_text(c).replace(" ", " ").strip() for c in cells]
-            texts = [t for t in texts if t]
-            if texts:
-                samples.append(texts)
-        debug_info["sample_rows"] = samples
-    return table, debug_info
+    out: Dict[str, Dict[str, Optional[float]]] = {}
+    if not isinstance(bosses, dict):
+        return out, debug_info
+    skipped_no_points = 0
+    skipped_no_date = 0
+    for raw_boss, raw in bosses.items():
+        if not isinstance(raw, dict) or not raw:
+            continue
+        boss = normalize_boss(str(raw_boss)) or str(raw_boss).strip()
+        if not boss:
+            continue
+        points = _character_points_value(raw)
+        kills = _character_kills_value(raw)
+        report_id = str(
+            raw.get("report_id") or raw.get("reportId") or raw.get("report") or ""
+        ).strip().strip("/")
+        date_obj = _report_id_date(report_id)
+        if points is None:
+            skipped_no_points += 1
+            continue
+        if date_obj is None:
+            skipped_no_date += 1
+            continue
+        out[boss.lower()] = {
+            "points": points,
+            "kills": kills,
+            "date_obj": date_obj,
+            "date": report_id,
+        }
+    if not out:
+        debug_info["skipped_no_points"] = skipped_no_points
+        debug_info["skipped_no_date"] = skipped_no_date
+        debug_info["sample_raw_boss"] = next(iter(bosses.values()), None) if bosses else None
+    return out, debug_info
 def _analyse_log_kill_debug_line(
     boss: str,
     mode: str,
