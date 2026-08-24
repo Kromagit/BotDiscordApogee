@@ -1766,7 +1766,7 @@ async def extract_dkparse_screen_only(
             [],
         )
     try:
-        table = await _get_uwu_character_table_summary(character, spec_index, UWU_SERVER)
+        table, table_debug = await _get_uwu_character_table_summary(character, spec_index, UWU_SERVER)
     except Exception as exc:
         dkp_debug(
             "DKPARSE FETCH UWU ECHEC",
@@ -1780,11 +1780,26 @@ async def extract_dkparse_screen_only(
             [],
         )
     if not table:
+        dkp_debug(
+            "DKPARSE FETCH UWU TABLE VIDE",
+            {"character": character, "spec_index": spec_index, **table_debug},
+        )
+        debug_suffix = ""
+        if table_debug.get("sample_rows"):
+            debug_suffix = " — 🔧 [debug] lignes brutes <tr> : " + "; ".join(
+                str(r) for r in table_debug["sample_rows"][:4]
+            )
+        elif table_debug.get("tr_count") == 0:
+            debug_suffix = (
+                f" — 🔧 [debug] page récupérée ({table_debug.get('html_len', 0)} car., "
+                f"url={table_debug.get('final_url')}) mais 0 balise <tr> trouvée."
+            )
         return (
             character,
             f"Aucune donnée trouvée sur uwu-logs.xyz pour {character} "
             f"(spec {spec_index}, {UWU_SERVER}) — vérifie l'orthographe du "
-            "pseudo lu sur le screen ou que ce personnage existe sur le site.",
+            "pseudo lu sur le screen ou que ce personnage existe sur le site."
+            f"{debug_suffix}",
             f"spec{spec_index}",
             [],
         )
@@ -4297,7 +4312,7 @@ async def _get_uwu_character_table_summary(
     player: str,
     spec_idx: int,
     server: str,
-) -> Dict[str, Dict[str, Optional[float]]]:
+) -> Tuple[Dict[str, Dict[str, Optional[float]]], Dict[str, Any]]:
     url = (
         "https://uwu-logs.xyz/character?name="
         + quote(player)
@@ -4306,8 +4321,27 @@ async def _get_uwu_character_table_summary(
         + "&spec="
         + str(int(spec_idx))
     )
-    _final, html = await _fetch_uwu_with_retry(url, "ApogeeBot/11.2 (+Analyse Log table)")
-    return _extract_character_boss_table_rows(html)
+    final_url, html = await _fetch_uwu_with_retry(url, "ApogeeBot/11.2 (+Analyse Log table)")
+    table = _extract_character_boss_table_rows(html)
+    debug_info: Dict[str, Any] = {
+        "url": url,
+        "final_url": final_url,
+        "html_len": len(html or ""),
+        "tr_count": len(re.findall(r"(?is)<tr[^>]*>.*?</tr>", html or "")),
+    }
+    if not table:
+        # Dump raw cell text for the first few <tr> rows, bypassing the
+        # boss-name/column filters, so the real table structure returned by
+        # uwu-logs.xyz can be seen directly instead of guessed at.
+        samples = []
+        for row in re.findall(r"(?is)<tr[^>]*>.*?</tr>", html or "")[:6]:
+            cells = _html_cells(row)
+            texts = [html_to_text(c).replace(" ", " ").strip() for c in cells]
+            texts = [t for t in texts if t]
+            if texts:
+                samples.append(texts)
+        debug_info["sample_rows"] = samples
+    return table, debug_info
 def _analyse_log_kill_debug_line(
     boss: str,
     mode: str,
