@@ -4300,11 +4300,17 @@ def _analyse_log_kill_debug_line(
     best_points = None
     best_player = None
     samples = []
+    raw_dump = None
     for player, raw in (rank_data or {}).items():
         entries += 1
         if not isinstance(raw, dict):
             non_dict += 1
             continue
+        if raw_dump is None:
+            try:
+                raw_dump = f"{player}={json.dumps(raw, ensure_ascii=False, default=str)}"
+            except Exception:
+                raw_dump = f"{player}={raw!r}"
         player_name = str(player)
         if not WOW_NAME_RE.fullmatch(player_name):
             name_regex_fail += 1
@@ -4338,6 +4344,7 @@ def _analyse_log_kill_debug_line(
         f"{points_unreadable} points illisibles, {non_dps_filtered} spec non-DPS filtrée(s), "
         f"{qualifying} qualifiant(s) (>=70 ou top1) — "
         f"meilleur={best_player}:{best_points} — échantillon: " + "; ".join(samples)
+        + (f" — JSON brut (1er joueur): {raw_dump}" if raw_dump else "")
     )
 def _apogeebot_hits_from_rank_payload(
     payload: Dict[str, Any],
