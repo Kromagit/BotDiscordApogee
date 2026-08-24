@@ -12,13 +12,11 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit, urljoin, parse_qs
 import sys
-
 import aiohttp
 import discord
 from discord import app_commands
 from discord.ext import commands
 from dotenv import load_dotenv
-
 # OCR local pour lire le nom du personnage sur le screenshot DKPARSE.
 # Dépendances :
 #   pip install rapidocr_onnxruntime pillow numpy
@@ -26,20 +24,16 @@ try:
     from rapidocr_onnxruntime import RapidOCR
 except Exception:
     RapidOCR = None
-
 try:
     from PIL import Image, ImageDraw, ImageFont
 except Exception:
     Image = None
     ImageDraw = None
     ImageFont = None
-
 try:
     import numpy as np
 except Exception:
     np = None
-
-
 # =============================================================================
 # Apogee Discord Bot - Raid-Helper + DKPARSE + ApogeeBot
 # =============================================================================
@@ -70,23 +64,17 @@ except Exception:
 #   QUE pour détecter ces améliorations, jamais pour calculer le classement du raid.
 # - catégories Analyse Log : Top 0.2 / 2 / 5 / 10 / 15 / 20 / 25 / 33 %.
 # =============================================================================
-
-
 def app_dir() -> Path:
     """Directory containing the EXE when frozen, otherwise this source file."""
     if getattr(sys, "frozen", False):
         return Path(sys.executable).resolve().parent
     return Path(__file__).resolve().parent
-
-
 APP_DIR = app_dir()
 load_dotenv(APP_DIR / ".env")
-
 TOKEN = os.getenv("DISCORD_TOKEN", "").strip()
 GUILD_ID = int(os.getenv("DISCORD_GUILD_ID", "0") or 0)
 MAIN_CHANNEL_ID = int(os.getenv("MAIN_CHANNEL_ID", "0") or 0)
 ADMIN_ROLE_ID = int(os.getenv("ADMIN_ROLE_ID", "0") or 0)
-
 LOGS_RAID_CHANNEL_ID = int(os.getenv("LOGS_RAID_CHANNEL_ID", "0") or 0)
 DKPARSE_CHANNEL_ID = int(os.getenv("DKPARSE_CHANNEL_ID", "0") or 0)
 DKPARSE_MAX_DAYS = int(os.getenv("DKPARSE_MAX_DAYS", "8") or 8)
@@ -101,7 +89,6 @@ UWU_PEWPEW_MAX_FIGHTS_PER_BOSS = int(os.getenv("UWU_PEWPEW_MAX_FIGHTS_PER_BOSS",
 KROMADDON_SAVED_VARIABLES_FILE = os.path.expandvars(
     os.path.expanduser(os.getenv("KROMADDON_SAVED_VARIABLES", "").strip())
 )
-
 RAID_HELPER_API = "https://raid-helper.dev/api/v4/events/{event_id}"
 WOW_NAME_RE = re.compile(r"^[A-Za-z]{2,12}$")
 UWU_URL_RE = re.compile(
@@ -109,9 +96,7 @@ UWU_URL_RE = re.compile(
     re.IGNORECASE,
 )
 REPORT_DATE_RE = re.compile(r"/reports/(\d{2})-(\d{2})-(\d{2})--")
-
 RH_DEBUG = False
-
 STATUS_ORDER = ["signed", "bench", "late", "tentative", "absence", "unknown"]
 STATUS_LABELS = {
     "signed": "✅ INSCRITS",
@@ -129,7 +114,6 @@ STATUS_CODES = {
     "absence": "A",
     "unknown": "U",
 }
-
 # Seuls ces rôles Discord sont exportés par /export-grade.
 GRADE_ROLE_ORDER: Tuple[str, ...] = (
     "Officier",
@@ -140,8 +124,6 @@ GRADE_ROLE_ORDER: Tuple[str, ...] = (
     "Membre",
     "Initié",
 )
-
-
 DM_BAD_MAIN = (
     "Message automatique Apogee :\n"
     "Ton message dans #Main n'est pas valide. "
@@ -149,7 +131,6 @@ DM_BAD_MAIN = (
     "un reroll par ligne, sans texte autour.\n"
     "Exemple :\nKromatisme\nKromamage\nKromadruide"
 )
-
 # Specs DKPARSE retenues.
 # Les alias servent uniquement à reconnaître ce qu'UwU renvoie.
 DKPARSE_SPECS = {
@@ -185,7 +166,6 @@ DKPARSE_SPECS = {
     "marksmanship hunter": "MM",
     "mm": "MM",
 }
-
 # Barème défini pour les DKPARSE.
 # Le premier seuil atteint en partant du haut gagne la valeur correspondante.
 DKPARSE_BRACKETS = (
@@ -196,7 +176,6 @@ DKPARSE_BRACKETS = (
     (80.0, 200),
     (70.0, 70),
 )
-
 BOSS_ALIASES = {
     "lord marrowgar": "Lord Marrowgar",
     "marrowgar": "Lord Marrowgar",
@@ -226,27 +205,20 @@ BOSS_ALIASES = {
     "lich king": "The Lich King",
     "lk": "The Lich King",
 }
-
 # Valithria n'est pas utilisée pour le meilleur parse dans l'environnement
 # Kromaddon actuel. Elle est laissée hors DKPARSE par défaut.
 DKPARSE_EXCLUDED_BOSSES = {"Gunship Battle", "Valithria Dreamwalker"}
-
 intents = discord.Intents.default()
 intents.guilds = True
 intents.members = True
 intents.message_content = True
-
 bot = commands.Bot(command_prefix="!", intents=intents)
-
-
 @dataclass
 class Signup:
     user_id: int
     display_name: str
     status: str
     raw_status: Any = None
-
-
 @dataclass(frozen=True)
 class UwuReport:
     url: str
@@ -254,8 +226,6 @@ class UwuReport:
     posted_at: datetime
     report_date: Optional[datetime]
     label: str = ""
-
-
 @dataclass(frozen=True)
 class ParseHit:
     character: str
@@ -265,8 +235,6 @@ class ParseHit:
     report_url: str
     report_date: Optional[datetime]
     evidence: str = ""
-
-
 @dataclass(frozen=True)
 class ScreenParseRow:
     boss: str
@@ -275,8 +243,6 @@ class ScreenParseRow:
     best_date: Optional[datetime]
     date_raw: str = ""
     attachment: str = ""
-
-
 @dataclass
 class DKParseScreenResult:
     message_id: int
@@ -288,8 +254,6 @@ class DKParseScreenResult:
     issues: List[str]
     total: int
     ocr_detail: str = ""
-
-
 @dataclass(frozen=True)
 class PewPewHit:
     player: str
@@ -298,8 +262,6 @@ class PewPewHit:
     points: float
     server_best: bool = False
     spec: str = ""
-
-
 @dataclass(frozen=True)
 class ParseImprovement:
     """Personal-best boss row whose current best report is the posted raid."""
@@ -308,8 +270,6 @@ class ParseImprovement:
     percentile: Optional[float] = None
     spec: str = ""
     kills: Optional[int] = None
-
-
 def rh_debug(title: str, value: Any = None) -> None:
     if not RH_DEBUG:
         return
@@ -324,8 +284,6 @@ def rh_debug(title: str, value: Any = None) -> None:
         except Exception:
             print(repr(value))
     print("=" * 78)
-
-
 def dkp_debug(title: str, value: Any = None) -> None:
     if not DKPARSE_DEBUG:
         return
@@ -337,19 +295,14 @@ def dkp_debug(title: str, value: Any = None) -> None:
         else:
             print(value)
     print("-" * 78)
-
-
 def get_first(d: Dict[str, Any], keys: Iterable[str], default=None):
     for key in keys:
         if key in d and d[key] not in (None, ""):
             return d[key]
     return default
-
-
 # =============================================================================
 # Raid-Helper (existing V3 behavior)
 # =============================================================================
-
 def normalize_status(raw: Any) -> str:
     s = str(raw or "").strip().lower()
     aliases = {
@@ -373,8 +326,6 @@ def normalize_status(raw: Any) -> str:
     if "sign" in s or "accept" in s or "confirm" in s:
         return "signed"
     return "unknown"
-
-
 def extract_raw_status(entry: Dict[str, Any]) -> Any:
     raw_status = get_first(
         entry,
@@ -391,8 +342,6 @@ def extract_raw_status(entry: Dict[str, Any]) -> Any:
             raw_status,
         )
     return raw_status
-
-
 def signup_category(entry: Dict[str, Any]) -> str:
     class_name = str(get_first(entry, ["className", "cClassName"], "")).strip().lower()
     if class_name == "late":
@@ -406,11 +355,8 @@ def signup_category(entry: Dict[str, Any]) -> str:
     if class_name:
         return "signed"
     return normalize_status(extract_raw_status(entry))
-
-
 def find_signup_lists(obj: Any) -> List[List[Dict[str, Any]]]:
     found = []
-
     def walk(x: Any):
         if isinstance(x, dict):
             for k, v in x.items():
@@ -436,7 +382,6 @@ def find_signup_lists(obj: Any) -> List[List[Dict[str, Any]]]:
                     found.append(items)
             for v in x:
                 walk(v)
-
     walk(obj)
     unique, seen = [], set()
     for lst in found:
@@ -445,8 +390,6 @@ def find_signup_lists(obj: Any) -> List[List[Dict[str, Any]]]:
             seen.add(marker)
             unique.append(lst)
     return unique
-
-
 def compact_entry(entry: Dict[str, Any]) -> Dict[str, Any]:
     keys = [
         "id", "userId", "user_id", "discordId", "discord_id", "memberId", "member_id",
@@ -460,12 +403,9 @@ def compact_entry(entry: Dict[str, Any]) -> Dict[str, Any]:
         if key in entry:
             out[key] = entry[key]
     return out or entry
-
-
 def extract_signup(entry: Dict[str, Any]) -> Optional[Signup]:
     user_obj = entry.get("user") if isinstance(entry.get("user"), dict) else {}
     member_obj = entry.get("member") if isinstance(entry.get("member"), dict) else {}
-
     uid = get_first(
         entry, ["userId", "user_id", "discordId", "discord_id", "memberId", "member_id"]
     )
@@ -479,7 +419,6 @@ def extract_signup(entry: Dict[str, Any]) -> Optional[Signup]:
             uid = candidate
     if uid is None or not str(uid).isdigit():
         return None
-
     name = get_first(
         entry, ["displayName", "display_name", "username", "userName", "name", "memberName"]
     )
@@ -489,15 +428,12 @@ def extract_signup(entry: Dict[str, Any]) -> Optional[Signup]:
         name = get_first(member_obj, ["display_name", "username", "name"])
     if not name:
         name = f"Discord {uid}"
-
     return Signup(
         user_id=int(uid),
         display_name=str(name),
         status=signup_category(entry),
         raw_status=extract_raw_status(entry),
     )
-
-
 def debug_event_structure(payload: Any, event_id: int) -> None:
     if not RH_DEBUG:
         return
@@ -507,8 +443,6 @@ def debug_event_structure(payload: Any, event_id: int) -> None:
         print(f"[RH DEBUG] Liste #{list_index}: {len(signup_list)}")
         for entry in signup_list:
             print(json.dumps(compact_entry(entry), ensure_ascii=False, indent=2, default=str))
-
-
 def parse_event_payload(payload: Any) -> Tuple[List[Signup], str]:
     event_title = "Raid-Helper Event"
     if isinstance(payload, dict):
@@ -517,14 +451,12 @@ def parse_event_payload(payload: Any) -> Tuple[List[Signup], str]:
         )
         if isinstance(payload.get("event"), dict):
             event_title = str(get_first(payload["event"], ["title", "name"], event_title))
-
     signups: Dict[int, Signup] = {}
     for lst in find_signup_lists(payload):
         for entry in lst:
             s = extract_signup(entry)
             if s:
                 signups[s.user_id] = s
-
     if not signups and isinstance(payload, dict):
         for key in ("signUps", "signups", "signup", "attendees", "participants"):
             lst = payload.get(key)
@@ -534,10 +466,7 @@ def parse_event_payload(payload: Any) -> Tuple[List[Signup], str]:
                         s = extract_signup(entry)
                         if s:
                             signups[s.user_id] = s
-
     return list(signups.values()), event_title
-
-
 async def fetch_raid_helper_event(event_id: int) -> Any:
     url = RAID_HELPER_API.format(event_id=event_id)
     timeout = aiohttp.ClientTimeout(total=15)
@@ -551,8 +480,6 @@ async def fetch_raid_helper_event(event_id: int) -> Any:
                 return json.loads(body)
             except json.JSONDecodeError as exc:
                 raise RuntimeError("Raid-Helper n'a pas renvoyé un JSON valide.") from exc
-
-
 async def get_text_channel(guild: discord.Guild, channel_id: int, env_name: str) -> discord.TextChannel:
     if not channel_id:
         raise RuntimeError(f"{env_name} manquant dans .env")
@@ -565,12 +492,8 @@ async def get_text_channel(guild: discord.Guild, channel_id: int, env_name: str)
     if not isinstance(channel, discord.TextChannel):
         raise RuntimeError(f"{env_name} ne correspond pas à un salon texte accessible.")
     return channel
-
-
 async def get_main_channel(guild: discord.Guild) -> discord.TextChannel:
     return await get_text_channel(guild, MAIN_CHANNEL_ID, "MAIN_CHANNEL_ID")
-
-
 def _parse_main_declaration(content: str) -> Optional[List[str]]:
     """Parse one #main message: main first, then zero or more rerolls."""
     characters = [line.strip() for line in (content or "").splitlines() if line.strip()]
@@ -580,8 +503,6 @@ def _parse_main_declaration(content: str) -> Optional[List[str]]:
     if len(folded) != len(set(folded)):
         return None
     return characters
-
-
 async def build_main_registry(
     guild: discord.Guild,
 ) -> Tuple[Dict[int, List[str]], List[str]]:
@@ -590,7 +511,6 @@ async def build_main_registry(
     by_user: Dict[int, Tuple[List[str], int]] = {}
     name_owner: Dict[str, int] = {}
     problems: List[str] = []
-
     async for msg in channel.history(limit=None, oldest_first=True):
         if msg.author.bot:
             continue
@@ -599,7 +519,6 @@ async def build_main_registry(
             preview = re.sub(r"\s+", " ", msg.content or "").strip()[:60]
             problems.append(f"<@{msg.author.id}> : message invalide (`{preview}`)")
             continue
-
         conflicts = [
             name
             for name in characters
@@ -615,7 +534,6 @@ async def build_main_registry(
                 )
             )
             continue
-
         if msg.author.id in by_user:
             old_characters, _ = by_user[msg.author.id]
             for old_name in old_characters:
@@ -625,10 +543,7 @@ async def build_main_registry(
         by_user[msg.author.id] = (characters, msg.id)
         for name in characters:
             name_owner[name.casefold()] = msg.author.id
-
     return {uid: value[0] for uid, value in by_user.items()}, problems
-
-
 async def build_main_map(guild: discord.Guild) -> Tuple[Dict[int, str], List[str]]:
     registry, problems = await build_main_registry(guild)
     return {
@@ -636,8 +551,6 @@ async def build_main_map(guild: discord.Guild) -> Tuple[Dict[int, str], List[str
         for user_id, characters in registry.items()
         if characters
     }, problems
-
-
 def _lua_table_body(raw: str, opening_brace: int) -> Optional[str]:
     """Return a Lua table body without executing the SavedVariables file."""
     if opening_brace < 0 or opening_brace >= len(raw) or raw[opening_brace] != "{":
@@ -670,8 +583,6 @@ def _lua_table_body(raw: str, opening_brace: int) -> Optional[str]:
                 return raw[opening_brace + 1:index]
         index += 1
     return None
-
-
 def _lua_named_table_body(raw: str, key: str) -> Optional[str]:
     """Return the first table assigned to an exact Lua identifier/string key."""
     escaped_key = re.escape(key)
@@ -683,8 +594,6 @@ def _lua_named_table_body(raw: str, key: str) -> Optional[str]:
         return None
     opening_brace = (raw or "").find("{", match.start(), match.end())
     return _lua_table_body(raw or "", opening_brace)
-
-
 def _lua_direct_named_tables(raw: str) -> List[Tuple[str, str]]:
     """Read direct ["name"] = {...} children from one Lua table body."""
     entry_re = re.compile(
@@ -726,8 +635,6 @@ def _lua_direct_named_tables(raw: str) -> List[Tuple[str, str]]:
                     continue
         index += 1
     return entries
-
-
 def _extract_kromaddon_alt_to_main(raw: str) -> Dict[str, str]:
     """Extract explicit and raid-history reroll links without executing Lua."""
     raw = raw or ""
@@ -738,7 +645,6 @@ def _extract_kromaddon_alt_to_main(raw: str) -> Dict[str, str]:
     db_body = _lua_table_body(raw, db_opening_brace)
     if db_body is None:
         return {}
-
     # Each attendance raid stores the resolved owner as:
     # players[main] = { main = "Main", characters = { ["Alt"] = true } }.
     # This contains the useful links even when the manually maintained
@@ -754,7 +660,6 @@ def _extract_kromaddon_alt_to_main(raw: str) -> Dict[str, str]:
             else:
                 timestamp_match = re.match(r"(\d+)", raid_id)
                 raid_date = int(timestamp_match.group(1)) if timestamp_match else 0
-
             players_body = _lua_named_table_body(raid_body, "players")
             if players_body is None:
                 continue
@@ -779,12 +684,10 @@ def _extract_kromaddon_alt_to_main(raw: str) -> Dict[str, str]:
                         and (previous is None or raid_date >= previous[0])
                     ):
                         inferred[folded] = (raid_date, main)
-
     mapping: Dict[str, str] = {
         character: dated_main[1]
         for character, dated_main in inferred.items()
     }
-
     # An explicit link is authoritative and therefore overrides raid history.
     explicit_body = _lua_named_table_body(db_body, "altToMain")
     if explicit_body is None:
@@ -798,19 +701,14 @@ def _extract_kromaddon_alt_to_main(raw: str) -> Dict[str, str]:
         if alt.casefold() != main.casefold():
             mapping[alt.casefold()] = main
     return mapping
-
-
 _KROMADDON_ALT_CACHE_PATH = ""
 _KROMADDON_ALT_CACHE_MTIME_NS = -1
 _KROMADDON_ALT_CACHE: Dict[str, str] = {}
-
-
 def _load_kromaddon_alt_to_main() -> Dict[str, str]:
     """Load and mtime-cache the configured Kromaddon SavedVariables mapping."""
     global _KROMADDON_ALT_CACHE_PATH
     global _KROMADDON_ALT_CACHE_MTIME_NS
     global _KROMADDON_ALT_CACHE
-
     if not KROMADDON_SAVED_VARIABLES_FILE:
         return {}
     path = Path(KROMADDON_SAVED_VARIABLES_FILE)
@@ -837,8 +735,6 @@ def _load_kromaddon_alt_to_main() -> Dict[str, str]:
             },
         )
         return {}
-
-
 def _resolve_kromaddon_main(character: str, alt_to_main: Dict[str, str]) -> str:
     """Resolve an alt chain defensively, stopping on missing links or cycles."""
     current = character
@@ -853,14 +749,11 @@ def _resolve_kromaddon_main(character: str, alt_to_main: Dict[str, str]) -> str:
             break
         current = parent
     return current
-
-
 async def build_grade_export(guild: discord.Guild) -> Tuple[str, List[str], int]:
     # Exporte chaque main valide de #Main avec uniquement les grades retenus.
     main_map, main_problems = await build_main_map(guild)
     warnings = list(main_problems)
     lines: List[str] = []
-
     for user_id, main in sorted(main_map.items(), key=lambda item: item[1].lower()):
         member = guild.get_member(user_id)
         if member is None:
@@ -868,27 +761,20 @@ async def build_grade_export(guild: discord.Guild) -> Tuple[str, List[str], int]
                 member = await guild.fetch_member(user_id)
             except (discord.NotFound, discord.Forbidden, discord.HTTPException):
                 member = None
-
         if member is None:
             warnings.append(f"{main} : membre Discord introuvable")
             lines.append(f"{main}: Aucun")
             continue
-
         member_roles = {role.name.casefold() for role in member.roles}
         grades = [
             role_name
             for role_name in GRADE_ROLE_ORDER
             if role_name.casefold() in member_roles
         ]
-
         if not grades:
             warnings.append(f"{main} : aucun rôle de grade suivi")
-
         lines.append(f"{main}: {', '.join(grades) if grades else 'Aucun'}")
-
     return "\n".join(lines), warnings, len(main_map)
-
-
 def can_use_admin(interaction: discord.Interaction) -> bool:
     if not interaction.guild or not isinstance(interaction.user, discord.Member):
         return False
@@ -898,8 +784,6 @@ def can_use_admin(interaction: discord.Interaction) -> bool:
         ADMIN_ROLE_ID
         and any(role.id == ADMIN_ROLE_ID for role in interaction.user.roles)
     )
-
-
 def split_discord_text(text: str, max_len: int = 1900) -> List[str]:
     if len(text) <= max_len:
         return [text]
@@ -915,14 +799,11 @@ def split_discord_text(text: str, max_len: int = 1900) -> List[str]:
     if current:
         chunks.append(current)
     return chunks
-
-
 class ExportView(discord.ui.View):
     def __init__(self, export_text: str, filename: str = "Kromaddon_RaidHelper.txt"):
         super().__init__(timeout=600)
         self.export_text = export_text
         self.filename = filename
-
     @discord.ui.button(label="Export Kromaddon", style=discord.ButtonStyle.primary)
     async def export_button(
         self, interaction: discord.Interaction, button: discord.ui.Button
@@ -936,8 +817,6 @@ class ExportView(discord.ui.View):
             file=file,
             ephemeral=True,
         )
-
-
 async def run_rh_list(interaction: discord.Interaction, message: discord.Message):
     if not can_use_admin(interaction):
         await interaction.response.send_message(
@@ -947,7 +826,6 @@ async def run_rh_list(interaction: discord.Interaction, message: discord.Message
     if not interaction.guild:
         await interaction.response.send_message("Serveur requis.", ephemeral=True)
         return
-
     await interaction.response.defer(ephemeral=False, thinking=True)
     try:
         payload = await fetch_raid_helper_event(message.id)
@@ -957,12 +835,10 @@ async def run_rh_list(interaction: discord.Interaction, message: discord.Message
             raise RuntimeError(
                 "Aucune inscription Raid-Helper détectée dans la réponse API."
             )
-
         main_map, main_problems = await build_main_map(interaction.guild)
         grouped: Dict[str, List[str]] = defaultdict(list)
         export_items: List[str] = []
         unrecognized: List[Signup] = []
-
         for s in signups:
             main = main_map.get(s.user_id)
             if main:
@@ -970,7 +846,6 @@ async def run_rh_list(interaction: discord.Interaction, message: discord.Message
                 export_items.append(f"{main}:{STATUS_CODES.get(s.status, 'U')}:{s.user_id}")
             else:
                 unrecognized.append(s)
-
         lines = [f"**{event_title}**", ""]
         for status in STATUS_ORDER:
             names = sorted(grouped.get(status, []), key=str.lower)
@@ -978,26 +853,26 @@ async def run_rh_list(interaction: discord.Interaction, message: discord.Message
                 lines.append(f"**{STATUS_LABELS[status]}**")
                 lines.extend(names)
                 lines.append("")
-
         if unrecognized:
             lines.append("**⚠️ NON RECONNUS**")
+            main_channel_hint = (
+                f"<#{MAIN_CHANNEL_ID}>" if MAIN_CHANNEL_ID else "#main"
+            )
+            lines.append(f"Merci de remplir le chan {main_channel_hint}.")
             for s in unrecognized:
                 lines.append(f"<@{s.user_id}>")
             lines.append("")
-
         if main_problems:
             lines.append("**⚠️ ANOMALIES #Main**")
             lines.extend(main_problems[:20])
             if len(main_problems) > 20:
                 lines.append(f"... et {len(main_problems) - 20} autre(s).")
             lines.append("")
-
         lines.append(
             f"**Total :** {len(signups)} inscription(s) — "
             f"{len(signups)-len(unrecognized)} reconnue(s) — "
             f"{len(unrecognized)} non reconnue(s)"
         )
-
         export_text = "RH|" + "|".join(sorted(export_items, key=str.lower))
         chunks = split_discord_text("\n".join(lines))
         for index, chunk in enumerate(chunks):
@@ -1012,14 +887,10 @@ async def run_rh_list(interaction: discord.Interaction, message: discord.Message
         if RH_DEBUG:
             print(repr(exc))
         await interaction.followup.send(f"❌ Export inscrit : {exc}")
-
-
 # =============================================================================
 # OCR screenshot DKPARSE
 # =============================================================================
-
 OCR_ENGINE = None
-
 OCR_IGNORE_WORDS = {
     "icecrown", "boss", "rank", "points", "point", "best", "dps", "dur",
     "kills", "kill", "date", "show", "other", "bosses", "hide", "snapshot",
@@ -1028,15 +899,11 @@ OCR_IGNORE_WORDS = {
     "druid", "warlock", "shaman", "frost", "fire", "shadow", "balance",
     "feral", "combat", "fury", "unholy", "demonology", "marksmanship",
 }
-
-
 def get_ocr_engine():
     global OCR_ENGINE
     if OCR_ENGINE is None and RapidOCR is not None:
         OCR_ENGINE = RapidOCR()
     return OCR_ENGINE
-
-
 def is_image_attachment(att: discord.Attachment) -> bool:
     ctype = (att.content_type or "").lower()
     name = (att.filename or "").lower()
@@ -1044,19 +911,13 @@ def is_image_attachment(att: discord.Attachment) -> bool:
         ctype.startswith("image/")
         or name.endswith((".png", ".jpg", ".jpeg", ".webp", ".bmp"))
     )
-
-
 async def download_attachment_bytes(att: discord.Attachment) -> bytes:
     try:
         return await att.read(use_cached=True)
     except TypeError:
         return await att.read()
-
-
 def _clean_ocr_token(raw: str) -> str:
     return re.sub(r"[^A-Za-z]", "", raw or "")
-
-
 def _box_geometry(box: Any) -> Tuple[float, float, float, float]:
     try:
         xs = [float(p[0]) for p in box]
@@ -1064,8 +925,6 @@ def _box_geometry(box: Any) -> Tuple[float, float, float, float]:
         return min(xs), min(ys), max(xs), max(ys)
     except Exception:
         return 0.0, 0.0, 0.0, 0.0
-
-
 def choose_character_from_ocr(
     ocr_result: Any,
     image_width: int,
@@ -1073,7 +932,6 @@ def choose_character_from_ocr(
 ) -> Tuple[Optional[str], List[Dict[str, Any]]]:
     """
     Choose the character name from the UwU character table header.
-
     Browser screenshots may contain tab/address-bar text above the actual page.
     The old heuristic could therefore select something such as UwULogsAprX.
     We now anchor the name to the visible UwU table: same horizontal band as
@@ -1083,7 +941,6 @@ def choose_character_from_ocr(
     candidates: List[Dict[str, Any]] = []
     if not items:
         return None, candidates
-
     def valid_name_item(it: Dict[str, Any]) -> bool:
         token = _clean_ocr_token(it["raw"])
         if not WOW_NAME_RE.fullmatch(token):
@@ -1096,9 +953,7 @@ def choose_character_from_ocr(
         if normalize_boss(token):
             return False
         return True
-
     raw_candidates = [it for it in items if valid_name_item(it)]
-
     # Locate table header row and the Icecrown server label.
     table_headers = [
         it for it in items
@@ -1109,7 +964,6 @@ def choose_character_from_ocr(
     if table_headers:
         ys = sorted(it["cy"] for it in table_headers)
         table_y = ys[len(ys)//2]
-
     ice_cells = [
         it for it in items
         if "icecrown" in re.sub(r"[^a-z]", "", it["lower"])
@@ -1121,7 +975,6 @@ def choose_character_from_ocr(
             ice = min(ice_cells, key=lambda it: abs(it["cy"] - table_y))
         else:
             ice = max(ice_cells, key=lambda it: it["confidence"])
-
     def add_candidate(it: Dict[str, Any], anchor_score: float) -> None:
         token = _clean_ocr_token(it["raw"])
         score = it["confidence"] * 4.0 + anchor_score
@@ -1133,7 +986,6 @@ def choose_character_from_ocr(
             "y": round(it["cy"], 1),
             "score": round(score, 4),
         })
-
     # Strong path: character is left of Icecrown and on almost the same line.
     if ice is not None:
         y_tol = max(16.0, image_height * 0.045)
@@ -1147,7 +999,6 @@ def choose_character_from_ocr(
             y_prox = max(0.0, 2.5 - abs(it["cy"] - ice["cy"]) / max(y_tol, 1.0) * 2.5)
             x_prox = max(0.0, 1.5 - abs(it["cx"] - image_width * 0.28) / max(image_width, 1) * 2.0)
             add_candidate(it, 5.0 + y_prox + x_prox)
-
     # Second path: immediately above the Boss/Rank/Points table header.
     if not candidates and table_y is not None:
         header_band = [
@@ -1160,7 +1011,6 @@ def choose_character_from_ocr(
             v = max(0.0, 3.0 - (table_y - it["cy"]) / max(image_height, 1) * 8.0)
             x = max(0.0, 1.5 - abs(it["cx"] - image_width * 0.28) / max(image_width, 1) * 2.0)
             add_candidate(it, 3.0 + v + x)
-
     # Conservative fallback. Penalize browser chrome at the very top.
     if not candidates:
         for it in raw_candidates:
@@ -1181,21 +1031,16 @@ def choose_character_from_ocr(
                 "y": round(it["cy"], 1),
                 "score": round(score, 4),
             })
-
     candidates.sort(key=lambda c: c["score"], reverse=True)
     if not candidates or candidates[0]["confidence"] < 0.35:
         return None, candidates
     return candidates[0]["name"], candidates
-
-
 async def extract_character_from_screenshot(
     message: discord.Message,
 ) -> Tuple[Optional[str], str]:
     image_attachments = [a for a in message.attachments if is_image_attachment(a)]
-
     if not image_attachments:
         return None, "Aucun screenshot image joint au message."
-
     if RapidOCR is None or Image is None or np is None:
         missing = []
         if RapidOCR is None:
@@ -1209,27 +1054,21 @@ async def extract_character_from_screenshot(
             "OCR local indisponible (" + ", ".join(missing) + "). "
             "Installer : pip install rapidocr_onnxruntime pillow numpy",
         )
-
     engine = get_ocr_engine()
     if engine is None:
         return None, "Impossible d'initialiser RapidOCR."
-
     all_candidates: List[Dict[str, Any]] = []
-
     for att in image_attachments[:4]:
         try:
             raw = await download_attachment_bytes(att)
             image = Image.open(io.BytesIO(raw)).convert("RGB")
             width, height = image.size
             arr = np.array(image)
-
             result, _elapsed = engine(arr)
             name, candidates = choose_character_from_ocr(result, width, height)
-
             for c in candidates[:10]:
                 c["attachment"] = att.filename
             all_candidates.extend(candidates[:10])
-
             dkp_debug(
                 "OCR SCREENSHOT",
                 {
@@ -1239,28 +1078,21 @@ async def extract_character_from_screenshot(
                     "candidates": candidates[:10],
                 },
             )
-
             if name:
                 return name, f"Nom lu sur le screen : {name}"
-
         except Exception as exc:
             dkp_debug(
                 "OCR SCREENSHOT ECHEC",
                 {"attachment": att.filename, "error": repr(exc)},
             )
-
     dkp_debug("OCR CANDIDATS GLOBAUX", all_candidates[:20])
     return None, "Le nom du personnage n'a pas pu être lu de façon fiable sur le screenshot."
-
-
-
 def _ocr_result_items(ocr_result: Any) -> List[Dict[str, Any]]:
     """Normalize RapidOCR output into positioned text items."""
     if isinstance(ocr_result, tuple) and ocr_result:
         ocr_result = ocr_result[0]
     if not isinstance(ocr_result, list):
         return []
-
     out: List[Dict[str, Any]] = []
     for item in ocr_result:
         if not isinstance(item, (list, tuple)) or len(item) < 2:
@@ -1285,8 +1117,6 @@ def _ocr_result_items(ocr_result: Any) -> List[Dict[str, Any]]:
             "h": max(1.0, y2 - y1),
         })
     return out
-
-
 def _ocr_percent_value(raw: str) -> Optional[float]:
     """Read one OCR cell as a 0..100 decimal percentage-like value."""
     text = (raw or "").strip().replace("%", "").replace(",", ".")
@@ -1299,8 +1129,6 @@ def _ocr_percent_value(raw: str) -> Optional[float]:
     except ValueError:
         return None
     return value if 0.0 <= value <= 100.0 else None
-
-
 def parse_requested_points_from_ocr(
     ocr_result: Any,
     requested_bosses: List[str],
@@ -1309,18 +1137,15 @@ def parse_requested_points_from_ocr(
 ) -> Dict[str, float]:
     """
     Read the orange/red `Points` column from the UwU character screenshot.
-
     This is the DKPARSE value the user sees on the screenshot. Fight pages are
     used only to prove participation/date/spec; they must not invent/replace
     this value (the old parser could incorrectly pick unrelated 100 values).
     """
     if not requested_bosses:
         return {}
-
     items = _ocr_result_items(ocr_result)
     if not items:
         return {}
-
     # Locate the table header. RapidOCR usually returns `Points` as one cell.
     point_headers = [
         it for it in items
@@ -1332,7 +1157,6 @@ def parse_requested_points_from_ocr(
         # Prefer the highest-confidence header near the middle of the table.
         header = max(point_headers, key=lambda it: (it["confidence"], -abs(it["cx"] - image_width * 0.5)))
         points_x = header["cx"]
-
     # Fallback: infer Points between Rank and Best Dps headers.
     if points_x is None:
         rank_headers = [it for it in items if it["lower"].strip() == "rank"]
@@ -1341,11 +1165,9 @@ def parse_requested_points_from_ocr(
             rx = max(rank_headers, key=lambda it: it["confidence"])["cx"]
             bx = max(best_headers, key=lambda it: it["confidence"])["cx"]
             points_x = (rx + bx) / 2.0
-
     if points_x is None:
         dkp_debug("OCR POINTS HEADER INTROUVABLE", {"requested_bosses": requested_bosses})
         return {}
-
     found: Dict[str, float] = {}
     for boss in requested_bosses:
         boss_cells = [
@@ -1356,7 +1178,6 @@ def parse_requested_points_from_ocr(
             continue
         boss_cell = max(boss_cells, key=lambda it: it["confidence"])
         row_tol = max(10.0, boss_cell["h"] * 0.9, image_height * 0.012)
-
         candidates: List[Tuple[float, float, Dict[str, Any]]] = []
         for it in items:
             if abs(it["cy"] - boss_cell["cy"]) > row_tol:
@@ -1367,7 +1188,6 @@ def parse_requested_points_from_ocr(
             # Distance to the Points-column header is the primary criterion.
             xdist = abs(it["cx"] - points_x)
             candidates.append((xdist, -it["confidence"], it))
-
         if not candidates:
             continue
         candidates.sort(key=lambda t: (t[0], t[1]))
@@ -1375,7 +1195,6 @@ def parse_requested_points_from_ocr(
         value = _ocr_percent_value(best_item["raw"])
         if value is not None:
             found[boss] = value
-
     dkp_debug(
         "OCR POINTS DKPARSE",
         {
@@ -1385,8 +1204,6 @@ def parse_requested_points_from_ocr(
         },
     )
     return found
-
-
 async def extract_dkparse_screenshot_data(
     message: discord.Message,
     requested_bosses: List[str],
@@ -1395,7 +1212,6 @@ async def extract_dkparse_screenshot_data(
     image_attachments = [a for a in message.attachments if is_image_attachment(a)]
     if not image_attachments:
         return None, "Aucun screenshot image joint au message.", {}
-
     if RapidOCR is None or Image is None or np is None:
         missing = []
         if RapidOCR is None:
@@ -1410,11 +1226,9 @@ async def extract_dkparse_screenshot_data(
             "Installer : pip install rapidocr_onnxruntime pillow numpy",
             {},
         )
-
     engine = get_ocr_engine()
     if engine is None:
         return None, "Impossible d'initialiser RapidOCR.", {}
-
     all_candidates: List[Dict[str, Any]] = []
     for att in image_attachments[:4]:
         try:
@@ -1441,12 +1255,8 @@ async def extract_dkparse_screenshot_data(
                 return name, f"Nom lu sur le screen : {name}", points
         except Exception as exc:
             dkp_debug("OCR DKPARSE ECHEC", {"attachment": att.filename, "error": repr(exc)})
-
     dkp_debug("OCR CANDIDATS GLOBAUX", all_candidates[:20])
     return None, "Le nom du personnage n'a pas pu être lu de façon fiable sur le screenshot.", {}
-
-
-
 def _ocr_date_value(raw: str) -> Optional[datetime]:
     """Parse a Best Log date cell such as 09-08-26 / 12/08/2026."""
     text = (raw or "").strip()
@@ -1461,8 +1271,6 @@ def _ocr_date_value(raw: str) -> Optional[datetime]:
         return datetime(year, month, day, tzinfo=timezone.utc)
     except ValueError:
         return None
-
-
 def _points_column_x(items: List[Dict[str, Any]], image_width: int, image_height: int) -> Optional[float]:
     headers = [
         it for it in items
@@ -1474,7 +1282,6 @@ def _points_column_x(items: List[Dict[str, Any]], image_width: int, image_height
             headers,
             key=lambda it: (it["confidence"], -abs(it["cx"] - image_width * 0.55)),
         )["cx"]
-
     rank_headers = [it for it in items if it["lower"].strip() == "rank"]
     best_headers = [it for it in items if "best" in it["lower"]]
     if rank_headers and best_headers:
@@ -1482,14 +1289,11 @@ def _points_column_x(items: List[Dict[str, Any]], image_width: int, image_height
         bx = max(best_headers, key=lambda it: it["confidence"])["cx"]
         return (rx + bx) / 2.0
     return None
-
-
 def _infer_wow_class_from_ocr_items(items: List[Dict[str, Any]]) -> str:
     """Read the WoW class from the whole UwU character screenshot."""
     joined = " ".join(it["raw"] for it in items)
     low = joined.lower()
     padded = f" {low} "
-
     class_hints = [
         ("deathknight", ("death knight", "deathknight", "scourgelord")),
         ("warlock", (" warlock ", "dark coven")),
@@ -1506,8 +1310,6 @@ def _infer_wow_class_from_ocr_items(items: List[Dict[str, Any]]) -> str:
         if any(h in padded for h in hints):
             return cls
     return ""
-
-
 # UwU uses the normal talent-tree order for ?spec=1/2/3.
 # Only specs tracked by the guild are mapped to Kromaddon labels.
 TRACKED_SPEC_BY_CLASS_INDEX = {
@@ -1522,17 +1324,13 @@ TRACKED_SPEC_BY_CLASS_INDEX = {
     ("warlock", 2): "Démono",
     ("hunter", 2): "MM",
 }
-
-
 def _spec_index_from_ocr_url(items: List[Dict[str, Any]]) -> Optional[int]:
     """Read UwU's ?spec=N parameter from the browser address bar."""
     if not items:
         return None
-
     ordered = sorted(items, key=lambda x: (x["cy"], x["cx"]))
     joined = " ".join(it["raw"] for it in ordered)
     compact = re.sub(r"\s+", "", joined.lower())
-
     for text in (compact, joined.lower()):
         for pattern in (
             r"(?:[?&]|^)spec[=:]?([123])(?:[&#/]|$)",
@@ -1541,7 +1339,6 @@ def _spec_index_from_ocr_url(items: List[Dict[str, Any]]) -> Optional[int]:
             m = re.search(pattern, text)
             if m:
                 return int(m.group(1))
-
     spec_cells = [it for it in items if "spec" in it["lower"]]
     for spec_cell in spec_cells:
         nearby = [
@@ -1556,8 +1353,6 @@ def _spec_index_from_ocr_url(items: List[Dict[str, Any]]) -> Optional[int]:
         if m:
             return int(m.group(1))
     return None
-
-
 def _selected_spec_index_from_image(
     image_array: Any,
     items: List[Dict[str, Any]],
@@ -1571,19 +1366,16 @@ def _selected_spec_index_from_image(
     """
     if image_array is None or np is None or image_width <= 0 or image_height <= 0:
         return None
-
     try:
         arr = image_array
         if getattr(arr, "ndim", 0) != 3 or arr.shape[2] < 3:
             return None
-
         ice_cells = [
             it for it in items
             if "icecrown" in re.sub(r"[^a-z]", "", it["lower"])
         ]
         if not ice_cells:
             return None
-
         table_headers = [
             it for it in items
             if it["lower"].strip() in {"boss", "rank", "points", "date"}
@@ -1593,29 +1385,24 @@ def _selected_spec_index_from_image(
         if table_headers:
             ys = sorted(it["cy"] for it in table_headers)
             table_y = ys[len(ys) // 2]
-
         usable_ice = [
             it for it in ice_cells
             if table_y is None or it["cy"] < table_y
         ] or ice_cells
-
         ice = (
             min(usable_ice, key=lambda it: abs(it["cy"] - table_y))
             if table_y is not None
             else max(usable_ice, key=lambda it: it["confidence"])
         )
-
         y0 = max(0, int(ice["cy"]) - max(28, int(image_height * 0.030)))
         y1 = min(image_height, int(ice["cy"]) + max(38, int(image_height * 0.045)))
         x0 = max(0, int(image_width * 0.875))
         x1 = min(image_width, int(image_width * 0.997))
         if x1 - x0 < 60 or y1 - y0 < 20:
             return None
-
         crop = arr[y0:y1, x0:x1, :3]
         slot_w = crop.shape[1] / 3.0
         scores: List[int] = []
-
         for idx in range(3):
             a = int(round(idx * slot_w))
             b = int(round((idx + 1) * slot_w))
@@ -1623,7 +1410,6 @@ def _selected_spec_index_from_image(
             r = slot[:, :, 0].astype(np.int16)
             g = slot[:, :, 1].astype(np.int16)
             blue = slot[:, :, 2].astype(np.int16)
-
             purple = (
                 (r >= 70)
                 & (blue >= 95)
@@ -1632,11 +1418,9 @@ def _selected_spec_index_from_image(
                 & (blue >= g + 28)
             )
             scores.append(int(purple.sum()))
-
         best_i = max(range(3), key=lambda i: scores[i])
         best = scores[best_i]
         second = sorted(scores, reverse=True)[1]
-
         selected = best_i + 1 if best >= 18 and best >= second * 1.35 else None
         dkp_debug(
             "OCR SPEC ICON",
@@ -1646,8 +1430,6 @@ def _selected_spec_index_from_image(
     except Exception as exc:
         dkp_debug("OCR SPEC ICON ECHEC", {"error": repr(exc)})
         return None
-
-
 def _infer_dkparse_spec_from_ocr_items(
     items: List[Dict[str, Any]],
     image_array: Any = None,
@@ -1659,15 +1441,12 @@ def _infer_dkparse_spec_from_ocr_items(
       1) class + UwU URL ?spec=N
       2) class + selected top-right spec icon
       3) class + talent distribution fallback
-
     We deliberately do NOT scan the entire page for any spec word first,
     because UwU can display both dual-spec builds on the left.
     """
     if not items:
         return ""
-
     wow_class = _infer_wow_class_from_ocr_items(items)
-
     url_spec_index = _spec_index_from_ocr_url(items)
     if wow_class and url_spec_index:
         label = TRACKED_SPEC_BY_CLASS_INDEX.get((wow_class, url_spec_index), "")
@@ -1677,7 +1456,6 @@ def _infer_dkparse_spec_from_ocr_items(
         )
         if label:
             return label
-
     icon_spec_index = _selected_spec_index_from_image(
         image_array, items, image_width, image_height
     )
@@ -1689,7 +1467,6 @@ def _infer_dkparse_spec_from_ocr_items(
         )
         if label:
             return label
-
     joined = " ".join(it["raw"] for it in items)
     builds: List[Tuple[int, int, int]] = []
     for m in re.finditer(
@@ -1699,7 +1476,6 @@ def _infer_dkparse_spec_from_ocr_items(
         vals = tuple(int(x) for x in m.groups())
         if sum(vals) <= 80 and max(vals) >= 30:
             builds.append(vals)
-
     if wow_class and builds:
         candidates: List[str] = []
         for vals in builds:
@@ -1710,10 +1486,7 @@ def _infer_dkparse_spec_from_ocr_items(
         unique = list(dict.fromkeys(candidates))
         if len(unique) == 1:
             return unique[0]
-
     return ""
-
-
 def parse_all_dkparse_rows_from_ocr(
     ocr_result: Any,
     image_width: int,
@@ -1723,13 +1496,11 @@ def parse_all_dkparse_rows_from_ocr(
 ) -> Tuple[str, List[ScreenParseRow]]:
     """
     Parse ALL ICC DKPARSE rows visible in the screenshot.
-
     The Discord message text is deliberately not consulted here.
     """
     items = _ocr_result_items(ocr_result)
     if not items:
         return "", []
-
     spec = _infer_dkparse_spec_from_ocr_items(
         items,
         image_array=image_array,
@@ -1740,7 +1511,6 @@ def parse_all_dkparse_rows_from_ocr(
     if points_x is None:
         dkp_debug("OCR SCREEN-ONLY POINTS HEADER INTROUVABLE")
         return spec, []
-
     # One best OCR cell per canonical boss.
     boss_cells: Dict[str, Dict[str, Any]] = {}
     for it in items:
@@ -1750,13 +1520,11 @@ def parse_all_dkparse_rows_from_ocr(
         old = boss_cells.get(boss)
         if old is None or it["confidence"] > old["confidence"]:
             boss_cells[boss] = it
-
     rows: List[ScreenParseRow] = []
     for boss, boss_cell in boss_cells.items():
         row_tol = max(9.0, boss_cell["h"] * 0.95, image_height * 0.013)
         row_items = [it for it in items if abs(it["cy"] - boss_cell["cy"]) <= row_tol]
         row_items.sort(key=lambda it: it["cx"])
-
         # Points: closest numeric cell to the Points header X coordinate.
         point_candidates: List[Tuple[float, float, Dict[str, Any]]] = []
         for it in row_items:
@@ -1771,7 +1539,6 @@ def parse_all_dkparse_rows_from_ocr(
         parse_value = _ocr_percent_value(point_item["raw"])
         if parse_value is None:
             continue
-
         # Date: preferably a single OCR cell, otherwise the whole reconstructed row.
         best_date: Optional[datetime] = None
         date_raw = ""
@@ -1786,7 +1553,6 @@ def parse_all_dkparse_rows_from_ocr(
             best_date = _ocr_date_value(row_text)
             if best_date:
                 date_raw = row_text
-
         rows.append(
             ScreenParseRow(
                 boss=boss,
@@ -1797,7 +1563,6 @@ def parse_all_dkparse_rows_from_ocr(
                 attachment=attachment,
             )
         )
-
     rows.sort(key=lambda r: (r.best_date or datetime(1970, 1, 1, tzinfo=timezone.utc), r.boss), reverse=True)
     dkp_debug(
         "OCR SCREEN-ONLY ROWS",
@@ -1815,16 +1580,131 @@ def parse_all_dkparse_rows_from_ocr(
         },
     )
     return spec, rows
+def _find_flat_color_runs(
+    row: "np.ndarray", min_run: int, tol: int
+) -> List[Tuple[int, int, Tuple[int, int, int]]]:
+    """Contiguous runs of near-constant RGB color within one image row."""
+    runs: List[Tuple[int, int, Tuple[int, int, int]]] = []
+    n = len(row)
+    if n == 0:
+        return runs
+    start = 0
+    start_color = row[0].astype(int)
+    for i in range(1, n + 1):
+        if i == n or bool(np.any(np.abs(row[i].astype(int) - start_color) > tol)):
+            if i - start >= min_run:
+                runs.append((start, i - 1, tuple(int(c) for c in row[start])))
+            if i < n:
+                start = i
+                start_color = row[i].astype(int)
+    return runs
+
+
+def _spec_icon_runs_match(
+    a: List[Tuple[int, int, Tuple[int, int, int]]],
+    b: List[Tuple[int, int, Tuple[int, int, int]]],
+) -> bool:
+    if len(a) != len(b):
+        return False
+    for (s1, e1, c1), (s2, e2, c2) in zip(a, b):
+        if abs(s1 - s2) > 6 or abs(e1 - e2) > 6:
+            return False
+        if any(abs(x - y) > 14 for x, y in zip(c1, c2)):
+            return False
+    return True
+
+
+def detect_active_uwu_spec_index(image: "Image.Image") -> Optional[int]:
+    """Detect which of the 3 uwu-logs spec icons (top-right of the character
+    page, next to the big Dps% number) is the active one.
+
+    uwu-logs draws a short, perfectly flat-colored underline bar beneath each
+    of the 3 spec icons: a neutral grey bar (94,94,94 in samples seen) under
+    the 2 inactive specs, and a vividly saturated bar under the active one
+    (its color varies — purple, magenta... — so we detect it by saturation,
+    not by one fixed hue). This was reverse-engineered from real uwu-logs
+    screenshots rather than guessed: the bars are exact solid-color
+    rectangles spanning several consecutive rows, which is a very
+    distinctive, resolution-independent signature — unlike the icon artwork
+    above them (busy/textured) or ordinary page text (glyphs vary row to
+    row). Requiring the SAME 3-run pattern to repeat for several consecutive
+    rows is what lets this reject unrelated nav-bar/logo text that a plain
+    color-saturation scan alone would also pick up.
+    Returns 1/2/3 (matching uwu-logs' own spec=1/2/3 URL parameter), or None
+    if no confident match was found.
+    """
+    arr = np.array(image.convert("RGB"))
+    h, w, _ = arr.shape
+    if h < 20 or w < 20:
+        return None
+    y_lo, y_hi = 0, int(h * 0.35)
+    x_lo = int(w * 0.55)
+    min_run = max(12, int(w * 0.010))
+    tol = 10  # generous: tolerate JPEG/Discord re-encoding noise
+    candidates: List[Tuple[int, List[Tuple[int, int, Tuple[int, int, int]]]]] = []
+    for y in range(y_lo, y_hi):
+        row = arr[y, x_lo:, :]
+        runs = _find_flat_color_runs(row, min_run=min_run, tol=tol)
+        # a pure-black run is background, never the underline itself
+        runs = [r for r in runs if not (r[2][0] < 10 and r[2][1] < 10 and r[2][2] < 10)]
+        if len(runs) == 3:
+            widths = [r[1] - r[0] for r in runs]
+            if max(widths) - min(widths) < max(20, int(w * 0.012)) and min(widths) > min_run:
+                candidates.append((y, runs))
+    consistency = 3
+    i = 0
+    stable = None
+    while i < len(candidates):
+        y0, runs0 = candidates[i]
+        streak = [(y0, runs0)]
+        j = i + 1
+        while (
+            j < len(candidates)
+            and candidates[j][0] == candidates[j - 1][0] + 1
+            and _spec_icon_runs_match(candidates[j][1], runs0)
+        ):
+            streak.append(candidates[j])
+            j += 1
+        if len(streak) >= consistency:
+            stable = streak
+            break
+        i = j if j > i else i + 1
+    if stable is None:
+        return None
+    _, runs = stable[len(stable) // 2]
+    saturations = []
+    for (_s, _e, color) in runs:
+        r, g, b = color
+        mx, mn = max(r, g, b), min(r, g, b)
+        saturations.append((mx - mn) / max(mx, 1))
+    best_idx = int(np.argmax(saturations))
+    if saturations[best_idx] < 0.35:
+        return None
+    others = [s for idx, s in enumerate(saturations) if idx != best_idx]
+    if others and (saturations[best_idx] - max(others)) < 0.20:
+        return None
+    return best_idx + 1  # 1-indexed: matches uwu-logs' spec=1/2/3 URL param
 
 
 async def extract_dkparse_screen_only(
     message: discord.Message,
 ) -> Tuple[Optional[str], str, str, List[ScreenParseRow]]:
-    """Read character + all DKPARSE rows from screenshots; ignore message text entirely."""
+    """Read character + all DKPARSE rows from a screenshot of the player's OWN
+    uwu-logs.xyz character page.
+
+    V3 : seul le pseudo est lu par OCR sur le screenshot (texte large, fiable).
+    Le spec actif est lu depuis les 3 icônes en haut à droite de la page (bordure
+    colorée = active, cf. detect_active_uwu_spec_index) et non par OCR texte,
+    puisque uwu-logs n'affiche jamais le nom du spec en toutes lettres sur cette
+    page. Boss/Points/Date viennent ensuite d'une lecture EN DIRECT de
+    https://uwu-logs.xyz/character?name=...&server=Icecrown&spec=N — la donnée
+    canonique et complète — plutôt que d'un OCR du tableau (peu fiable : petite
+    police, ligne coupée par un scroll, boss masqué derrière "Hide other bosses"
+    jamais récupérable par OCR).
+    """
     image_attachments = [a for a in message.attachments if is_image_attachment(a)]
     if not image_attachments:
         return None, "Aucun screenshot image joint au message.", "", []
-
     if RapidOCR is None or Image is None or np is None:
         missing = []
         if RapidOCR is None:
@@ -1840,16 +1720,12 @@ async def extract_dkparse_screen_only(
             "",
             [],
         )
-
     engine = get_ocr_engine()
     if engine is None:
         return None, "Impossible d'initialiser RapidOCR.", "", []
-
     character: Optional[str] = None
-    spec = ""
-    rows: List[ScreenParseRow] = []
+    spec_index: Optional[int] = None
     all_candidates: List[Dict[str, Any]] = []
-
     for att in image_attachments[:4]:
         try:
             raw = await download_attachment_bytes(att)
@@ -1857,63 +1733,102 @@ async def extract_dkparse_screen_only(
             width, height = image.size
             image_array = np.array(image)
             result, _elapsed = engine(image_array)
-
             name, candidates = choose_character_from_ocr(result, width, height)
             if name and not character:
                 character = name
             for c in candidates[:10]:
                 c["attachment"] = att.filename
             all_candidates.extend(candidates[:10])
-
-            img_spec, img_rows = parse_all_dkparse_rows_from_ocr(
-                result,
-                width,
-                height,
-                att.filename,
-                image_array=image_array,
-            )
-            if img_spec and not spec:
-                spec = img_spec
-            rows.extend(img_rows)
-
+            if spec_index is None:
+                spec_index = detect_active_uwu_spec_index(image)
             dkp_debug(
-                "OCR SCREEN-ONLY COMPLET",
-                {
-                    "attachment": att.filename,
-                    "selected": name,
-                    "spec": img_spec,
-                    "row_count": len(img_rows),
-                },
+                "OCR SCREEN NOM+SPEC (V3, fetch uwu-logs en direct)",
+                {"attachment": att.filename, "selected": name, "spec_index": spec_index},
             )
         except Exception as exc:
             dkp_debug("OCR SCREEN-ONLY ECHEC", {"attachment": att.filename, "error": repr(exc)})
-
-    # Dedupe exact OCR duplicates across multiple attachments.
-    unique: Dict[Tuple[str, Optional[datetime], int], ScreenParseRow] = {}
-    for row in rows:
-        key = (row.boss, row.best_date, int(round(row.parse * 100)))
-        unique[key] = row
-    rows = list(unique.values())
-
     if not character:
         dkp_debug("OCR CANDIDATS GLOBAUX", all_candidates[:20])
-        return None, "Le nom du personnage n'a pas pu être lu de façon fiable sur le screenshot.", spec, rows
-
-    return character, f"Nom lu sur le screen : {character}", spec, rows
-
-
+        return None, "Le nom du personnage n'a pas pu être lu de façon fiable sur le screenshot.", "", []
+    if spec_index is None:
+        return (
+            character,
+            "La spécialisation active n'a pas pu être détectée depuis les 3 icônes "
+            "en haut à droite du screenshot (aucune icône colorée identifiée avec "
+            "certitude — screenshot recadré, flou, ou thème de page différent ?).",
+            "",
+            [],
+        )
+    try:
+        table = await _get_uwu_character_table_summary(character, spec_index, UWU_SERVER)
+    except Exception as exc:
+        dkp_debug(
+            "DKPARSE FETCH UWU ECHEC",
+            {"character": character, "spec_index": spec_index, "error": repr(exc)},
+        )
+        return (
+            character,
+            f"Impossible de récupérer la page uwu-logs.xyz de {character} "
+            f"(spec {spec_index}, {UWU_SERVER}) : {exc}",
+            f"spec{spec_index}",
+            [],
+        )
+    if not table:
+        return (
+            character,
+            f"Aucune donnée trouvée sur uwu-logs.xyz pour {character} "
+            f"(spec {spec_index}, {UWU_SERVER}) — vérifie l'orthographe du "
+            "pseudo lu sur le screen ou que ce personnage existe sur le site.",
+            f"spec{spec_index}",
+            [],
+        )
+    rows: List[ScreenParseRow] = []
+    for boss_lower, info in table.items():
+        points = info.get("points")
+        date_raw = info.get("date") or ""
+        if points is None or not date_raw:
+            continue
+        best_date = _ocr_date_value(date_raw)
+        boss = normalize_boss(boss_lower) or boss_lower
+        rows.append(
+            ScreenParseRow(
+                boss=boss,
+                parse=float(points),
+                spec=f"spec{spec_index}",
+                best_date=best_date,
+                date_raw=date_raw,
+                attachment=image_attachments[0].filename,
+            )
+        )
+    dkp_debug(
+        "DKPARSE FETCH UWU ROWS",
+        {
+            "character": character,
+            "spec_index": spec_index,
+            "rows": [
+                {
+                    "boss": r.boss,
+                    "parse": r.parse,
+                    "date": r.best_date.date().isoformat() if r.best_date else None,
+                }
+                for r in rows
+            ],
+        },
+    )
+    return (
+        character,
+        f"Nom lu sur le screen : {character} (spec {spec_index}, via uwu-logs.xyz)",
+        f"spec{spec_index}",
+        rows,
+    )
 def _screen_date_within_post_window(best_date: datetime, post_time: datetime) -> bool:
     delta = (post_time.astimezone(timezone.utc).date() - best_date.date()).days
     return -1 <= delta <= DKPARSE_MAX_DAYS
-
-
 def _lograid_date_set(reports: List[UwuReport]) -> set:
     return {r.report_date.date() for r in reports if r.report_date is not None}
-
 # =============================================================================
 # DKPARSE
 # =============================================================================
-
 def canonical_uwu_url(url: str) -> str:
     """Remove query/fragment and normalize a report URL for duplicate handling."""
     url = html_lib.unescape(url).rstrip(".,;!?)>'\"")
@@ -1922,8 +1837,6 @@ def canonical_uwu_url(url: str) -> str:
     if not path.endswith("/"):
         path += "/"
     return urlunsplit(("https", "uwu-logs.xyz", path, "", ""))
-
-
 def report_date_from_url(url: str) -> Optional[datetime]:
     m = REPORT_DATE_RE.search(url)
     if not m:
@@ -1933,11 +1846,7 @@ def report_date_from_url(url: str) -> Optional[datetime]:
         return datetime(2000 + yy, mm, dd, tzinfo=timezone.utc)
     except ValueError:
         return None
-
-
 _REPORT_ID_DATE_RE = re.compile(r"^(\d{2})-(\d{2})-(\d{2})")
-
-
 def _report_id_date(report_id: str):
     """Parse the YY-MM-DD prefix of a report_id (not a full URL) as a real date."""
     if not report_id:
@@ -1950,8 +1859,6 @@ def _report_id_date(report_id: str):
         return datetime(2000 + yy, mm, dd, tzinfo=timezone.utc).date()
     except ValueError:
         return None
-
-
 def extract_uwu_urls(text: str) -> List[str]:
     out, seen = [], set()
     for raw in UWU_URL_RE.findall(text or ""):
@@ -1960,8 +1867,6 @@ def extract_uwu_urls(text: str) -> List[str]:
             seen.add(url)
             out.append(url)
     return out
-
-
 def normalize_spec(raw: str) -> str:
     """Recognize a tracked spec without substring false positives (ex: SP in spell)."""
     s = re.sub(r"\s+", " ", (raw or "").strip().lower())
@@ -1970,8 +1875,6 @@ def normalize_spec(raw: str) -> str:
         if re.search(pattern, s):
             return label
     return ""
-
-
 def normalize_boss(raw: str) -> str:
     s = re.sub(r"[-_]+", " ", (raw or "").strip().lower())
     s = re.sub(r"\s+", " ", s)
@@ -1981,23 +1884,17 @@ def normalize_boss(raw: str) -> str:
         if alias in s:
             return boss
     return ""
-
-
 def dkp_for_parse(parse_value: float) -> int:
     for threshold, amount in DKPARSE_BRACKETS:
         if parse_value >= threshold:
             return amount
     return 0
-
-
 def html_to_text(raw_html: str) -> str:
     text = re.sub(r"(?is)<script[^>]*>.*?</script>", " ", raw_html)
     text = re.sub(r"(?is)<style[^>]*>.*?</style>", " ", text)
     text = re.sub(r"(?s)<[^>]+>", " ", text)
     text = html_lib.unescape(text)
     return re.sub(r"\s+", " ", text).strip()
-
-
 def json_candidates_from_html(raw_html: str) -> List[Any]:
     """Parse JSON-ish script blocks when UwU embeds raid data client-side."""
     found: List[Any] = []
@@ -2015,8 +1912,6 @@ def json_candidates_from_html(raw_html: str) -> List[Any]:
             except Exception:
                 pass
     return found
-
-
 def walk_dicts(obj: Any) -> Iterable[Dict[str, Any]]:
     if isinstance(obj, dict):
         yield obj
@@ -2025,8 +1920,6 @@ def walk_dicts(obj: Any) -> Iterable[Dict[str, Any]]:
     elif isinstance(obj, list):
         for value in obj:
             yield from walk_dicts(value)
-
-
 def _numeric(value: Any) -> Optional[float]:
     if isinstance(value, (int, float)):
         return float(value)
@@ -2038,14 +1931,11 @@ def _numeric(value: Any) -> Optional[float]:
             except ValueError:
                 return None
     return None
-
-
 def parse_hits_from_json(
     objects: List[Any], character: str, report_url: str, report_date: Optional[datetime]
 ) -> List[ParseHit]:
     hits: List[ParseHit] = []
     char_l = character.lower()
-
     name_keys = ("name", "player", "playerName", "character", "characterName")
     boss_keys = ("boss", "bossName", "fight", "fightName", "encounter", "encounterName")
     spec_keys = ("spec", "specName", "specialization", "specialisation")
@@ -2053,22 +1943,18 @@ def parse_hits_from_json(
         "parse", "percent", "percentage", "performance", "performancePercent",
         "rankPercent", "dpsPercent", "points",
     )
-
     for obj in objects:
         for d in walk_dicts(obj):
             values_lower = " ".join(str(v).lower() for v in d.values() if isinstance(v, str))
             name = str(get_first(d, name_keys, ""))
             if char_l not in name.lower() and char_l not in values_lower:
                 continue
-
             boss_raw = str(get_first(d, boss_keys, ""))
             boss = normalize_boss(boss_raw or values_lower)
             if not boss or boss in DKPARSE_EXCLUDED_BOSSES:
                 continue
-
             spec_raw = str(get_first(d, spec_keys, ""))
             spec = normalize_spec(spec_raw or values_lower)
-
             parse_value = None
             for key in parse_keys:
                 if key in d:
@@ -2078,7 +1964,6 @@ def parse_hits_from_json(
                         break
             if parse_value is None:
                 continue
-
             hits.append(
                 ParseHit(
                     character=character,
@@ -2091,14 +1976,11 @@ def parse_hits_from_json(
                 )
             )
     return hits
-
-
 def parse_hits_from_text(
     raw_html: str, character: str, report_url: str, report_date: Optional[datetime]
 ) -> List[ParseHit]:
     """
     Fallback for UwU HTML.
-
     We only accept a value if character + boss + percentage/rank-like value are
     physically close in the returned page. This intentionally prefers false
     negatives over paying a wrong DKPARSE.
@@ -2107,12 +1989,10 @@ def parse_hits_from_text(
     lower = text.lower()
     char_l = character.lower()
     hits: List[ParseHit] = []
-
     positions = [m.start() for m in re.finditer(re.escape(char_l), lower)]
     for pos in positions:
         window = text[max(0, pos - 700): min(len(text), pos + 1200)]
         window_l = window.lower()
-
         boss = ""
         boss_pos = 10**9
         for alias, canonical in BOSS_ALIASES.items():
@@ -2121,9 +2001,7 @@ def parse_hits_from_text(
                 boss, boss_pos = canonical, p
         if not boss or boss in DKPARSE_EXCLUDED_BOSSES:
             continue
-
         spec = normalize_spec(window)
-
         # Strong labels first.
         patterns = [
             r"(?:parse|performance|points?|rank)\s*[:=]?\s*(\d{2,3}(?:[.,]\d+)?)\s*%?",
@@ -2138,12 +2016,10 @@ def parse_hits_from_text(
                     continue
                 if 0 <= value <= 100:
                     values.append(value)
-
         # DKPARSE only starts at 70, which also removes many unrelated values.
         values = [v for v in values if v >= 70]
         if not values:
             continue
-
         # Use the largest candidate only inside this tightly bounded evidence
         # window. If UwU exposes structured JSON, that path is preferred.
         value = max(values)
@@ -2159,8 +2035,6 @@ def parse_hits_from_text(
             )
         )
     return hits
-
-
 def boss_from_uwu_url(url: str) -> str:
     """Return the canonical boss name from an UwU ?boss=... query."""
     try:
@@ -2169,68 +2043,51 @@ def boss_from_uwu_url(url: str) -> str:
     except Exception:
         raw = ""
     return normalize_boss(raw)
-
-
 def extract_uwu_fight_urls(raw_html: str, report_url: str) -> List[str]:
     """
     UwU's report landing page does not necessarily contain the raid roster.
     Individual fight pages are linked through ?boss=... URLs.
-
     Collect same-report fight URLs from href/data attributes and JS strings.
     """
     base = canonical_uwu_url(report_url)
     base_parts = urlsplit(base)
     candidates: List[str] = []
-
     # HTML attributes.
     attr_pattern = r"""(?is)(?:href|data-url|data-href|value)\s*=\s*["']([^"']+)["']"""
     for m in re.finditer(attr_pattern, raw_html):
         candidates.append(html_lib.unescape(m.group(1).strip()))
-
     # JS/JSON strings containing report queries.
     js_pattern = r"""(?is)["']([^"']*(?:\?|&amp;|&)boss=[^"']+)["']"""
     for m in re.finditer(js_pattern, raw_html):
         candidates.append(html_lib.unescape(m.group(1).strip()))
-
     out: List[str] = []
     seen = set()
-
     for raw in candidates:
         if not raw or "boss=" not in raw.lower():
             continue
-
         absolute = urljoin(base, raw)
         parts = urlsplit(absolute)
-
-        if parts.netloc.lower() not in {"uwu-logs.xyz", "www.uwu-logs.xyz"}:
+        if parts.netloc.lower() not in {"uwu-logs.xyz", "[www.uwu-logs.xyz](https://www.uwu-logs.xyz)"}:
             continue
-
         if parts.path.rstrip("/") != base_parts.path.rstrip("/"):
             continue
-
         url = urlunsplit(("https", "uwu-logs.xyz", parts.path, parts.query, ""))
         if url not in seen:
             seen.add(url)
             out.append(url)
-
     return out
-
-
 def _candidate_parse_values(text: str) -> List[float]:
     """
     Extract plausible performance/parse values.
-
     Strong labelled values are preferred. As a fallback for an UwU player row,
     decimal/percent values in the DKPARSE range are accepted.
     """
     strong: List[float] = []
     fallback: List[float] = []
-
     labelled_patterns = [
         r"(?:parse|performance|points?|rank)\s*[:=]?\s*(\d{2,3}(?:[.,]\d+)?)\s*%?",
         r"(\d{2,3}(?:[.,]\d+)?)\s*%\s*(?:parse|performance|points?|rank)?",
     ]
-
     for pattern in labelled_patterns:
         for m in re.finditer(pattern, text, re.IGNORECASE):
             try:
@@ -2239,7 +2096,6 @@ def _candidate_parse_values(text: str) -> List[float]:
                 continue
             if 70 <= value <= 100:
                 strong.append(value)
-
     for m in re.finditer(r"(?<!\d)(\d{2,3}(?:[.,]\d{1,3})?)(?!\d)", text):
         raw = m.group(1)
         try:
@@ -2248,15 +2104,10 @@ def _candidate_parse_values(text: str) -> List[float]:
             continue
         if not 70 <= value <= 100:
             continue
-
         around = text[max(0, m.start() - 2): m.end() + 2]
         if "." in raw or "," in raw or "%" in around:
             fallback.append(value)
-
     return strong or fallback
-
-
-
 def _edit_distance_max1(a: str, b: str) -> int:
     """Distance <=1, with adjacent transposition counted as one edit."""
     a = (a or "").lower()
@@ -2286,8 +2137,6 @@ def _edit_distance_max1(a: str, b: str) -> int:
             if edits > 1:
                 return 2
     return 1
-
-
 def _row_matches_character(row_html: str, character: str) -> bool:
     """Exact name first; distance-1 matching only as fallback."""
     if re.search(rf"(?i)(?<![A-Za-z]){re.escape(character)}(?![A-Za-z])", row_html):
@@ -2299,8 +2148,6 @@ def _row_matches_character(row_html: str, character: str) -> bool:
         if _edit_distance_max1(character, token) <= 1:
             return True
     return False
-
-
 def parse_hits_from_fight_page(
     raw_html: str,
     character: str,
@@ -2309,19 +2156,15 @@ def parse_hits_from_fight_page(
 ) -> List[ParseHit]:
     """
     Parse a selected UwU fight page.
-
     Boss is read directly from ?boss=... in the fight URL, so the parser no
     longer requires boss + character + parse to appear together on the landing
     page.
     """
     char_l = character.lower()
-
     boss = boss_from_uwu_url(fight_url)
     if not boss or boss in DKPARSE_EXCLUDED_BOSSES:
         return []
-
     hits: List[ParseHit] = []
-
     rows = re.findall(r"(?is)<tr\b[^>]*>.*?</tr>", raw_html)
     relevant_rows = [
         row for row in rows
@@ -2329,7 +2172,6 @@ def parse_hits_from_fight_page(
     ]
     if not relevant_rows:
         relevant_rows = [row for row in rows if _row_matches_character(row, character)]
-
     fragments: List[str] = relevant_rows[:10]
     if not fragments:
         for m in re.finditer(re.escape(character), raw_html, re.IGNORECASE):
@@ -2338,14 +2180,12 @@ def parse_hits_from_fight_page(
             )
             if len(fragments) >= 10:
                 break
-
     for fragment in fragments:
         visible = html_to_text(fragment)
         spec = normalize_spec(visible + " " + fragment)
         values = _candidate_parse_values(visible + " " + fragment)
         if not values:
             continue
-
         value = max(values)
         hits.append(
             ParseHit(
@@ -2358,11 +2198,7 @@ def parse_hits_from_fight_page(
                 evidence="UwU fight page",
             )
         )
-
     return hits
-
-
-
 def parse_presence_from_fight_page(
     raw_html: str,
     character: str,
@@ -2374,14 +2210,12 @@ def parse_presence_from_fight_page(
     boss = boss_from_uwu_url(fight_url)
     if not boss or boss in DKPARSE_EXCLUDED_BOSSES:
         return None
-
     rows = re.findall(r"(?is)<tr\b[^>]*>.*?</tr>", raw_html)
     exact_rows = [
         row for row in rows
         if re.search(rf"(?i)(?<![A-Za-z]){re.escape(character)}(?![A-Za-z])", row)
     ]
     relevant_rows = exact_rows or [row for row in rows if _row_matches_character(row, character)]
-
     fragments: List[str] = relevant_rows[:10]
     if not fragments:
         # Conservative fallback around an exact textual occurrence only.
@@ -2389,17 +2223,14 @@ def parse_presence_from_fight_page(
             fragments.append(raw_html[max(0, m.start()-1400):min(len(raw_html), m.end()+2200)])
             if len(fragments) >= 5:
                 break
-
     if not fragments:
         return None
-
     # Prefer a recognized DKPARSE spec if one appears in the player's row/fragment.
     spec = ""
     for fragment in fragments:
         spec = normalize_spec(html_to_text(fragment) + " " + fragment)
         if spec:
             break
-
     return ParseHit(
         character=character,
         boss=boss,
@@ -2409,19 +2240,15 @@ def parse_presence_from_fight_page(
         report_date=report_date,
         evidence="Screenshot Points + présence UwU",
     )
-
-
 def _fight_url_priority(url: str) -> Tuple[int, int]:
     """Prefer a concrete attempt URL, then mode URL, then generic boss URL."""
     q = parse_qs(urlsplit(html_lib.unescape(url)).query)
     has_attempt = 0 if "attempt" in q else 1
     has_mode = 0 if "mode" in q else 1
     return has_attempt, has_mode
-
 async def _fetch_uwu_with_retry(url: str, user_agent: str) -> Tuple[str, str]:
     """
     Lecture UwU avec retry sur erreurs temporaires.
-
     429 = rate limit.
     500/502/503/504 = erreurs serveur/proxy temporaires.
     """
@@ -2433,24 +2260,20 @@ async def _fetch_uwu_with_retry(url: str, user_agent: str) -> Tuple[str, str]:
     transient_statuses = {429, 500, 502, 503, 504}
     last_status = None
     last_error = None
-
     for attempt in range(5):
         try:
             async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
                 async with session.get(url, allow_redirects=True) as resp:
                     body = await resp.text(errors="replace")
                     last_status = resp.status
-
                     if resp.status == 200:
                         return str(resp.url), body
-
                     if resp.status in transient_statuses:
                         retry_raw = resp.headers.get("Retry-After", "")
                         try:
                             delay = float(retry_raw)
                         except (TypeError, ValueError):
                             delay = 1.0 * (2 ** attempt)
-
                         delay = max(0.75, min(delay, 10.0))
                         dkp_debug(
                             "UWU HTTP RETRY",
@@ -2462,14 +2285,11 @@ async def _fetch_uwu_with_retry(url: str, user_agent: str) -> Tuple[str, str]:
                                 "delay": delay,
                             },
                         )
-
                         if attempt < 4:
                             await asyncio.sleep(delay)
                             continue
                         break
-
                     raise RuntimeError(f"UwU HTTP {resp.status}")
-
         except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
             last_error = exc
             delay = max(0.75, min(1.0 * (2 ** attempt), 10.0))
@@ -2487,7 +2307,6 @@ async def _fetch_uwu_with_retry(url: str, user_agent: str) -> Tuple[str, str]:
                 await asyncio.sleep(delay)
                 continue
             break
-
     if last_status is not None:
         raise RuntimeError(f"UwU HTTP {last_status} après retries")
     if last_error is not None:
@@ -2495,12 +2314,8 @@ async def _fetch_uwu_with_retry(url: str, user_agent: str) -> Tuple[str, str]:
             f"UwU réseau après retries: {type(last_error).__name__}: {last_error}"
         )
     raise RuntimeError("UwU lecture impossible après retries")
-
-
 async def fetch_uwu_url(url: str) -> Tuple[str, str]:
     return await _fetch_uwu_with_retry(url, "ApogeeDKParseBot/1.3 (+Discord guild tooling)")
-
-
 async def fetch_uwu_report(report: UwuReport) -> Tuple[str, str]:
     dkp_debug("UWU LECTURE DEBUT", report.url)
     try:
@@ -2519,21 +2334,17 @@ async def fetch_uwu_report(report: UwuReport) -> Tuple[str, str]:
         return final_url, body
     except Exception:
         raise
-
-
 async def scan_whitelisted_reports(
     guild: discord.Guild, reference_time: datetime
 ) -> List[UwuReport]:
     channel = await get_text_channel(
         guild, LOGS_RAID_CHANNEL_ID, "LOGS_RAID_CHANNEL_ID"
     )
-
     HISTORY_LIMIT = 300
     reports: List[UwuReport] = []
     seen: set[str] = set()
     scanned_messages = 0
     messages_with_urls = 0
-
     dkp_debug(
         "SCAN #logs-raid",
         {
@@ -2544,13 +2355,10 @@ async def scan_whitelisted_reports(
             "mode": "latest messages, no Discord after/before filter",
         },
     )
-
     try:
         async for msg in channel.history(limit=HISTORY_LIMIT, oldest_first=False):
             scanned_messages += 1
-
             combined_parts = [msg.content or ""]
-
             for embed in msg.embeds:
                 if embed.url:
                     combined_parts.append(embed.url)
@@ -2563,14 +2371,11 @@ async def scan_whitelisted_reports(
                         combined_parts.append(field.name)
                     if field.value:
                         combined_parts.append(field.value)
-
             for attachment in msg.attachments:
                 combined_parts.append(attachment.url or "")
                 combined_parts.append(attachment.filename or "")
-
             combined = "\n".join(x for x in combined_parts if x)
             urls = extract_uwu_urls(combined)
-
             if DKPARSE_DEBUG:
                 dkp_debug(
                     f"MSG {msg.id}",
@@ -2581,14 +2386,11 @@ async def scan_whitelisted_reports(
                         "urls_found": urls,
                     },
                 )
-
             if urls:
                 messages_with_urls += 1
-
             for url in urls:
                 if url in seen:
                     continue
-
                 seen.add(url)
                 rdate = report_date_from_url(url)
                 report = UwuReport(
@@ -2599,7 +2401,6 @@ async def scan_whitelisted_reports(
                     label=(msg.content or "")[:120],
                 )
                 reports.append(report)
-
                 dkp_debug(
                     "RAPPORT DÉTECTÉ",
                     {
@@ -2609,7 +2410,6 @@ async def scan_whitelisted_reports(
                         "eligible_for_request": report_within_delay(report, reference_time),
                     },
                 )
-
     except discord.Forbidden as exc:
         raise RuntimeError(
             "Le bot n'a pas la permission de lire l'historique de #logs-raid."
@@ -2618,7 +2418,6 @@ async def scan_whitelisted_reports(
         raise RuntimeError(
             f"Discord n'a pas pu lire l'historique de #logs-raid : {exc}"
         ) from exc
-
     dkp_debug(
         "RÉSUMÉ SCAN #logs-raid",
         {
@@ -2631,9 +2430,7 @@ async def scan_whitelisted_reports(
             "urls": [r.url for r in reports],
         },
     )
-
     return reports
-
 def report_within_delay(report: UwuReport, post_time: datetime) -> bool:
     # Best source is date encoded in UwU report URL.
     if report.report_date:
@@ -2641,13 +2438,10 @@ def report_within_delay(report: UwuReport, post_time: datetime) -> bool:
         report_day = report.report_date.date()
         delta = (post_day - report_day).days
         return -1 <= delta <= DKPARSE_MAX_DAYS
-
     # If URL format changes, the Discord #logs-raid timestamp is acceptable as
     # fallback, but the result will remain conservative elsewhere.
     delta = post_time - report.posted_at
     return timedelta(days=-1) <= delta <= timedelta(days=DKPARSE_MAX_DAYS + 1)
-
-
 def explicit_character_from_post(content: str) -> Optional[str]:
     """
     Optional override:
@@ -2661,8 +2455,6 @@ def explicit_character_from_post(content: str) -> Optional[str]:
         content or "",
     )
     return m.group(1) if m else None
-
-
 def requested_bosses_from_post(content: str) -> List[str]:
     """Return only bosses explicitly named in the post, in textual order."""
     text = (content or "").lower()
@@ -2676,14 +2468,11 @@ def requested_bosses_from_post(content: str) -> List[str]:
         if boss not in first_pos or pos < first_pos[boss]:
             first_pos[boss] = pos
     return [boss for boss, _pos in sorted(first_pos.items(), key=lambda kv: kv[1])]
-
-
 def requested_raid_date_from_post(
     content: str, post_time: datetime
 ) -> Optional[datetime]:
     """
     Lit une date de raid écrite dans le post, ex. LOD 12/08 ou LOD 09/08/2026.
-
     Elle sert uniquement à prioriser les rapports UwU à examiner.
     La fenêtre DKPARSE reste calculée depuis la date du post Discord.
     """
@@ -2694,28 +2483,21 @@ def requested_raid_date_from_post(
     )
     if not m:
         return None
-
     day = int(m.group(1))
     month = int(m.group(2))
     raw_year = m.group(3)
-
     if raw_year:
         year = int(raw_year)
         if year < 100:
             year += 2000
     else:
         year = post_time.astimezone(timezone.utc).year
-
     try:
         return datetime(year, month, day, tzinfo=timezone.utc)
     except ValueError:
         return None
-
-
 def requested_spec_from_post(content: str) -> str:
     return normalize_spec(content or "")
-
-
 def dedupe_hits(hits: List[ParseHit]) -> List[ParseHit]:
     """
     Multiple people may upload the same raid.
@@ -2733,8 +2515,6 @@ def dedupe_hits(hits: List[ParseHit]) -> List[ParseHit]:
         elif hit.parse == old.parse and hit.spec and not old.spec:
             best[hit.boss] = hit
     return sorted(best.values(), key=lambda h: h.boss.lower())
-
-
 def build_kromaddon_dkparse_export(
     character: str, post_time: datetime, hits: List[ParseHit]
 ) -> str:
@@ -2759,8 +2539,6 @@ def build_kromaddon_dkparse_export(
     lines.append(f"TOTAL={total}")
     lines.append("END")
     return "\n".join(lines)
-
-
 async def evaluate_dkparse_screen_message(
     guild: discord.Guild,
     message: discord.Message,
@@ -2768,15 +2546,12 @@ async def evaluate_dkparse_screen_message(
 ) -> DKParseScreenResult:
     """
     DKPARSE SCREEN-ONLY.
-
     The message text is ignored. Every visible boss row is evaluated from its
     own Points + Best Log date. #logs-raid is only used as a date whitelist.
     """
     issues: List[str] = []
-
     if DKPARSE_CHANNEL_ID and message.channel.id != DKPARSE_CHANNEL_ID:
         issues.append("Message hors du salon KAparse configuré.")
-
     character, ocr_detail, spec, rows = await extract_dkparse_screen_only(message)
     if not character:
         issues.append(ocr_detail)
@@ -2791,7 +2566,6 @@ async def evaluate_dkparse_screen_message(
             total=0,
             ocr_detail=ocr_detail,
         )
-
     dated_rows = [r for r in rows if r.best_date is not None]
     if not dated_rows:
         issues.append("Aucune date Best Log lisible sur le screenshot.")
@@ -2806,13 +2580,11 @@ async def evaluate_dkparse_screen_message(
             total=0,
             ocr_detail=ocr_detail,
         )
-
     in_window_rows = [
         r for r in dated_rows
         if r.best_date is not None
         and _screen_date_within_post_window(r.best_date, message.created_at)
     ]
-
     if not in_window_rows:
         newest = max(r.best_date for r in dated_rows if r.best_date is not None)
         delta = (
@@ -2835,18 +2607,15 @@ async def evaluate_dkparse_screen_message(
             total=0,
             ocr_detail=ocr_detail,
         )
-
     if log_dates is None:
         reports = await scan_whitelisted_reports(guild, message.created_at)
         log_dates = _lograid_date_set(reports)
-
     dates_needed = sorted({r.best_date.date() for r in in_window_rows if r.best_date})
     missing_dates = [d for d in dates_needed if d not in log_dates]
     for d in missing_dates:
         issues.append(
             f"Aucun raid n'est enregistré dans #logs-raid le {d.strftime('%d/%m/%Y')}."
         )
-
     valid_hits: List[ParseHit] = []
     for row in in_window_rows:
         if row.best_date is None or row.best_date.date() not in log_dates:
@@ -2865,7 +2634,6 @@ async def evaluate_dkparse_screen_message(
                 evidence="Screenshot OCR + date présente dans #logs-raid",
             )
         )
-
     # Deduplicate same boss/date inside one post; highest parse wins.
     best_by_key: Dict[Tuple[str, datetime], ParseHit] = {}
     for hit in valid_hits:
@@ -2880,15 +2648,12 @@ async def evaluate_dkparse_screen_message(
         key=lambda h: (h.report_date or datetime(1970,1,1,tzinfo=timezone.utc), h.boss),
     )
     total = sum(dkp_for_parse(h.parse) for h in valid_hits)
-
     if not valid_hits:
         qualifying = [r for r in in_window_rows if dkp_for_parse(r.parse) > 0]
         if not qualifying:
             issues.append("Aucun boss du screen n'atteint le seuil KAparse minimum (70%).")
-
     retained_dates = sorted({h.report_date for h in valid_hits if h.report_date})
     raid_date = retained_dates[-1] if retained_dates else None
-
     dkp_debug(
         "DKPARSE SCREEN-ONLY RESULTAT",
         {
@@ -2905,7 +2670,6 @@ async def evaluate_dkparse_screen_message(
             "issues": issues,
         },
     )
-
     return DKParseScreenResult(
         message_id=message.id,
         character=character,
@@ -2917,25 +2681,20 @@ async def evaluate_dkparse_screen_message(
         total=total,
         ocr_detail=ocr_detail,
     )
-
-
 async def analyze_dkparse_message(
     guild: discord.Guild, message: discord.Message
 ) -> Tuple[str, Optional[str]]:
     result = await evaluate_dkparse_screen_message(guild, message)
-
     if not result.character:
         return (
             "⚠️ **KAPARSE À VÉRIFIER**\n"
             + "\n".join(result.issues or ["Aucun personnage lisible sur le screenshot."]),
             None,
         )
-
     lines = [
         f"**KAparse — {result.character}**",
         f"Personnage lu sur le screen : **{result.character}**",
     ]
-
     retained_dates = sorted({
         h.report_date.date() for h in result.valid_hits if h.report_date is not None
     })
@@ -2944,12 +2703,10 @@ async def analyze_dkparse_message(
         lines.append(
             f"{label} : **" + ", ".join(d.strftime('%d/%m/%Y') for d in retained_dates) + "**"
         )
-
     if result.spec:
         lines.append(f"Spec lue sur le screen : **{result.spec}**")
     else:
         lines.append("Spec : non lisible sur ce screen (non bloquant)")
-
     if result.valid_hits:
         lines += [""]
         for hit in result.valid_hits:
@@ -2961,7 +2718,6 @@ async def analyze_dkparse_message(
                 f"→ **+{amount} DKP VALIDÉ**"
             )
         lines += ["", f"**BONUS KAPARSE TOTAL : +{result.total} DKP**"]
-
     # If character + dated rows were read, a zero bonus is a deterministic
     # rejection under the screen-only rules, not an uncertainty.
     deterministic_reject = (
@@ -2969,12 +2725,10 @@ async def analyze_dkparse_message(
         and bool(result.rows)
         and any(r.best_date is not None for r in result.rows)
     )
-
     if result.issues:
         icon = "❌" if deterministic_reject else "⚠️"
         lines += ["", f"**{icon} Vérifications / remarques :**"]
         lines.extend(f"• {issue}" for issue in result.issues)
-
     if not result.valid_hits:
         if deterministic_reject:
             lines += [
@@ -2989,20 +2743,16 @@ async def analyze_dkparse_message(
                 "Le screenshot n'a pas pu être lu avec assez de certitude pour décider.",
             ]
         return "\n".join(lines), None
-
     export = build_kromaddon_dkparse_export(
         result.character,
         message.created_at,
         result.valid_hits,
     )
     return "\n".join(lines), export
-
-
 class DKParseExportView(discord.ui.View):
     def __init__(self, export_text: str):
         super().__init__(timeout=900)
         self.export_text = export_text
-
     @discord.ui.button(label="Export KAparse Kromaddon", style=discord.ButtonStyle.success)
     async def export_dkparse(
         self, interaction: discord.Interaction, button: discord.ui.Button
@@ -3016,8 +2766,6 @@ class DKParseExportView(discord.ui.View):
             file=file,
             ephemeral=True,
         )
-
-
 async def run_dkparse_check(
     interaction: discord.Interaction, message: discord.Message
 ):
@@ -3029,7 +2777,6 @@ async def run_dkparse_check(
     if not interaction.guild:
         await interaction.response.send_message("Serveur requis.", ephemeral=True)
         return
-
     await interaction.response.defer(ephemeral=False, thinking=True)
     try:
         report, export = await analyze_dkparse_message(interaction.guild, message)
@@ -3045,11 +2792,7 @@ async def run_dkparse_check(
             import traceback
             traceback.print_exc()
         await interaction.followup.send(f"❌ KAparse : {exc}")
-
-
 KAPARSE_AUTO_IN_FLIGHT: set = set()
-
-
 async def handle_kaparse_auto_message(message: discord.Message) -> None:
     """Automatically analyse every user screenshot posted in the KAparse channel."""
     if message.author.bot or not message.guild:
@@ -3060,14 +2803,12 @@ async def handle_kaparse_auto_message(message: discord.Message) -> None:
         return
     if message.id in KAPARSE_AUTO_IN_FLIGHT:
         return
-
     KAPARSE_AUTO_IN_FLIGHT.add(message.id)
     try:
         try:
             await message.add_reaction("🔎")
         except discord.HTTPException:
             pass
-
         report, export = await analyze_dkparse_message(message.guild, message)
         kwargs = {
             "mention_author": False,
@@ -3079,14 +2820,12 @@ async def handle_kaparse_auto_message(message: discord.Message) -> None:
         else:
             await message.reply(report, **kwargs)
             final_emoji = "❌" if "KAPARSE REFUSÉ" in report else "⚠️"
-
         try:
             if bot.user:
                 await message.remove_reaction("🔎", bot.user)
             await message.add_reaction(final_emoji)
         except discord.HTTPException:
             pass
-
     except Exception as exc:
         if DKPARSE_DEBUG:
             import traceback
@@ -3101,21 +2840,15 @@ async def handle_kaparse_auto_message(message: discord.Message) -> None:
             pass
     finally:
         KAPARSE_AUTO_IN_FLIGHT.discard(message.id)
-
-
-
 # =============================================================================
 # DKPARSE weekly closure
 # =============================================================================
-
 def build_kromaddon_dkparse_batch(totals: Dict[str, int]) -> str:
     """Compact clipboard format, analogous to RH|Name:Code used by Kromaddon."""
     parts = ["DKPARSE"]
     for name in sorted(totals, key=str.lower):
         parts.append(f"{name}:{int(totals[name])}")
     return "|".join(parts)
-
-
 def try_copy_host_clipboard(text: str) -> Tuple[bool, str]:
     """
     Best effort: copies to the clipboard of the MACHINE RUNNING THE BOT.
@@ -3134,7 +2867,6 @@ def try_copy_host_clipboard(text: str) -> Tuple[bool, str]:
                 return True, "copié dans le presse-papier Windows de la machine du bot"
         except Exception as exc:
             dkp_debug("PRESSE-PAPIER WINDOWS ECHEC", repr(exc))
-
     try:
         import tkinter  # stdlib, may fail on a headless host
         root = tkinter.Tk()
@@ -3147,8 +2879,6 @@ def try_copy_host_clipboard(text: str) -> Tuple[bool, str]:
     except Exception as exc:
         dkp_debug("PRESSE-PAPIER FALLBACK ECHEC", repr(exc))
         return False, "presse-papier hôte indisponible ; utilise le bloc texte/fichier Discord"
-
-
 async def collect_dkparse_batch(
     guild: discord.Guild,
     channel: discord.TextChannel,
@@ -3157,30 +2887,25 @@ async def collect_dkparse_batch(
     # One Discord-only scan of #logs-raid. No UwU HTTP request is made here.
     reports = await scan_whitelisted_reports(guild, datetime.now(timezone.utc))
     log_dates = _lograid_date_set(reports)
-
     screen_messages = 0
     total_messages = 0
     warnings: List[str] = []
     dedup: Dict[Tuple[str, str, datetime], ParseHit] = {}
-
     async for msg in channel.history(limit=None, oldest_first=True):
         total_messages += 1
         if msg.author.bot:
             continue
         if not any(is_image_attachment(a) for a in msg.attachments):
             continue
-
         screen_messages += 1
         result = await evaluate_dkparse_screen_message(guild, msg, log_dates=log_dates)
         if not result.character:
             warnings.append(f"Message {msg.id}: personnage illisible")
             continue
-
         if result.issues and not result.valid_hits:
             warnings.append(
                 f"{result.character} / message {msg.id}: " + "; ".join(result.issues[:2])
             )
-
         for hit in result.valid_hits:
             if hit.report_date is None:
                 continue
@@ -3188,25 +2913,19 @@ async def collect_dkparse_batch(
             old = dedup.get(key)
             if old is None or hit.parse > old.parse:
                 dedup[key] = hit
-
     totals: Dict[str, int] = defaultdict(int)
     display_names: Dict[str, str] = {}
     for (char_l, _boss, _date), hit in dedup.items():
         display_names.setdefault(char_l, hit.character)
         totals[display_names[char_l]] += dkp_for_parse(hit.parse)
-
     return dict(totals), warnings, screen_messages, total_messages
-
-
 class DKParsePurgeConfirmView(discord.ui.View):
     def __init__(self, owner_id: int, channel_id: int):
         super().__init__(timeout=900)
         self.owner_id = owner_id
         self.channel_id = channel_id
-
     def _allowed(self, interaction: discord.Interaction) -> bool:
         return interaction.user.id == self.owner_id or can_use_admin(interaction)
-
     @discord.ui.button(
         label="CONFIRMER ET VIDER LE SALON KAPARSE",
         style=discord.ButtonStyle.danger,
@@ -3220,7 +2939,6 @@ class DKParsePurgeConfirmView(discord.ui.View):
         if not interaction.guild:
             await interaction.response.send_message("Serveur requis.", ephemeral=True)
             return
-
         await interaction.response.defer(ephemeral=True, thinking=True)
         try:
             channel = await get_text_channel(
@@ -3244,7 +2962,6 @@ class DKParsePurgeConfirmView(discord.ui.View):
             await interaction.followup.send(
                 f"❌ Suppression KAparse : {exc}", ephemeral=True
             )
-
     @discord.ui.button(label="Annuler", style=discord.ButtonStyle.secondary)
     async def cancel_purge(
         self, interaction: discord.Interaction, button: discord.ui.Button
@@ -3254,8 +2971,6 @@ class DKParsePurgeConfirmView(discord.ui.View):
             return
         self.stop()
         await interaction.response.edit_message(view=None)
-
-
 @bot.tree.command(
     name="kaparse-cloture",
     description="Exporte les KAparse de la semaine puis propose de vider le salon.",
@@ -3267,7 +2982,6 @@ async def dkparse_cloture(interaction: discord.Interaction):
     if not interaction.guild:
         await interaction.response.send_message("Serveur requis.", ephemeral=True)
         return
-
     await interaction.response.defer(ephemeral=True, thinking=True)
     try:
         channel = await get_text_channel(
@@ -3276,10 +2990,8 @@ async def dkparse_cloture(interaction: discord.Interaction):
         totals, warnings, screen_messages, total_messages = await collect_dkparse_batch(
             interaction.guild, channel
         )
-
         export_text = build_kromaddon_dkparse_batch(totals)
         copied, clipboard_detail = try_copy_host_clipboard(export_text)
-
         lines = [
             "**Clôture KAparse — aperçu AVANT suppression**",
             f"Screens analysés : **{screen_messages}**",
@@ -3292,23 +3004,19 @@ async def dkparse_cloture(interaction: discord.Interaction):
                 lines.append(f"• **{name}** : +{totals[name]} DKP")
         else:
             lines.append("Aucun bonus KAparse validé.")
-
         if warnings:
             lines += ["", f"⚠️ {len(warnings)} avertissement(s) avant suppression :"]
             lines.extend(f"• {w}" for w in warnings[:12])
             if len(warnings) > 12:
                 lines.append(f"• ... et {len(warnings) - 12} autre(s)")
-
         lines += [
             "",
             f"Presse-papier : **{'OK' if copied else 'NON'}** — {clipboard_detail}",
         ]
-
         # Keep the confirmation/export message safely below Discord's 2000-char limit.
         summary_text = "\n".join(lines)
         for chunk in split_discord_text(summary_text):
             await interaction.followup.send(chunk, ephemeral=True)
-
         file = discord.File(
             io.BytesIO(export_text.encode("utf-8")),
             filename="Kromaddon_DKPARSE_BATCH.txt",
@@ -3330,13 +3038,9 @@ async def dkparse_cloture(interaction: discord.Interaction):
             import traceback
             traceback.print_exc()
         await interaction.followup.send(f"❌ Clôture DKPARSE : {exc}", ephemeral=True)
-
-
-
 # =============================================================================
 # ApogeeBot equivalent
 # =============================================================================
-
 PEWPEW_TIERS: Tuple[Tuple[float, str], ...] = (
     (0.2, "🔴 Top 0.2% 🔴"),
     (2.0, "🟠 Top 2% 🟠"),
@@ -3347,7 +3051,6 @@ PEWPEW_TIERS: Tuple[Tuple[float, str], ...] = (
     (25.0, "⚪ Top 25% ⚪"),
     (33.0, "⚫ Top 33% ⚫"),
 )
-
 # Analyse Log V2 : le classement du raid se base sur le Dps% (`points`) renvoyé
 # par /rank pour chaque combat posté, soit la valeur affichée dans la colonne
 # Dps% d'UwU, et sur les mêmes seuils que KAparse.
@@ -3373,7 +3076,6 @@ ANALYSE_LOG_BOSS_ORDER: Tuple[str, ...] = (
     "Sindragosa",
     "The Lich King",
 )
-
 ANALYSE_LOG_BOSS_SHORT = {
     "Lord Marrowgar": "Garga",
     "Lady Deathwhisper": "Lady",
@@ -3386,23 +3088,16 @@ ANALYSE_LOG_BOSS_SHORT = {
     "Sindragosa": "Sindra",
     "The Lich King": "LK",
 }
-
 ANALYSE_LOG_BOSS_ORDER_INDEX = {
     boss: index for index, boss in enumerate(ANALYSE_LOG_BOSS_ORDER)
 }
-
-
 def _analyse_log_boss_label(boss: str) -> str:
     return ANALYSE_LOG_BOSS_SHORT.get(boss, boss)
-
-
 def _analyse_log_boss_sort_key(boss: str) -> Tuple[int, str]:
     return (
         ANALYSE_LOG_BOSS_ORDER_INDEX.get(boss, len(ANALYSE_LOG_BOSS_ORDER)),
         boss.lower(),
     )
-
-
 WOW_CLASS_COLORS: Dict[str, Tuple[int, int, int]] = {
     "deathknight": (196, 30, 59),
     "druid": (255, 125, 10),
@@ -3415,7 +3110,6 @@ WOW_CLASS_COLORS: Dict[str, Tuple[int, int, int]] = {
     "warlock": (135, 136, 238),
     "warrior": (198, 155, 109),
 }
-
 UWU_PARSE_COLOR_TIERS: Tuple[Tuple[float, Tuple[int, int, int]], ...] = (
     (99.995, (229, 204, 127)),
     (99.0, (229, 104, 255)),
@@ -3425,7 +3119,6 @@ UWU_PARSE_COLOR_TIERS: Tuple[Tuple[float, Tuple[int, int, int]], ...] = (
     (25.0, (30, 255, 0)),
     (0.0, (128, 128, 128)),
 )
-
 REPORT_BG = (18, 20, 24)
 REPORT_PANEL = (29, 32, 38)
 REPORT_PANEL_2 = (36, 40, 47)
@@ -3433,7 +3126,6 @@ REPORT_TEXT = (235, 237, 240)
 REPORT_MUTED = (165, 170, 180)
 REPORT_DIVIDER = (60, 66, 75)
 REPORT_ACCENT = (114, 137, 218)
-
 ANALYSE_LOG_TRACKED_SPEC_CLASS = {
     "fwar": "warrior",
     "combat": "rogue",
@@ -3447,8 +3139,6 @@ ANALYSE_LOG_TRACKED_SPEC_CLASS = {
     "demono": "warlock",
     "mm": "hunter",
 }
-
-
 # AnalyseLog est un classement DPS. Les arbres de talents qui identifient sans
 # ambiguïté un tank ou un soigneur ne doivent entrer ni dans le classement, ni
 # dans la recherche de records personnels. Feral Combat et Frost DK restent
@@ -3473,8 +3163,6 @@ ANALYSE_LOG_NON_DPS_SPECS = frozenset({
     "feral tank",
     "guardian druid",
 })
-
-
 def _analyse_log_is_non_dps_spec(spec: str) -> bool:
     normalized = re.sub(
         r"\s+",
@@ -3482,8 +3170,6 @@ def _analyse_log_is_non_dps_spec(spec: str) -> bool:
         html_lib.unescape(spec or "").strip().lower(),
     )
     return normalized in ANALYSE_LOG_NON_DPS_SPECS
-
-
 def _analyse_log_class_from_spec(spec: str) -> str:
     s = re.sub(r"\s+", " ", html_lib.unescape(spec or "").strip().lower())
     if s in ANALYSE_LOG_TRACKED_SPEC_CLASS:
@@ -3504,12 +3190,8 @@ def _analyse_log_class_from_spec(spec: str) -> str:
         if token in s:
             return cls
     return ""
-
-
 def _analyse_log_class_color(spec: str) -> Tuple[int, int, int]:
     return WOW_CLASS_COLORS.get(_analyse_log_class_from_spec(spec), REPORT_TEXT)
-
-
 def _analyse_log_parse_color(value: Optional[float], server_best: bool = False) -> Tuple[int, int, int]:
     if server_best:
         return UWU_PARSE_COLOR_TIERS[0][1]
@@ -3521,8 +3203,6 @@ def _analyse_log_parse_color(value: Optional[float], server_best: bool = False) 
         if v >= threshold - 1e-9:
             return color
     return REPORT_TEXT
-
-
 def _report_font(size: int, bold: bool = False):
     if ImageFont is None:
         raise RuntimeError("Pillow (ImageFont) indisponible pour le rendu image Analyse Log.")
@@ -3545,8 +3225,6 @@ def _report_font(size: int, bold: bool = False):
         except Exception:
             pass
     return ImageFont.load_default()
-
-
 def _text_width(draw, text_value: str, font) -> int:
     if not text_value:
         return 0
@@ -3555,8 +3233,6 @@ def _text_width(draw, text_value: str, font) -> int:
         return max(0, right - left)
     except Exception:
         return int(draw.textlength(text_value, font=font))
-
-
 def _wrap_segments(draw, segments, max_width: int):
     lines = []
     current = []
@@ -3574,8 +3250,6 @@ def _wrap_segments(draw, segments, max_width: int):
     if current:
         lines.append(current)
     return lines or [[("", REPORT_TEXT, _report_font(24, False))]]
-
-
 def _render_segment_lines(draw, x: int, y: int, lines, line_height: int):
     for line in lines:
         cx = x
@@ -3584,11 +3258,8 @@ def _render_segment_lines(draw, x: int, y: int, lines, line_height: int):
             cx += _text_width(draw, seg_text, seg_font)
         y += line_height
     return y
-
-
 def _character_points_value(raw: Dict[str, Any]) -> Optional[float]:
     """Points exactement comme affichés par UwU dans la fiche personnage.
-
     L'API /character renvoie les points multipliés par 100 :
     8491 -> 84.91 affiché par character.js.
     """
@@ -3599,8 +3270,6 @@ def _character_points_value(raw: Dict[str, Any]) -> Optional[float]:
         return None
     value = float(value) / 100.0
     return value if 0.0 <= value <= 100.0 else None
-
-
 def _character_kills_value(raw: Dict[str, Any]) -> Optional[int]:
     """Nombre de kills affiché par UwU : champ JSON `raids`."""
     if not isinstance(raw, dict):
@@ -3609,8 +3278,6 @@ def _character_kills_value(raw: Dict[str, Any]) -> Optional[int]:
     if value is None or value < 0:
         return None
     return int(value)
-
-
 def _character_rank_players(raw: Dict[str, Any]) -> Optional[int]:
     if not isinstance(raw, dict):
         return None
@@ -3618,13 +3285,10 @@ def _character_rank_players(raw: Dict[str, Any]) -> Optional[int]:
     if value is None:
         return None
     return int(value)
-
-
 def _extract_improvement_kills(raw: Dict[str, Any]) -> Optional[int]:
     canonical = _character_kills_value(raw)
     if canonical is not None:
         return canonical
-
     candidate_keys = ("kills", "kill_count", "killCount", "kills_count", "boss_kills", "count")
     for key in candidate_keys:
         value = _numeric(raw.get(key))
@@ -3638,8 +3302,6 @@ def _extract_improvement_kills(raw: Dict[str, Any]) -> Optional[int]:
                 if value is not None and value >= 0:
                     return int(value)
     return None
-
-
 def _ranking_sections(hits: List[PewPewHit]):
     best: Dict[Tuple[str, str], PewPewHit] = {}
     display_name: Dict[str, str] = {}
@@ -3650,11 +3312,9 @@ def _ranking_sections(hits: List[PewPewHit]):
         old = best.get(key)
         if old is None or hit.points > old.points or (hit.points == old.points and hit.server_best and not old.server_best):
             best[key] = hit
-
     by_player: Dict[str, List[PewPewHit]] = defaultdict(list)
     for (pl, _boss), hit in best.items():
         by_player[pl].append(hit)
-
     bucket_players: Dict[str, List[Tuple[str, List[PewPewHit]]]] = defaultdict(list)
     for pl, phits in by_player.items():
         phits.sort(key=lambda h: (-h.points, _analyse_log_boss_sort_key(h.boss)))
@@ -3664,7 +3324,6 @@ def _ranking_sections(hits: List[PewPewHit]):
             continue
         main_bucket = min((b for b, _h in buckets), key=lambda b: ANALYSE_LOG_POINT_TIER_INDEX[b])
         bucket_players[main_bucket].append((display_name[pl], phits))
-
     sections = []
     for bucket_key, threshold, label in ANALYSE_LOG_POINT_TIERS:
         players = bucket_players.get(bucket_key, [])
@@ -3690,8 +3349,6 @@ def _ranking_sections(hits: List[PewPewHit]):
             })
         sections.append((bucket_key, label, rows))
     return sections
-
-
 def _improvement_rows(improvements: List[ParseImprovement]):
     best_improvements: Dict[Tuple[str, str], ParseImprovement] = {}
     display_names: Dict[str, str] = {}
@@ -3702,23 +3359,18 @@ def _improvement_rows(improvements: List[ParseImprovement]):
         old = best_improvements.get(key)
         if old is None or (imp.percentile is not None and (old.percentile is None or imp.percentile > old.percentile)):
             best_improvements[key] = imp
-
     by_player: Dict[str, List[ParseImprovement]] = defaultdict(list)
     for (pl, _boss), imp in best_improvements.items():
         by_player[pl].append(imp)
-
     def player_sort(item):
         pl, rows = item
         best_pct = max((r.percentile for r in rows if r.percentile is not None), default=-1.0)
         return (-len(rows), -best_pct, display_names.get(pl, pl).lower())
-
     ordered = []
     for pl, rows in sorted(by_player.items(), key=player_sort):
         rows.sort(key=lambda r: _analyse_log_boss_sort_key(r.boss))
         ordered.append((display_names.get(pl, pl), rows))
     return ordered
-
-
 def _render_report_image(title: str, subtitle: str, section_items) -> bytes:
     if Image is None or ImageDraw is None or ImageFont is None:
         raise RuntimeError("Pillow indisponible pour générer l'image Analyse Log.")
@@ -3726,20 +3378,16 @@ def _render_report_image(title: str, subtitle: str, section_items) -> bytes:
     margin = 56
     inner_w = width - margin * 2
     pad = 24
-
     title_font = _report_font(42, True)
     subtitle_font = _report_font(26, True)
     section_font = _report_font(28, True)
-
     dummy = Image.new("RGB", (width, 10), REPORT_BG)
     measure = ImageDraw.Draw(dummy)
-
     blocks = []
     total_h = margin
     header_h = 122
     blocks.append(("header", header_h, title, subtitle))
     total_h += header_h + 16
-
     for item in section_items:
         if item[0] == "section":
             _, heading, rows = item
@@ -3759,7 +3407,6 @@ def _render_report_image(title: str, subtitle: str, section_items) -> bytes:
             content_h = pad + 34 + len(wrapped) * 34 + pad
             blocks.append(("message", content_h, heading, wrapped))
             total_h += content_h + 16
-
     total_h += margin
     img = Image.new("RGB", (width, max(total_h, 300)), REPORT_BG)
     draw = ImageDraw.Draw(img)
@@ -3785,12 +3432,9 @@ def _render_report_image(title: str, subtitle: str, section_items) -> bytes:
             draw.line((margin + pad, y + 58, width - margin - pad, y + 58), fill=REPORT_DIVIDER, width=2)
             _render_segment_lines(draw, margin + pad, y + 74, wrapped, 34)
         y += h + 16
-
     buf = io.BytesIO()
     img.save(buf, format="PNG", optimize=True)
     return buf.getvalue()
-
-
 def render_pewpew_ranking_image(hits: List[PewPewHit]) -> bytes:
     sections = _ranking_sections(hits)
     if not sections:
@@ -3830,8 +3474,6 @@ def render_pewpew_ranking_image(hits: List[PewPewHit]) -> bytes:
             rendered_rows.append(segs)
         section_items.append(("section", label, rendered_rows))
     return _render_report_image("Analyse Log", "Classement du raid", section_items)
-
-
 def render_analysis_improvements_image(improvements: List[ParseImprovement], improvement_failures: int = 0) -> bytes:
     rows = _improvement_rows(improvements)
     if not rows:
@@ -3857,13 +3499,9 @@ def render_analysis_improvements_image(improvements: List[ParseImprovement], imp
     if improvement_failures:
         section_items.append(("message", "Note", [(f"⚠️ {improvement_failures} vérification(s) d'amélioration ont échoué ; la liste peut être incomplète.", REPORT_MUTED, _report_font(22, False))]))
     return _render_report_image("Analyse Log", "Parses améliorées sur ce raid", section_items)
-
-
 PEWPEW_STATE_FILE = APP_DIR / "apogeebot_seen_v11.json"
 PEWPEW_LOCK = asyncio.Lock()
 PEWPEW_IN_FLIGHT: set = set()
-
-
 def _load_pewpew_seen() -> set:
     try:
         data = json.loads(PEWPEW_STATE_FILE.read_text(encoding="utf-8"))
@@ -3872,11 +3510,7 @@ def _load_pewpew_seen() -> set:
     except Exception:
         pass
     return set()
-
-
 PEWPEW_SEEN_REPORTS = _load_pewpew_seen()
-
-
 def _save_pewpew_seen() -> None:
     try:
         PEWPEW_STATE_FILE.write_text(
@@ -3885,8 +3519,6 @@ def _save_pewpew_seen() -> None:
         )
     except Exception as exc:
         dkp_debug("APOGEEBOT STATE SAVE ECHEC", repr(exc))
-
-
 def _generic_boss_from_uwu_url(url: str) -> str:
     try:
         q = parse_qs(urlsplit(html_lib.unescape(url)).query)
@@ -3905,18 +3537,11 @@ def _generic_boss_from_uwu_url(url: str) -> str:
         lw = word.lower()
         pretty.append(lw if i > 0 and lw in small else lw.capitalize())
     return " ".join(pretty)
-
-
 def _html_cells(row_html: str) -> List[str]:
     cells = re.findall(r"(?is)<t[dh]\b[^>]*>(.*?)</t[dh]>", row_html)
     return [html_to_text(c) for c in cells]
-
-
-
 def _html_raw_cells(row_html: str) -> List[str]:
     return re.findall(r"(?is)<t[dh]\b[^>]*>.*?</t[dh]>", row_html)
-
-
 def _extract_explicit_points_from_html(fragment: str) -> Optional[float]:
     text = html_lib.unescape(fragment or "")
     patterns = [
@@ -3933,8 +3558,6 @@ def _extract_explicit_points_from_html(fragment: str) -> Optional[float]:
             if 0.0 <= value <= 100.0:
                 return value
     return None
-
-
 def _extract_name_from_raw_name_cell(cell_html: str, cell_text: str) -> str:
     patterns = [
         r'(?i)[?&](?:name|player)=([A-Za-z]{2,12})(?=[&"\'<> ]|$)',
@@ -3950,8 +3573,6 @@ def _extract_name_from_raw_name_cell(cell_html: str, cell_text: str) -> str:
         if WOW_NAME_RE.fullmatch(token) and low not in OCR_IGNORE_WORDS and low not in {'image','rank','dps','damage','total','heal','points','player','name'} and not normalize_boss(token):
             return token
     return ''
-
-
 def _extract_player_name_from_html_row(row_html: str, cells: List[str]) -> str:
     # Strongest source: character/player link query.
     patterns = [
@@ -3962,14 +3583,12 @@ def _extract_player_name_from_html_row(row_html: str, cells: List[str]) -> str:
         m = re.search(pattern, row_html)
         if m and WOW_NAME_RE.fullmatch(m.group(1)):
             return m.group(1)
-
     # Then anchor text.
     for raw in re.findall(r"(?is)<a\b[^>]*>(.*?)</a>", row_html):
         text = html_to_text(raw)
         for token in re.findall(r"\b[A-Za-z]{2,12}\b", text):
             if WOW_NAME_RE.fullmatch(token) and token.lower() not in OCR_IGNORE_WORDS:
                 return token
-
     # Finally inspect likely first cells, avoiding headers/class words.
     for cell in cells[:3]:
         for token in re.findall(r"\b[A-Za-z]{2,12}\b", cell):
@@ -3978,8 +3597,6 @@ def _extract_player_name_from_html_row(row_html: str, cells: List[str]) -> str:
                     continue
                 return token
     return ""
-
-
 def _extract_points_like_value(row_html: str, row_text: str) -> Optional[float]:
     """Extract explicitly labelled UwU performance Points from one player row."""
     patterns = [
@@ -3999,8 +3616,6 @@ def _extract_points_like_value(row_html: str, row_text: str) -> Optional[float]:
             if 0.0 <= value <= 100.0:
                 return value
     return None
-
-
 def _extract_direct_top_percent(row_html: str, row_text: str) -> Optional[float]:
     """Read an explicitly labelled already-computed top/rank percentage."""
     patterns = [
@@ -4020,8 +3635,6 @@ def _extract_direct_top_percent(row_html: str, row_text: str) -> Optional[float]
             if 0.0 <= value <= 33.0001:
                 return value
     return None
-
-
 def _pewpew_hit_from_values(player: str, boss: str, points: Optional[float] = None, direct_top: Optional[float] = None, blob: str = '') -> Optional[PewPewHit]:
     if not player or not boss:
         return None
@@ -4037,14 +3650,11 @@ def _pewpew_hit_from_values(player: str, boss: str, points: Optional[float] = No
     if top_percent > 33.0001:
         return None
     return PewPewHit(player=player, boss=boss, top_percent=top_percent, points=float(points), server_best=('server best' in (blob or '').lower() or float(points) >= 99.995))
-
-
 def parse_pewpew_hits_from_fight_page(
     raw_html: str,
     fight_url: str,
 ) -> List[PewPewHit]:
     """Use explicit Performance Points only. Top%% = 100 - Points.
-
     DEPRECATED / DEAD CODE (conservé pour référence uniquement) :
     la page HTML brute renvoyée par le serveur uwu-logs ne contient jamais
     les valeurs points-rank / points-dps (elles sont calculées côté client
@@ -4089,20 +3699,15 @@ def parse_pewpew_hits_from_fight_page(
         key=(player.lower(),boss); old=found.get(key)
         if old is None or hit.top_percent < old.top_percent: found[key]=hit
     return list(found.values())
-
-
 def _pewpew_page_debug_summary(raw_html: str) -> Dict[str, Any]:
     rows = re.findall(r"(?is)<tr\b[^>]*>.*?</tr>", raw_html)
-
     headers: List[List[str]] = []
     sample_rows: List[Dict[str, Any]] = []
     header_seen = False
-
     for row in rows:
         cells = _html_cells(row)
         if not cells:
             continue
-
         low_join = " ".join(cells).lower()
         is_header = (
             ("name" in low_join or "player" in low_join)
@@ -4112,7 +3717,6 @@ def _pewpew_page_debug_summary(raw_html: str) -> Dict[str, Any]:
             headers.append(cells[:12])
             header_seen = True
             continue
-
         if header_seen and len(sample_rows) < 4:
             raw_cells = _html_raw_cells(row)
             sample_rows.append(
@@ -4126,7 +3730,6 @@ def _pewpew_page_debug_summary(raw_html: str) -> Dict[str, Any]:
                     ],
                 }
             )
-
     script_srcs: List[str] = []
     for m in re.finditer(
         r"(?is)<script\\b[^>]*\\bsrc\\s*=\\s*[\"']([^\"']+)[\"'][^>]*>",
@@ -4135,7 +3738,6 @@ def _pewpew_page_debug_summary(raw_html: str) -> Dict[str, Any]:
         src = html_lib.unescape(m.group(1)).strip()
         if src and src not in script_srcs:
             script_srcs.append(src)
-
     js_keyword_contexts: List[str] = []
     keyword_re = re.compile(
         r"(?i)(add-player-rank|points-rank|points-dps|fetch\s*\(|XMLHttpRequest|"
@@ -4150,7 +3752,6 @@ def _pewpew_page_debug_summary(raw_html: str) -> Dict[str, Any]:
             js_keyword_contexts.append(snippet[:1100])
         if len(js_keyword_contexts) >= 12:
             break
-
     return {
         "rows": len(rows),
         "candidate_headers": headers[:5],
@@ -4159,21 +3760,15 @@ def _pewpew_page_debug_summary(raw_html: str) -> Dict[str, Any]:
         "js_keyword_contexts": js_keyword_contexts,
         "html_chars": len(raw_html),
     }
-
-
 def _pewpew_tier(value: float) -> Optional[float]:
     for threshold, _label in PEWPEW_TIERS:
         if value <= threshold + 1e-9:
             return threshold
     return None
-
-
 def _fmt_top_percent(value: float) -> str:
     if abs(value - round(value)) < 0.05:
         return f"{int(round(value))}%"
     return f"{value:.1f}%"
-
-
 def format_pewpew_report(hits: List[PewPewHit]) -> str:
     """Format only the Top tiers for Analyse Log."""
     # Best result per player + boss across attempts.
@@ -4186,21 +3781,17 @@ def format_pewpew_report(hits: List[PewPewHit]) -> str:
         old = best.get(key)
         if old is None or hit.top_percent < old.top_percent:
             best[key] = hit
-
     by_player: Dict[str, List[PewPewHit]] = defaultdict(list)
     for (pl, _boss), hit in best.items():
         by_player[pl].append(hit)
-
     tier_players: Dict[float, List[Tuple[str, List[PewPewHit]]]] = defaultdict(list)
     for pl, phits in by_player.items():
         phits.sort(key=lambda h: (h.top_percent, h.boss))
         tier = _pewpew_tier(phits[0].top_percent)
         if tier is not None:
             tier_players[tier].append((display_name[pl], phits))
-
     if not tier_players:
         return ""
-
     lines = ["**Classement du raid**"]
     for threshold, label in PEWPEW_TIERS:
         players = tier_players.get(threshold, [])
@@ -4208,7 +3799,6 @@ def format_pewpew_report(hits: List[PewPewHit]) -> str:
             continue
         players.sort(key=lambda item: (item[1][0].top_percent, item[0].lower()))
         lines.append(label)
-
         for name, phits in players:
             lead = [h for h in phits if h.top_percent <= threshold + 1e-9]
             lead_parts = []
@@ -4216,7 +3806,6 @@ def format_pewpew_report(hits: List[PewPewHit]) -> str:
                 # `h.points` est le Dps% affiché par UwU pour ce combat.
                 value = "SERVER BEST!" if h.server_best else f"{h.points:.2f}%"
                 lead_parts.append(f"**{value}** sur {_analyse_log_boss_label(h.boss)}")
-
             extras = []
             thresholds = [t for t, _ in PEWPEW_TIERS if t > threshold]
             for t in thresholds:
@@ -4224,13 +3813,9 @@ def format_pewpew_report(hits: List[PewPewHit]) -> str:
                 if count:
                     label_num = "0.2" if t == 0.2 else str(int(t))
                     extras.append(f"**{count}** top {label_num}%")
-
             suffix = (", aussi " + ", ".join(extras)) if extras else ""
             lines.append(f"  🔸  *{name}*: " + ", ".join(lead_parts) + suffix)
-
     return "\n".join(lines)
-
-
 def format_analysis_log(
     hits: List[PewPewHit],
     improvements: List[ParseImprovement],
@@ -4238,15 +3823,12 @@ def format_analysis_log(
 ) -> str:
     """One Discord message: current-raid rankings, then personal improvements."""
     lines = ["**Analyse Log**"]
-
     ranking = format_pewpew_report(hits)
     if ranking:
         lines += ["", ranking]
     else:
         lines += ["", "**Classement du raid**", "Aucun joueur Top 33 sur ce raid."]
-
     lines += ["", "**📈 Parses améliorées sur ce raid**"]
-
     best_improvements: Dict[Tuple[str, str], ParseImprovement] = {}
     display_names: Dict[str, str] = {}
     for imp in improvements:
@@ -4260,11 +3842,9 @@ def format_analysis_log(
             old.percentile is None or imp.percentile > old.percentile
         ):
             best_improvements[key] = imp
-
     by_player: Dict[str, List[ParseImprovement]] = defaultdict(list)
     for (pl, _boss), imp in best_improvements.items():
         by_player[pl].append(imp)
-
     if not by_player:
         if improvement_failures:
             lines.append(
@@ -4273,12 +3853,10 @@ def format_analysis_log(
         else:
             lines.append("Aucune amélioration de parse détectée sur ce raid.")
         return "\n".join(lines)
-
     def player_sort(item):
         pl, rows = item
         best_pct = max((r.percentile for r in rows if r.percentile is not None), default=-1.0)
         return (-len(rows), -best_pct, display_names.get(pl, pl).lower())
-
     for pl, rows in sorted(by_player.items(), key=player_sort):
         # Ordre de boss fixe demandé pour les parses améliorées.
         rows.sort(key=lambda r: _analyse_log_boss_sort_key(r.boss))
@@ -4290,13 +3868,11 @@ def format_analysis_log(
             else:
                 parts.append(f"**{boss_label} {row.percentile:.2f}%**")
         lines.append(f"• **{display_names.get(pl, pl)}** — " + ", ".join(parts))
-
     if improvement_failures:
         lines += [
             "",
             f"⚠️ {improvement_failures} vérification(s) d'amélioration ont échoué ; la liste peut être incomplète.",
         ]
-
     return "\n".join(lines)
 def _pewpew_attempt_number(url: str) -> int:
     try:
@@ -4305,50 +3881,38 @@ def _pewpew_attempt_number(url: str) -> int:
         return int(raw)
     except Exception:
         return -1
-
-
 def _choose_pewpew_fight_url(urls: List[str]) -> Optional[str]:
     """
     Pick one concrete fight per boss.
-
     UwU usually exposes:
       - one or more concrete ?attempt=...&s=...&f=... links
       - a ?boss=...&mode=... link
       - a generic ?boss=... link
-
     The highest concrete attempt is normally the final/kill attempt and avoids
     hammering UwU with several requests per boss.
     """
     unique = list(dict.fromkeys(urls))
     if not unique:
         return None
-
     concrete = []
     for url in unique:
         q = parse_qs(urlsplit(html_lib.unescape(url)).query)
         if "attempt" in q and ("s" in q or "f" in q):
             concrete.append(url)
-
     if concrete:
         concrete.sort(key=lambda u: (_pewpew_attempt_number(u), u), reverse=True)
         return concrete[0]
-
     with_attempt = [u for u in unique if "attempt" in parse_qs(urlsplit(html_lib.unescape(u)).query)]
     if with_attempt:
         with_attempt.sort(key=lambda u: (_pewpew_attempt_number(u), u), reverse=True)
         return with_attempt[0]
-
     return sorted(unique, key=_fight_url_priority)[0]
-
-
 def _apogee_report_id(url: str) -> str:
     try:
         path = urlsplit(canonical_uwu_url(url)).path.rstrip("/")
         return path.rsplit("/", 1)[-1]
     except Exception:
         return ""
-
-
 def _extract_report_id_from_text(text: str) -> str:
     m = re.search(
         r"(\d{2}-\d{2}-\d{2}--\d{2}-\d{2}--[^/\s\"'<>]+--[^/\s\"'<>]+)",
@@ -4356,8 +3920,6 @@ def _extract_report_id_from_text(text: str) -> str:
         re.IGNORECASE,
     )
     return m.group(1) if m else ""
-
-
 APOGEE_SPEC_TREE_HINTS = {
     "blood": 1, "frost": 2, "unholy": 3,
     "balance": 1, "feral": 2, "restoration": 3,
@@ -4370,8 +3932,6 @@ APOGEE_SPEC_TREE_HINTS = {
     "affliction": 1, "demonology": 2, "destruction": 3,
     "arms": 1, "fury": 2,
 }
-
-
 def _infer_tree_index_from_row(row_html: str) -> int:
     text = (html_to_text(row_html) + " " + row_html).lower()
     # Longest/specific hints first to avoid generic collisions.
@@ -4384,14 +3944,10 @@ def _infer_tree_index_from_row(row_html: str) -> int:
         if m and m.group(1) in {"1", "2", "3"}:
             return int(m.group(1))
     return 0
-
-
 APOGEEBOT_NON_PLAYER_ROWS = {
     "name", "total", "player", "players", "guild", "server",
     "duration", "date", "raid", "report",
 }
-
-
 def _apogeebot_report_metadata_names(report_id: str) -> set:
     """Return report author/server tokens that must never be treated as players."""
     ignored = set(APOGEEBOT_NON_PLAYER_ROWS)
@@ -4401,8 +3957,6 @@ def _apogeebot_report_metadata_names(report_id: str) -> set:
         ignored.add(parts[-2])  # uploader / report author
         ignored.add(parts[-1])  # realm/server
     return ignored
-
-
 def extract_apogeebot_participants(raw_html: str, report_id: str = "") -> Dict[str, int]:
     """Extract player names and, when visible, their talent-tree index."""
     out: Dict[str, int] = {}
@@ -4424,7 +3978,6 @@ def extract_apogeebot_participants(raw_html: str, report_id: str = "") -> Dict[s
         tree = _infer_tree_index_from_row(row)
         if low not in out or (out[low] == 0 and tree):
             out[low] = tree
-
     # Fallback to embedded JSON/JS participant objects.
     for obj in json_candidates_from_html(raw_html):
         for d in walk_dicts(obj):
@@ -4443,22 +3996,16 @@ def extract_apogeebot_participants(raw_html: str, report_id: str = "") -> Dict[s
             if low not in out or (out[low] == 0 and tree):
                 out[low] = tree
     return out
-
-
 APOGEEBOT_IGNORED_RANK_BOSSES = {
     "Gunship",
     "Gunship Battle",
     "Valithria Dreamwalker",
 }
-
-
 def _html_attr(tag_html: str, name: str) -> str:
     """Return one HTML attribute value from an opening tag/attribute blob."""
     pattern = r"(?is)\b" + re.escape(name) + r"\s*=\s*([\"'])(.*?)\1"
     m = re.search(pattern, tag_html or "")
     return html_lib.unescape(m.group(2)).strip() if m else ""
-
-
 def _apogeebot_report_server(report_url: str) -> str:
     report_id = _apogee_report_id(report_url)
     parts = [p for p in report_id.split("--") if p]
@@ -4467,11 +4014,8 @@ def _apogeebot_report_server(report_url: str) -> str:
         if candidate:
             return candidate
     return UWU_SERVER
-
-
 def _apogeebot_kill_urls(raw_html: str, report_url: str) -> List[str]:
     """Extract concrete kill links from an UwU report landing page.
-
     UwU renders SEGMENTS_KILLS as <a class="... kill-link ..."> links. We use
     those links directly so wipes and historical character data can never enter
     ApogeeBot's ranking calculation.
@@ -4479,7 +4023,6 @@ def _apogeebot_kill_urls(raw_html: str, report_url: str) -> List[str]:
     base = canonical_uwu_url(report_url)
     base_parts = urlsplit(base)
     found: List[str] = []
-
     for m in re.finditer(r"(?is)<a\b([^>]*)>(.*?)</a>", raw_html or ""):
         attrs = m.group(1)
         classes = _html_attr(attrs, "class").lower().split()
@@ -4490,7 +4033,7 @@ def _apogeebot_kill_urls(raw_html: str, report_url: str) -> List[str]:
             continue
         absolute = urljoin(base, href)
         parts = urlsplit(absolute)
-        if parts.netloc.lower() not in {"uwu-logs.xyz", "www.uwu-logs.xyz"}:
+        if parts.netloc.lower() not in {"uwu-logs.xyz", "[www.uwu-logs.xyz](https://www.uwu-logs.xyz)"}:
             continue
         if parts.path.rstrip("/") != base_parts.path.rstrip("/"):
             continue
@@ -4500,10 +4043,8 @@ def _apogeebot_kill_urls(raw_html: str, report_url: str) -> List[str]:
         url = urlunsplit(("https", "uwu-logs.xyz", parts.path, parts.query, ""))
         if url not in found:
             found.append(url)
-
     if found:
         return found
-
     # Conservative fallback for a deployment where the CSS class changes:
     # concrete segment links only, grouped by boss+mode, highest attempt first.
     grouped: Dict[Tuple[str, str], List[str]] = defaultdict(list)
@@ -4516,18 +4057,14 @@ def _apogeebot_kill_urls(raw_html: str, report_url: str) -> List[str]:
         if "attempt" not in q or not ("s" in q or "f" in q):
             continue
         grouped[(boss, mode)].append(url)
-
     fallback: List[str] = []
     for urls in grouped.values():
         urls.sort(key=lambda u: (_pewpew_attempt_number(u), u), reverse=True)
         fallback.append(urls[0])
     return fallback
-
-
 def _apogeebot_fight_name_mode(raw_html: str, fight_url: str) -> Tuple[str, str]:
     boss = ""
     mode = ""
-
     m = re.search(
         r"(?is)<[^>]+\bid=[\"']slice-name[\"'][^>]*>(.*?)</[^>]+>",
         raw_html or "",
@@ -4535,7 +4072,6 @@ def _apogeebot_fight_name_mode(raw_html: str, fight_url: str) -> Tuple[str, str]
     if m:
         visible_boss = html_to_text(m.group(1)).strip()
         boss = normalize_boss(visible_boss) or visible_boss
-
     m = re.search(
         r"(?is)<[^>]+\bid=[\"']slice-tries[\"'][^>]*>(.*?)</[^>]+>",
         raw_html or "",
@@ -4545,7 +4081,6 @@ def _apogeebot_fight_name_mode(raw_html: str, fight_url: str) -> Tuple[str, str]
         mm = re.search(r"\b(10N|10H|25N|25H)\b", visible)
         if mm:
             mode = mm.group(1)
-
     q = parse_qs(urlsplit(html_lib.unescape(fight_url)).query)
     if not boss:
         raw_boss = (q.get("boss") or [""])[0]
@@ -4554,10 +4089,7 @@ def _apogeebot_fight_name_mode(raw_html: str, fight_url: str) -> Tuple[str, str]
         candidate = (q.get("mode") or [""])[0].upper()
         if candidate in {"10N", "10H", "25N", "25H"}:
             mode = candidate
-
     return boss, mode
-
-
 def _apogeebot_parse_number(raw: str) -> Optional[float]:
     value = html_lib.unescape(raw or "")
     value = value.replace("\xa0", "").replace(" ", "").strip()
@@ -4571,8 +4103,6 @@ def _apogeebot_parse_number(raw: str) -> Optional[float]:
     except (TypeError, ValueError):
         return None
     return number if number >= 0 else None
-
-
 def _apogeebot_rank_input_from_fight(
     raw_html: str,
     fight_url: str,
@@ -4581,16 +4111,13 @@ def _apogeebot_rank_input_from_fight(
     boss, mode = _apogeebot_fight_name_mode(raw_html, fight_url)
     dps: Dict[str, float] = {}
     specs: Dict[str, str] = {}
-
     for row in re.findall(r"(?is)<tr\b[^>]*>.*?</tr>", raw_html or ""):
         tds = re.findall(r"(?is)<td\b([^>]*)>(.*?)</td>", row)
         if not tds:
             continue
-
         player = ""
         spec = ""
         useful_dps: Optional[float] = None
-
         for attrs, inner in tds:
             classes = set(_html_attr(attrs, "class").lower().split())
             if "player-cell" in classes:
@@ -4601,17 +4128,13 @@ def _apogeebot_rank_input_from_fight(
                     player = candidate
             elif "useful" in classes and "per-sec-cell" in classes:
                 useful_dps = _apogeebot_parse_number(html_to_text(inner))
-
         if not player or useful_dps is None or not spec:
             continue
         if _analyse_log_is_non_dps_spec(spec):
             continue
         dps[player] = float(useful_dps) + 0.1
         specs[player] = spec
-
     return boss, mode, dps, specs
-
-
 async def _post_uwu_rank(payload: Dict[str, Any]) -> Dict[str, Any]:
     """POST the current kill's DPS/spec table to UwU /rank as JSON."""
     url = "https://uwu-logs.xyz/rank"
@@ -4624,7 +4147,6 @@ async def _post_uwu_rank(payload: Dict[str, Any]) -> Dict[str, Any]:
     transient = {429, 500, 502, 503, 504}
     last_status = None
     last_error = None
-
     for attempt in range(5):
         try:
             async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
@@ -4656,17 +4178,13 @@ async def _post_uwu_rank(payload: Dict[str, Any]) -> Dict[str, Any]:
                 await asyncio.sleep(min(0.8 * (2 ** attempt), 8.0))
                 continue
             break
-
     if last_status is not None:
         raise RuntimeError(f"UwU /rank HTTP {last_status} après retries")
     if last_error is not None:
         raise RuntimeError(f"UwU /rank: {type(last_error).__name__}: {last_error}")
     raise RuntimeError("UwU /rank impossible")
-
-
 def _uwu_rank_points(raw: Dict[str, Any]) -> Optional[float]:
     """Return UwU's Dps% (`points`) for this exact fight.
-
     ``/rank`` returns three distinct values: the ordinal ``rank``, the
     population-position ``percentile`` used by the "Better than X%" tooltip,
     and ``points``, rendered by UwU in its Dps% column. Analyse Log and
@@ -4674,7 +4192,6 @@ def _uwu_rank_points(raw: Dict[str, Any]) -> Optional[float]:
     """
     if not isinstance(raw, dict):
         return None
-
     # Do not fall back to `percentile`: it is a different metric and can turn,
     # for example, UwU's 76.20 Dps% into a misleading 99.39% parse.
     for key in ("points", "point", "score", "parse", "value"):
@@ -4682,8 +4199,6 @@ def _uwu_rank_points(raw: Dict[str, Any]) -> Optional[float]:
         if value is not None and 0.0 <= value <= 100.0:
             return float(value)
     return None
-
-
 def _uwu_rank_rank(raw: Dict[str, Any]) -> Optional[int]:
     value = _numeric((raw or {}).get("rank")) if isinstance(raw, dict) else None
     if value is None:
@@ -4692,8 +4207,6 @@ def _uwu_rank_rank(raw: Dict[str, Any]) -> Optional[int]:
         return int(value)
     except Exception:
         return None
-
-
 def _analyse_log_hit_bucket(hit: PewPewHit) -> Optional[str]:
     if hit.server_best:
         return "top1"
@@ -4703,17 +4216,13 @@ def _analyse_log_hit_bucket(hit: PewPewHit) -> Optional[str]:
         if hit.points >= float(threshold) - 1e-9:
             return tier_key
     return None
-
-
 def _analyse_log_bucket_label(bucket: str) -> str:
     for tier_key, _threshold, label in ANALYSE_LOG_POINT_TIERS:
         if tier_key == bucket:
             return label
     return bucket
-
-
-def _extract_character_boss_table_rows(html: str) -> Dict[str, Dict[str, Optional[float]]]:
-    """Parse the public UwU character page table to recover Points and Kills.
+def _extract_character_boss_table_rows(html: str) -> Dict[str, Dict[str, Any]]:
+    """Parse the public UwU character page table to recover Points, Kills and Date.
     This is more reliable for display than guessing hidden JSON key names.
     """
     out: Dict[str, Dict[str, Optional[float]]] = {}
@@ -4721,20 +4230,17 @@ def _extract_character_boss_table_rows(html: str) -> Dict[str, Dict[str, Optiona
         cells = _html_cells(row)
         if len(cells) < 4:
             continue
-        texts = [html_to_text(cell).replace(" ", " ").strip() for cell in cells]
+        texts = [html_to_text(cell).replace(" ", " ").strip() for cell in cells]
         if not texts:
             continue
         raw_boss = texts[0]
         boss = normalize_boss(raw_boss) or raw_boss.strip()
         if boss not in ANALYSE_LOG_BOSS_ORDER and boss not in APOGEEBOT_IGNORED_RANK_BOSSES:
             continue
-
         date_idx = next((i for i, t in enumerate(texts) if re.fullmatch(r"\d{2}-\d{2}-\d{2}", t)), None)
         dur_idx = next((i for i, t in enumerate(texts) if re.fullmatch(r"\d{1,2}:\d{2}", t)), None)
-
         points = None
         kills = None
-
         # Typical row layout: Boss | Rank | Points | Best Dps | Dur | Kills | Date
         if len(texts) >= 6:
             p = _apogeebot_parse_number(texts[2])
@@ -4754,12 +4260,10 @@ def _extract_character_boss_table_rows(html: str) -> Dict[str, Dict[str, Optiona
                 if re.fullmatch(r"\d+", candidate or ""):
                     kills = int(candidate)
                     break
-
-        if points is not None or kills is not None:
-            out[boss.lower()] = {"points": points, "kills": kills}
+        date_text = texts[date_idx] if date_idx is not None else None
+        if points is not None or kills is not None or date_text:
+            out[boss.lower()] = {"points": points, "kills": kills, "date": date_text}
     return out
-
-
 async def _get_uwu_character_table_summary(
     player: str,
     spec_idx: int,
@@ -4775,8 +4279,6 @@ async def _get_uwu_character_table_summary(
     )
     _final, html = await _fetch_uwu_with_retry(url, "ApogeeBot/11.2 (+Analyse Log table)")
     return _extract_character_boss_table_rows(html)
-
-
 def _apogeebot_hits_from_rank_payload(
     payload: Dict[str, Any],
     boss: str,
@@ -4815,8 +4317,6 @@ def _apogeebot_hits_from_rank_payload(
             )
         )
     return hits
-
-
 def _apogeebot_tree_index_from_spec(spec: str) -> int:
     """Convert UwU's visible spec name to the class talent-tree index 1/2/3."""
     s = re.sub(r"\s+", " ", html_lib.unescape(spec or "").strip().lower())
@@ -4854,7 +4354,6 @@ def _apogeebot_tree_index_from_spec(spec: str) -> int:
     }
     if s in exact:
         return exact[s]
-
     # Conservative fallback for deployments that shorten the spec label.
     if s in {"blood", "balance", "beast mastery", "arcane", "discipline", "assassination", "elemental", "affliction", "arms"}:
         return 1
@@ -4863,8 +4362,6 @@ def _apogeebot_tree_index_from_spec(spec: str) -> int:
     if s in {"unholy", "survival", "shadow", "subtlety", "destruction"}:
         return 3
     return 0
-
-
 async def _get_uwu_character_for_improvements(
     player: str,
     spec_idx: int,
@@ -4880,13 +4377,11 @@ async def _get_uwu_character_for_improvements(
     }
     transient = {429, 500, 502, 503, 504}
     last_error = None
-
     # GET is the simplest/current structured endpoint. POST JSON is a fallback.
     requests = [
         ("GET", get_url, None),
         ("POST", post_url, {"server": server, "name": player, "spec_i": int(spec_idx)}),
     ]
-
     for method, url, payload in requests:
         for attempt in range(4):
             try:
@@ -4918,19 +4413,14 @@ async def _get_uwu_character_for_improvements(
                     await asyncio.sleep(min(0.7 * (2 ** attempt), 6.0))
                     continue
                 break
-
     if last_error is not None:
         raise RuntimeError(f"UwU /character amélioration: {type(last_error).__name__}: {last_error}")
     raise RuntimeError("UwU /character amélioration impossible")
-
-
 # Payload sample dump: only the first successful /character response of the
 # process is logged in full, so Kroma can eyeball the real shape once and
 # confirm/adjust the parsing assumptions below without spamming the console
 # on every subsequent call.
 _ANALYSE_LOG_CHARACTER_SAMPLE_LOGGED = False
-
-
 def _character_report_improvements(
     payload: Dict[str, Any],
     player: str,
@@ -4945,7 +4435,6 @@ def _character_report_improvements(
     en DKPARSE_DEBUG, joueur Baldursex) : le payload a bien la forme attendue
     (`{"bosses": {BossName: {report_id, dps_max, ...}}}`). Le bug n'était pas
     la forme du payload mais l'hypothèse de matching :
-
     Plusieurs membres de la guilde uploadent chacun leur propre combat log du
     MÊME raid vers uwu-logs (ex. Fireland à 21:00, Greenks à 21:00, Belladen à
     21:13 — même soirée). Chaque upload génère un `report_id` différent (il
@@ -4956,7 +4445,6 @@ def _character_report_improvements(
     presque toujours (report_id différent) et `same_best_dps` échouait aussi
     (tolérance trop stricte), alors que la clé (joueur, boss) était bien celle
     du raid posté.
-
     Nouveau critère : la source du meilleur score du joueur est considérée
     comme CE raid si (a) le report_id reçu date du même jour calendaire que le
     report posté (8 premiers caractères, format YY-MM-DD) ET (b) le dps_max
@@ -4976,12 +4464,10 @@ def _character_report_improvements(
             },
         )
         return []
-
     report_low = current_report_id.lower()
     out: List[ParseImprovement] = []
     own_keys = {k for k in current_percentiles if k[0] == player.lower()}
     seen_keys: set = set()
-
     for raw_boss, raw in bosses.items():
         if not isinstance(raw, dict) or not raw:
             continue
@@ -4991,22 +4477,18 @@ def _character_report_improvements(
             or raw.get("report")
             or ""
         ).strip().strip("/")
-
         boss = normalize_boss(str(raw_boss)) or str(raw_boss).strip()
         if not boss:
             continue
         key = (player.lower(), boss.lower())
         seen_keys.add(key)
-
         # Only bosses actually processed from a HEROIC kill in this report can
         # count as an improvement. This also guarantees NM parses never leak in.
         if key not in current_percentiles:
             continue
         if _analyse_log_is_non_dps_spec(current_specs.get(key, "")):
             continue
-
         same_report = bool(report_id) and report_id.lower() == report_low
-
         # Report-id date prefix, format YY-MM-DD--HH-MM--Uploader--Server.
         # Comparaison en VRAIES dates (pas en egalite de chaine) avec une
         # tolerance de +/-1 jour calendaire : un raid qui traverse minuit
@@ -5023,7 +4505,6 @@ def _character_report_improvements(
             and posted_date_obj is not None
             and abs((recv_date_obj - posted_date_obj).days) <= 1
         )
-
         best_dps = _numeric(raw.get("dps_max"))
         raid_dps = current_dps.get(key)
         # Multiple guild members can each upload their own log of the SAME
@@ -5037,9 +4518,7 @@ def _character_report_improvements(
         if best_dps is not None and raid_dps is not None and raid_dps > 0:
             rel_diff = abs(float(best_dps) - float(raid_dps)) / float(raid_dps)
             same_best_dps = rel_diff <= 0.01 or abs(float(best_dps) - float(raid_dps)) <= 1.0
-
         same_raid = same_date and same_best_dps
-
         if not (same_report or same_raid):
             # Clé qu'on savait pertinente (le joueur a fait ce boss ce soir),
             # mais aucun critère ne matche : cas à inspecter.
@@ -5057,7 +4536,6 @@ def _character_report_improvements(
                 },
             )
             continue
-
         if same_raid and not same_report:
             dkp_debug(
                 "ANALYSE LOG AMELIORATION MEME RAID (report_id différent, même soirée)",
@@ -5070,19 +4548,16 @@ def _character_report_improvements(
                     "raid_dps": raid_dps,
                 },
             )
-
         # Source de vérité : le même payload /character que la page UwU.
         # Ex. points=8491 -> 84.91 ; raids=26 -> 26 kills.
         uwu_points = _character_points_value(raw)
         kills_value = _character_kills_value(raw)
-
         if uwu_points is None:
             dkp_debug(
                 "ANALYSE LOG POINTS /character INTROUVABLES",
                 {"player": player, "boss": boss, "raw_boss_entry": raw},
             )
             continue
-
         out.append(
             ParseImprovement(
                 player=player,
@@ -5092,7 +4567,6 @@ def _character_report_improvements(
                 kills=kills_value,
             )
         )
-
     # Clés qu'on attendait absolument (le joueur a joué ce boss ce soir selon
     # /rank) mais qui n'apparaissent même pas dans payload["bosses"] — signe
     # que le nom de boss côté /character ne matche pas normalize_boss(), ou
@@ -5107,10 +4581,7 @@ def _character_report_improvements(
                 "bosses_recus": sorted(bosses.keys()),
             },
         )
-
     return out
-
-
 async def _detect_report_improvements(
     report_id: str,
     server: str,
@@ -5126,7 +4597,6 @@ async def _detect_report_improvements(
     queries = 0
     failures = 0
     character_payload_cache = character_payload_cache if character_payload_cache is not None else {}
-
     for player_low in sorted(player_specs):
         player = display_names.get(player_low, player_low.capitalize())
         spec_names = sorted(player_specs[player_low])
@@ -5137,14 +4607,12 @@ async def _detect_report_improvements(
             idx = _apogeebot_tree_index_from_spec(spec_name)
             if idx and idx not in tree_indices:
                 tree_indices.append(idx)
-
         if not tree_indices:
             dkp_debug(
                 "ANALYSE LOG SPEC NON MAPPÉE",
                 {"player": player, "specs": spec_names},
             )
             continue
-
         for spec_idx in tree_indices:
             try:
                 cache_key = (player.lower(), int(spec_idx))
@@ -5153,7 +4621,6 @@ async def _detect_report_improvements(
                     payload = await _get_uwu_character_for_improvements(player, spec_idx, server)
                     character_payload_cache[cache_key] = payload
                     queries += 1
-
                 global _ANALYSE_LOG_CHARACTER_SAMPLE_LOGGED
                 if not _ANALYSE_LOG_CHARACTER_SAMPLE_LOGGED:
                     dkp_debug(
@@ -5161,7 +4628,6 @@ async def _detect_report_improvements(
                         {"player": player, "spec_idx": spec_idx, "payload": payload},
                     )
                     _ANALYSE_LOG_CHARACTER_SAMPLE_LOGGED = True
-
                 rows = _character_report_improvements(
                     payload,
                     player,
@@ -5194,15 +4660,11 @@ async def _detect_report_improvements(
                     },
                 )
             await asyncio.sleep(0.08)
-
     return list(found.values()), queries, failures
-
-
 async def build_pewpew_report(
     report_url: str,
 ) -> Tuple[bytes, bytes, Dict[str, int], List[ParseImprovement]]:
     """Analyse Log: current-kill /rank + personal improvements from this report.
-
     Ranking is ALWAYS based on each kill's Useful DPS/spec submitted to /rank.
     /character is called only afterwards to answer a different question:
     "is this posted report now the source of this player's personal best on boss X?"
@@ -5215,7 +4677,6 @@ async def build_pewpew_report(
     report_id = _apogee_report_id(report_url)
     server = _apogeebot_report_server(report_url)
     kill_urls = _apogeebot_kill_urls(landing_html, report_url)
-
     stats: Dict[str, int] = {
         "participants": 0,
         "queries": 0,                  # /rank queries
@@ -5231,15 +4692,12 @@ async def build_pewpew_report(
         "improved_players": 0,
         "improvements": 0,
     }
-
     if not report_id or not kill_urls:
         print(f"[ANALYSE LOG] Aucun kill exploitable détecté dans {report_id or report_url}")
         return b"", b"", stats, []
-
     all_participants: set = set()
     all_ranked_players: set = set()
     hits: List[PewPewHit] = []
-
     # For improvement detection we remember only specs actually seen in this raid
     # and the UwU points produced for the current boss kill.
     player_specs: Dict[str, set] = defaultdict(set)
@@ -5247,9 +4705,7 @@ async def build_pewpew_report(
     current_percentiles: Dict[Tuple[str, str], float] = {}
     current_specs: Dict[Tuple[str, str], str] = {}
     current_dps: Dict[Tuple[str, str], float] = {}
-
     print(f"[ANALYSE LOG] {len(kill_urls)} kill(s) détecté(s) dans {report_id}")
-
     for index, fight_url in enumerate(kill_urls, start=1):
         boss_hint, mode_hint = _apogeebot_fight_name_mode("", fight_url)
         try:
@@ -5259,7 +4715,6 @@ async def build_pewpew_report(
             boss, mode, dps, specs = _apogeebot_rank_input_from_fight(fight_html, fight_url)
             boss = boss or boss_hint
             mode = mode or mode_hint
-
             # Analyse Log is HEROIC ONLY. Normal-mode parses are deliberately
             # ignored and never sent to /rank or to improvement detection.
             if mode in {"10N", "25N"}:
@@ -5268,7 +4723,6 @@ async def build_pewpew_report(
             if mode == "TBD":
                 print(f"[ANALYSE LOG] SKIP {boss or boss_hint or '?'} TBD: mode non classable")
                 continue
-
             if boss in APOGEEBOT_IGNORED_RANK_BOSSES:
                 print(f"[ANALYSE LOG] SKIP {boss}: boss non classé par UwU /rank")
                 continue
@@ -5276,7 +4730,6 @@ async def build_pewpew_report(
                 raise RuntimeError(f"boss/mode illisible ({boss!r}, {mode!r})")
             if not dps or not specs:
                 raise RuntimeError("aucun DPS avec spécialisation éligible extrait de la page du kill")
-
             for name in dps:
                 low = name.lower()
                 all_participants.add(low)
@@ -5286,7 +4739,6 @@ async def build_pewpew_report(
                     player_specs[low].add(spec_name)
                     current_specs[(low, boss.lower())] = spec_name
                 current_dps[(low, boss.lower())] = float(dps[name])
-
             rank_payload = {
                 "server": server,
                 "boss": boss,
@@ -5308,7 +4760,6 @@ async def build_pewpew_report(
                     },
                 },
             )
-
             rank_data = await _post_uwu_rank(rank_payload)
             stats["queries"] += 1
             stats["kills_ranked"] += 1
@@ -5317,7 +4768,6 @@ async def build_pewpew_report(
                 for name, value in rank_data.items()
                 if isinstance(value, dict)
             )
-
             # Keep every current-raid UwU points value, not only 70+.
             # The improvement section must display the same metric as UwU.
             for player, raw in rank_data.items():
@@ -5330,12 +4780,10 @@ async def build_pewpew_report(
                 old = current_percentiles.get(key)
                 if old is None or float(points) > old:
                     current_percentiles[key] = float(points)
-
             # Le classement du raid doit refléter CE kill. /character contient
             # au contraire les meilleurs historiques et n'est utilisé qu'après,
             # pour déterminer si ce kill est devenu un nouveau record personnel.
             hits.extend(_apogeebot_hits_from_rank_payload(rank_data, boss, specs))
-
             print(
                 f"[ANALYSE LOG] {boss} {mode}: {len(rank_data)} joueur(s) classé(s)"
             )
@@ -5364,21 +4812,17 @@ async def build_pewpew_report(
                 },
             )
         await asyncio.sleep(0.12)
-
     stats["participants"] = len(all_participants)
     stats["players_ok"] = len(all_ranked_players)
     stats["players_failed"] = max(0, len(all_participants - all_ranked_players))
-
     if stats["kills_ranked"] <= 0:
         print(f"[ANALYSE LOG] Aucun kill n'a pu être classé via /rank pour {report_id}")
         return b"", b"", stats, []
-
     # /character est réservé aux records personnels. Le classement ci-dessus
     # reste fondé sur /rank.points, donc uniquement sur le raid posté.
     character_payload_cache: Dict[Tuple[str, int], Dict[str, Any]] = {}
     stats["players_with_hits"] = len({h.player.lower() for h in hits})
     stats["hits"] = len(hits)
-
     improvements, imp_queries, imp_failures = await _detect_report_improvements(
         report_id,
         server,
@@ -5393,18 +4837,14 @@ async def build_pewpew_report(
     stats["improvement_query_failures"] = imp_failures
     stats["improved_players"] = len({x.player.lower() for x in improvements})
     stats["improvements"] = len(improvements)
-
     print(
         f"[ANALYSE LOG] Améliorations: {stats['improved_players']} joueur(s), "
         f"{stats['improvements']} boss, {imp_queries} requête(s) /character, "
         f"{imp_failures} échec(s)"
     )
-
     ranking_png = render_pewpew_ranking_image(hits)
     improvements_png = render_analysis_improvements_image(improvements, imp_failures)
     return ranking_png, improvements_png, stats, improvements
-
-
 async def _analyse_log_improvement_user_ids(
     guild: discord.Guild,
     improvements: List[ParseImprovement],
@@ -5423,7 +4863,6 @@ async def _analyse_log_improvement_user_ids(
             for character in characters:
                 resolved = _resolve_kromaddon_main(character, alt_to_main)
                 users_by_main[resolved.casefold()].add(user_id)
-
     user_ids: List[int] = []
     missing: List[str] = []
     ambiguous: Dict[str, List[int]] = {}
@@ -5443,7 +4882,6 @@ async def _analyse_log_improvement_user_ids(
         if user_id not in seen_ids:
             seen_ids.add(user_id)
             user_ids.append(user_id)
-
     if main_problems:
         dkp_debug(
             "ANALYSE LOG ANOMALIES #MAIN PENDANT LES MENTIONS",
@@ -5455,8 +4893,6 @@ async def _analyse_log_improvement_user_ids(
             ambiguous,
         )
     return user_ids, missing
-
-
 def _message_uwu_urls(message: discord.Message) -> List[str]:
     parts = [message.content or ""]
     for embed in message.embeds:
@@ -5464,8 +4900,6 @@ def _message_uwu_urls(message: discord.Message) -> List[str]:
         for field in embed.fields:
             parts.extend([field.name or "", field.value or ""])
     return extract_uwu_urls("\n".join(x for x in parts if x))
-
-
 async def _pewpew_set_reaction(
     message: discord.Message,
     emoji: str,
@@ -5474,8 +4908,6 @@ async def _pewpew_set_reaction(
         await message.add_reaction(emoji)
     except discord.HTTPException:
         pass
-
-
 async def _pewpew_remove_own_reaction(
     message: discord.Message,
     emoji: str,
@@ -5485,8 +4917,6 @@ async def _pewpew_remove_own_reaction(
             await message.remove_reaction(emoji, bot.user)
     except discord.HTTPException:
         pass
-
-
 async def handle_uwu_pewpew_message(
     message: discord.Message,
     *,
@@ -5498,7 +4928,6 @@ async def handle_uwu_pewpew_message(
         return
     if message.channel.id != LOGS_RAID_CHANNEL_ID:
         return
-
     urls = _message_uwu_urls(message)
     if not urls:
         print(
@@ -5506,30 +4935,23 @@ async def handle_uwu_pewpew_message(
             "mais aucun lien UwU détecté."
         )
         return
-
     print(f"[ANALYSE LOG] Message {message.id}: {len(urls)} rapport(s) UwU détecté(s)")
     await _pewpew_set_reaction(message, "🔎")
-
     final_status = "✅"
-
     async with PEWPEW_LOCK:
         for url in urls:
             canonical = canonical_uwu_url(url)
-
             if canonical in PEWPEW_SEEN_REPORTS and not force:
                 print(f"[ANALYSE LOG] Déjà traité: {canonical}")
                 continue
             if canonical in PEWPEW_IN_FLIGHT and not force:
                 print(f"[ANALYSE LOG] Déjà en cours d'analyse: {canonical}")
                 continue
-
             print(f"[ANALYSE LOG] Analyse: {canonical}")
             PEWPEW_IN_FLIGHT.add(canonical)
-
             try:
                 ranking_png, improvements_png, stats, improvements = await build_pewpew_report(canonical)
                 print(f"[ANALYSE LOG] Résultat {canonical}: {stats}")
-
                 if stats["participants"] <= 0:
                     final_status = "⚠️"
                     await message.reply(
@@ -5541,7 +4963,6 @@ async def handle_uwu_pewpew_message(
                         allowed_mentions=discord.AllowedMentions.none(),
                     )
                     continue
-
                 if stats.get("kills_ranked", 0) <= 0:
                     final_status = "⚠️"
                     await message.reply(
@@ -5554,7 +4975,6 @@ async def handle_uwu_pewpew_message(
                         allowed_mentions=discord.AllowedMentions.none(),
                     )
                     continue
-
                 if ranking_png:
                     await message.reply(
                         "**Classement du raid**",
@@ -5564,7 +4984,6 @@ async def handle_uwu_pewpew_message(
                     )
                 else:
                     print(f"[ANALYSE LOG] Image classement vide: {canonical}")
-
                 if improvements_png:
                     improvement_user_ids: List[int] = []
                     missing_improvement_players: List[str] = []
@@ -5585,13 +5004,11 @@ async def handle_uwu_pewpew_message(
                                 "ANALYSE LOG MENTIONS #MAIN ECHEC",
                                 {"error": f"{type(exc).__name__}: {exc}"},
                             )
-
                     improvement_message = "**Parses améliorées sur ce raid**"
                     if improvement_user_ids:
                         improvement_message += "\nJoueurs concernés : " + " ".join(
                             f"<@{user_id}>" for user_id in improvement_user_ids
                         )
-
                     allowed_improvement_mentions = discord.AllowedMentions.none()
                     if improvement_user_ids:
                         allowed_improvement_mentions = discord.AllowedMentions(
@@ -5600,13 +5017,11 @@ async def handle_uwu_pewpew_message(
                             users=[discord.Object(id=user_id) for user_id in improvement_user_ids],
                             replied_user=False,
                         )
-
                     if missing_improvement_players:
                         print(
                             "[ANALYSE LOG] Joueurs améliorés absents de #Main: "
                             + ", ".join(missing_improvement_players)
                         )
-
                     await message.reply(
                         improvement_message,
                         file=discord.File(io.BytesIO(improvements_png), filename="AnalyseLog_ParsesAmeliorees.png"),
@@ -5615,10 +5030,8 @@ async def handle_uwu_pewpew_message(
                     )
                 else:
                     print(f"[ANALYSE LOG] Image améliorations vide: {canonical}")
-
                 PEWPEW_SEEN_REPORTS.add(canonical)
                 _save_pewpew_seen()
-
             except Exception as exc:
                 final_status = "⚠️"
                 print(
@@ -5644,28 +5057,21 @@ async def handle_uwu_pewpew_message(
                     pass
             finally:
                 PEWPEW_IN_FLIGHT.discard(canonical)
-
     await _pewpew_remove_own_reaction(message, "🔎")
     await _pewpew_set_reaction(message, final_status)
-
 # =============================================================================
 # Discord commands / events
 # =============================================================================
-
 @app_commands.context_menu(name="Export inscrit")
 async def rh_list_context(
     interaction: discord.Interaction, message: discord.Message
 ):
     await run_rh_list(interaction, message)
-
-
 @app_commands.context_menu(name="KAparse")
 async def dkparse_context(
     interaction: discord.Interaction, message: discord.Message
 ):
     await run_dkparse_check(interaction, message)
-
-
 @bot.tree.command(
     name="export-grade",
     description="Exporte les mains de #Main et leurs rôles Discord de grade.",
@@ -5677,30 +5083,25 @@ async def export_grade(interaction: discord.Interaction):
     if not interaction.guild:
         await interaction.response.send_message("Serveur requis.", ephemeral=True)
         return
-
     await interaction.response.defer(ephemeral=True, thinking=True)
     try:
         export_text, warnings, total = await build_grade_export(interaction.guild)
-
         if not export_text:
             await interaction.followup.send(
                 "Aucun main valide trouvé dans #Main.",
                 ephemeral=True,
             )
             return
-
         file = discord.File(
             io.BytesIO(export_text.encode("utf-8")),
             filename="Apogee_Export_Grade.txt",
         )
-
         summary = f"✅ **Export grade prêt** — {total} main(s) de #Main."
         if warnings:
             preview = "\n".join(f"• {warning}" for warning in warnings[:10])
             if len(warnings) > 10:
                 preview += f"\n• ... et {len(warnings) - 10} autre(s)"
             summary += f"\n⚠️ {len(warnings)} anomalie(s) :\n{preview}"
-
         await interaction.followup.send(
             summary,
             file=file,
@@ -5711,8 +5112,6 @@ async def export_grade(interaction: discord.Interaction):
             f"❌ Export grade : {exc}",
             ephemeral=True,
         )
-
-
 @bot.tree.command(name="main-audit", description="Vérifie le salon #Main.")
 async def main_audit(interaction: discord.Interaction):
     if not can_use_admin(interaction):
@@ -5721,7 +5120,6 @@ async def main_audit(interaction: discord.Interaction):
     if not interaction.guild:
         await interaction.response.send_message("Serveur requis.", ephemeral=True)
         return
-
     await interaction.response.defer(ephemeral=True, thinking=True)
     try:
         mapping, problems = await build_main_map(interaction.guild)
@@ -5733,8 +5131,6 @@ async def main_audit(interaction: discord.Interaction):
         await interaction.followup.send("\n".join(lines), ephemeral=True)
     except Exception as exc:
         await interaction.followup.send(f"❌ Audit : {exc}", ephemeral=True)
-
-
 @bot.tree.command(
     name="analyse-log-test",
     description="Force Analyse Log sur un message #logs-raid.",
@@ -5750,9 +5146,7 @@ async def pewpew_test(interaction: discord.Interaction, message_id: str):
     if not message_id.isdigit():
         await interaction.response.send_message("ID de message invalide.", ephemeral=True)
         return
-
     await interaction.response.defer(ephemeral=True, thinking=True)
-
     try:
         channel = await get_text_channel(
             interaction.guild,
@@ -5760,7 +5154,6 @@ async def pewpew_test(interaction: discord.Interaction, message_id: str):
             "LOGS_RAID_CHANNEL_ID",
         )
         message = await channel.fetch_message(int(message_id))
-
         urls = _message_uwu_urls(message)
         if not urls:
             await interaction.followup.send(
@@ -5768,21 +5161,17 @@ async def pewpew_test(interaction: discord.Interaction, message_id: str):
                 ephemeral=True,
             )
             return
-
         await interaction.followup.send(
             f"Analyse forcée lancée pour {len(urls)} rapport(s). "
             "Le résultat sera posté en réponse au message dans #logs-raid.",
             ephemeral=True,
         )
         await handle_uwu_pewpew_message(message, force=True)
-
     except Exception as exc:
         await interaction.followup.send(
             f"❌ Analyse Log test : {type(exc).__name__}: {exc}",
             ephemeral=True,
         )
-
-
 @bot.tree.command(
     name="kaparse-check",
     description="Valide un message DKPARSE par son ID Discord.",
@@ -5798,7 +5187,6 @@ async def dkparse_check(interaction: discord.Interaction, message_id: str):
     if not message_id.isdigit():
         await interaction.response.send_message("ID de message invalide.", ephemeral=True)
         return
-
     try:
         channel = await get_text_channel(
             interaction.guild, DKPARSE_CHANNEL_ID, "DKPARSE_CHANNEL_ID"
@@ -5809,10 +5197,7 @@ async def dkparse_check(interaction: discord.Interaction, message_id: str):
             f"Impossible de récupérer ce message : {exc}", ephemeral=True
         )
         return
-
     await run_dkparse_check(interaction, message)
-
-
 @bot.tree.command(
     name="kaparse-logs",
     description="Affiche les dates de logs guilde trouvées dans #logs-raid.",
@@ -5824,7 +5209,6 @@ async def dkparse_logs(interaction: discord.Interaction):
     if not interaction.guild:
         await interaction.response.send_message("Serveur requis.", ephemeral=True)
         return
-
     await interaction.response.defer(ephemeral=True, thinking=True)
     try:
         now = datetime.now(timezone.utc)
@@ -5837,7 +5221,6 @@ async def dkparse_logs(interaction: discord.Interaction):
                 ephemeral=True,
             )
             return
-
         lines = [
             f"**{len(reports)} rapport(s) UwU éligible(s)** "
             f"({len(all_reports)} détecté(s) au total)",
@@ -5851,13 +5234,10 @@ async def dkparse_logs(interaction: discord.Interaction):
             lines.append(f"• {date_txt} — {r.url}")
         if len(reports) > 40:
             lines.append(f"... et {len(reports)-40} autre(s).")
-
         for chunk in split_discord_text("\n".join(lines)):
             await interaction.followup.send(chunk, ephemeral=True)
     except Exception as exc:
         await interaction.followup.send(f"❌ DKPARSE logs : {exc}", ephemeral=True)
-
-
 async def enforce_main_message(message: discord.Message):
     if (
         message.author.bot
@@ -5865,7 +5245,6 @@ async def enforce_main_message(message: discord.Message):
         or message.channel.id != MAIN_CHANNEL_ID
     ):
         return
-
     characters = _parse_main_declaration(message.content)
     if not characters:
         try:
@@ -5877,10 +5256,8 @@ async def enforce_main_message(message: discord.Message):
         except discord.HTTPException:
             pass
         return
-
     conflicting_names: Dict[str, int] = {}
     previous_messages: List[discord.Message] = []
-
     async for other in message.channel.history(limit=None):
         if other.id == message.id or other.author.bot:
             continue
@@ -5894,7 +5271,6 @@ async def enforce_main_message(message: discord.Message):
         for name in characters:
             if name.casefold() in other_names:
                 conflicting_names[name] = other.author.id
-
     if conflicting_names:
         try:
             await message.delete()
@@ -5912,18 +5288,14 @@ async def enforce_main_message(message: discord.Message):
         except discord.HTTPException:
             pass
         return
-
     for old in previous_messages:
         try:
             await old.delete()
         except discord.HTTPException:
             pass
-
-
 @bot.event
 async def on_message(message: discord.Message):
     await enforce_main_message(message)
-
     # KAparse: any user image in the configured channel is analysed automatically.
     if (
         not message.author.bot
@@ -5936,7 +5308,6 @@ async def on_message(message: discord.Message):
             f"[KAPARSE] Nouveau screen: id={message.id} auteur={message.author}"
         )
         asyncio.create_task(handle_kaparse_auto_message(message))
-
     # Analyse Log: automatic on every UwU report posted in #logs-raid.
     if (
         UWU_PEWPEW_ENABLED
@@ -5950,8 +5321,6 @@ async def on_message(message: discord.Message):
         )
         asyncio.create_task(handle_uwu_pewpew_message(message))
     await bot.process_commands(message)
-
-
 @bot.event
 async def on_message_edit(before: discord.Message, after: discord.Message):
     if after.channel.id == MAIN_CHANNEL_ID:
@@ -5965,8 +5334,6 @@ async def on_message_edit(before: discord.Message, after: discord.Message):
         and _message_uwu_urls(after)
     ):
         asyncio.create_task(handle_uwu_pewpew_message(after))
-
-
 @bot.event
 async def on_ready():
     print("ApogeeBot — Export inscrit + Export grade + KAparse + Analyse Log")
@@ -5985,8 +5352,6 @@ async def on_ready():
     print(f"KAparse window: {DKPARSE_MAX_DAYS} jours")
     print("KAparse OCR: " + ("RapidOCR OK" if (RapidOCR is not None and Image is not None and np is not None) else "INDISPONIBLE"))
     print(f"Analyse Log: {'ACTIVE' if UWU_PEWPEW_ENABLED else 'DESACTIVE'} (/rank HEROIC + détection PB /character+dps_max)")
-
-
 @bot.event
 async def setup_hook():
     for command in (rh_list_context, dkparse_context):
@@ -5994,7 +5359,6 @@ async def setup_hook():
             bot.tree.add_command(command)
         except app_commands.CommandAlreadyRegistered:
             pass
-
     if GUILD_ID:
         guild = discord.Object(id=GUILD_ID)
         bot.tree.copy_global_to(guild=guild)
@@ -6003,12 +5367,9 @@ async def setup_hook():
     else:
         synced = await bot.tree.sync()
         print(f"{len(synced)} commande(s) globale(s) synchronisée(s).")
-
-
 if __name__ == "__main__":
     if not TOKEN:
         raise SystemExit("DISCORD_TOKEN manquant dans .env")
     if not MAIN_CHANNEL_ID:
         raise SystemExit("MAIN_CHANNEL_ID manquant dans .env")
-
     bot.run(TOKEN)
