@@ -4279,6 +4279,66 @@ async def _get_uwu_character_table_summary(
     )
     _final, html = await _fetch_uwu_with_retry(url, "ApogeeBot/11.2 (+Analyse Log table)")
     return _extract_character_boss_table_rows(html)
+def _analyse_log_kill_debug_line(
+    boss: str,
+    mode: str,
+    rank_data: Dict[str, Any],
+    specs: Dict[str, str],
+) -> str:
+    """Human-readable per-kill breakdown of the /rank response, for a
+    Discord-visible diagnostic when 'Analyse Log' shows zero qualifying hits.
+    Explains for every entry why it was or wasn't counted as a 70+ hit.
+    """
+    specs = specs or {}
+    specs_by_lower = {str(k).lower(): str(v) for k, v in specs.items()}
+    entries = 0
+    non_dict = 0
+    name_regex_fail = 0
+    points_unreadable = 0
+    non_dps_filtered = 0
+    qualifying = 0
+    best_points = None
+    best_player = None
+    samples = []
+    for player, raw in (rank_data or {}).items():
+        entries += 1
+        if not isinstance(raw, dict):
+            non_dict += 1
+            continue
+        player_name = str(player)
+        if not WOW_NAME_RE.fullmatch(player_name):
+            name_regex_fail += 1
+        player_spec = specs.get(player_name, specs_by_lower.get(player_name.lower(), ""))
+        points = _uwu_rank_points(raw)
+        rank_value = _uwu_rank_rank(raw)
+        if points is None or not 0.0 <= points <= 100.0:
+            points_unreadable += 1
+        else:
+            if best_points is None or points > best_points:
+                best_points = points
+                best_player = player_name
+        is_non_dps = _analyse_log_is_non_dps_spec(player_spec)
+        if is_non_dps:
+            non_dps_filtered += 1
+        if (
+            WOW_NAME_RE.fullmatch(player_name)
+            and not is_non_dps
+            and points is not None
+            and 0.0 <= points <= 100.0
+            and (rank_value == 1 or points >= 70.0 - 1e-9)
+        ):
+            qualifying += 1
+        if len(samples) < 5:
+            samples.append(
+                f"{player_name} (spec={player_spec!r}, points={points}, rank={rank_value})"
+            )
+    return (
+        f"{boss} {mode}: {entries} entrée(s) /rank — "
+        f"{non_dict} non-dict, {name_regex_fail} nom hors regex, "
+        f"{points_unreadable} points illisibles, {non_dps_filtered} spec non-DPS filtrée(s), "
+        f"{qualifying} qualifiant(s) (>=70 ou top1) — "
+        f"meilleur={best_player}:{best_points} — échantillon: " + "; ".join(samples)
+    )
 def _apogeebot_hits_from_rank_payload(
     payload: Dict[str, Any],
     boss: str,
@@ -4695,6 +4755,7 @@ async def build_pewpew_report(
     if not report_id or not kill_urls:
         print(f"[ANALYSE LOG] Aucun kill exploitable détecté dans {report_id or report_url}")
         return b"", b"", stats, []
+    debug_lines: List[str] = []
     all_participants: set = set()
     all_ranked_players: set = set()
     hits: List[PewPewHit] = []
@@ -4784,6 +4845,7 @@ async def build_pewpew_report(
             # au contraire les meilleurs historiques et n'est utilisé qu'après,
             # pour déterminer si ce kill est devenu un nouveau record personnel.
             hits.extend(_apogeebot_hits_from_rank_payload(rank_data, boss, specs))
+            debug_lines.append(_analyse_log_kill_debug_line(boss, mode, rank_data, specs))
             print(
                 f"[ANALYSE LOG] {boss} {mode}: {len(rank_data)} joueur(s) classé(s)"
             )
@@ -4815,6 +4877,7 @@ async def build_pewpew_report(
     stats["participants"] = len(all_participants)
     stats["players_ok"] = len(all_ranked_players)
     stats["players_failed"] = max(0, len(all_participants - all_ranked_players))
+    stats["debug_lines"] = debug_lines
     if stats["kills_ranked"] <= 0:
         print(f"[ANALYSE LOG] Aucun kill n'a pu être classé via /rank pour {report_id}")
         return b"", b"", stats, []
@@ -4952,6 +5015,18 @@ async def handle_uwu_pewpew_message(
             try:
                 ranking_png, improvements_png, stats, improvements = await build_pewpew_report(canonical)
                 print(f"[ANALYSE LOG] Résultat {canonical}: {stats}")
+                debug_lines = stats.get("debug_lines") or []
+                if debug_lines:
+                    debug_text = (
+                        "🔧 **[debug] Analyse Log — détail /rank par kill**\n"
+                        + "\n".join(f"- {line}" for line in debug_lines)
+                    )
+                    for start in range(0, len(debug_text), 1900):
+                        await message.reply(
+                            debug_text[start:start + 1900],
+                            mention_author=False,
+                            allowed_mentions=discord.AllowedMentions.none(),
+                        )
                 if stats["participants"] <= 0:
                     final_status = "⚠️"
                     await message.reply(
