@@ -1821,9 +1821,25 @@ async def extract_dkparse_screen_only(
             ],
         },
     )
+    result_message = (
+        f"Nom lu sur le screen : {character} (spec {spec_index}, via uwu-logs.xyz)"
+    )
+    if not any(r.best_date is not None for r in rows):
+        # Diagnostic: table was fetched (non-empty) but no row survived with a
+        # parseable date — dump the raw per-boss table so the exact column
+        # format returned by uwu-logs.xyz can be confirmed against the
+        # regex-based scraper in _extract_character_boss_table_rows.
+        sample_items = list(table.items())[:6]
+        sample_txt = "; ".join(
+            f"{boss}={info!r}" for boss, info in sample_items
+        )
+        result_message += (
+            " — 🔧 [debug] table brute uwu-logs (aucune date exploitable) : "
+            + sample_txt
+        )
     return (
         character,
-        f"Nom lu sur le screen : {character} (spec {spec_index}, via uwu-logs.xyz)",
+        result_message,
         f"spec{spec_index}",
         rows,
     )
@@ -2575,6 +2591,8 @@ async def evaluate_dkparse_screen_message(
     dated_rows = [r for r in rows if r.best_date is not None]
     if not dated_rows:
         issues.append("Aucune date Best Log lisible sur le screenshot.")
+        if "[debug]" in (ocr_detail or ""):
+            issues.append(ocr_detail)
         return DKParseScreenResult(
             message_id=message.id,
             character=character,
@@ -5114,6 +5132,14 @@ async def handle_uwu_pewpew_message(
                         print(
                             "[ANALYSE LOG] Joueurs améliorés absents de #Main: "
                             + ", ".join(missing_improvement_players)
+                        )
+                        main_channel_hint = (
+                            f"<#{MAIN_CHANNEL_ID}>" if MAIN_CHANNEL_ID else "#main"
+                        )
+                        improvement_message += (
+                            "\nPersonnages concernés inconnus : "
+                            + ", ".join(missing_improvement_players)
+                            + f". Merci de remplir le chan {main_channel_hint}."
                         )
                     await message.reply(
                         improvement_message,
